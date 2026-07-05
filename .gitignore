@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# venv (uv/venv/virtualenv)
+.venv/
+venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 変換結果(テスト生成物含む) / conversion outputs (incl. test artifacts)
+*.glb
