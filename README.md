@@ -134,6 +134,29 @@ mmd2gltf/
 
 いずれも寛容な(商用利用・再配布可能な)オープンソースライセンスですが、配布時は各ライブラリのライセンス表記義務(著作権表示など)に従ってください。
 
+## 実行ファイル化
+
+PyInstallerを使って実行ファイル(.exe)にパッケージ化できます。
+
+```bash
+# 1) 依存パッケージをインストール
+pip install Pillow PyInstaller
+
+# 2) spec ファイルを使ってビルド
+uv run pyinstaller mmd2gltf.spec
+
+# 3) dist/mmd2gltf.exe が生成される
+```
+
+specファイルでは以下の設定を行っています:
+- `datas`: `mmd2gltf`パッケージとtkinterdnd2のtkdnd本体(tcl/dll)を同梱
+- `hiddenimports`: `mmd2gltf`サブモジュールを正しく読み込ませる
+- `console=False`: GUIアプリとして起動(コンソールウィンドウ非表示)
+- `icon`: ウィンドウアイコンに `icon.png` を使用
+
+※ `icon.png` → `icon.ico` (Windowsアイコン形式) への変換は
+`icon.png.save('icon.ico')` 等で事前に実行してください。
+
 ---
 
 ## English
@@ -271,3 +294,25 @@ The core conversion logic uses only the standard library. The following are opti
 | [tkinterdnd2](https://github.com/pmgagne/tkinterdnd2) | Drag-and-drop file support in the GUI | MIT License |
 
 Both are permissive open-source licenses (commercial use and redistribution allowed), but be sure to follow each library's attribution requirements when distributing your software.
+
+### Building a standalone executable
+
+You can package the app into a standalone executable (`.exe`) using PyInstaller.
+
+```bash
+# 1) Install dependencies
+pip install Pillow PyInstaller
+
+# 2) Build using the spec file
+uv run pyinstaller mmd2gltf.spec
+
+# 3) dist/mmd2gltf.exe is generated
+```
+
+The spec file configures the following:
+- `datas`: bundles the `mmd2gltf` package and tkinterdnd2's tkdnd binaries (tcl/dll)
+- `hiddenimports`: ensures the `mmd2gltf` submodules are loaded correctly
+- `console=False`: runs as a GUI app (no console window)
+- `icon`: uses `icon.png` as the window icon
+
+Note: convert `icon.png` to `icon.ico` (Windows icon format) beforehand, e.g. with `icon.png.save('icon.ico')`.
