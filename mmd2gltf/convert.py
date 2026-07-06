@@ -262,20 +262,42 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
         p = v["pos"]
         n = v["normal"]
         pos += [p[0] * scale, p[1] * scale, -p[2] * scale]
-        nrm += [n[0], n[1], -n[2]]
+        nx, ny, nz = n[0], n[1], -n[2]
+        nl = (nx * nx + ny * ny + nz * nz) ** 0.5
+        if nl > 1e-6:
+            nrm += [nx / nl, ny / nl, nz / nl]
+        else:
+            # MMDの一部頂点は法線が (0,0,0)（非表示・物理専用など）。
+            # glTFは単位法線を要求するため、任意の単位ベクトルで補う。
+            nrm += [0.0, 0.0, 1.0]
         uv += [v["uv"][0], v["uv"][1]]
         edge.append(v["edge"])
         for k in range(add_uv_n):
             add_uvs[k] += v["add_uv"][k]
         # skinning (SDEF/QDEF approximated as linear blend)
-        bs, ws = list(v["bones"]), list(v["weights"])
+        # Merge duplicate bone indices before writing. MMD models often
+        # author SDEF (and occasionally BDEF2) vertices with bone0 == bone1
+        # -- common around ankles/elbows -- which would emit JOINTS_0 like
+        # [9, 9, 0, 0]. The glTF validator rejects that
+        # (ACCESSOR_JOINTS_INDEX_DUPLICATE). Summing the duplicate's weights
+        # collapses it to one influence, then we normalize to 1.0.
+        acc = {}
+        for b, w in zip(v["bones"], v["weights"]):
+            if w <= 0.0:
+                continue
+            b = b if 0 <= b < nb else 0
+            acc[b] = acc.get(b, 0.0) + w
+        if acc:
+            top = sorted(acc.items(), key=lambda kv: -kv[1])[:4]
+            bs = [b for b, _ in top]
+            ws = [w for _, w in top]
+            s = sum(ws)
+            ws = [w / s for w in ws]
+        else:
+            bs, ws = [0], [1.0]
         while len(bs) < 4:
             bs.append(0)
             ws.append(0.0)
-        bs = [(b if 0 <= b < nb else 0) for b in bs[:4]]
-        ws = [max(0.0, w) for w in ws[:4]]
-        s = sum(ws)
-        ws = [w / s for w in ws] if s > 0 else [1.0, 0.0, 0.0, 0.0]
         joints += bs
         weights += ws
         if has_sdef:
