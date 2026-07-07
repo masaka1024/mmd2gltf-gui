@@ -17,6 +17,7 @@ import sys
 from .pmx import parse_pmx
 from .vmd import parse_vmd
 from . import gltf as G
+from . import physics
 from .animation import bake, Track, FPS
 
 try:
@@ -568,6 +569,13 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             "rigidBodies": model["rigid_bodies"],
             "joints": model["joints"],
         }}
+
+        # 変換済み物理ビュー（後工程向け・ボーンローカル）を併載。
+        # raw の rigidBodies/joints は保持したまま physicsGltf を追加する。
+        _phys = g.j["extras"]["mmd"]
+        if _phys.get("rigidBodies"):
+            _bwm = physics.compute_bone_world_matrices(g.j)
+            _phys["physicsGltf"] = physics.build_physics_gltf(_phys, _bwm)
 
     # ---------------- animation ---------------------------------------------
     if vmd_path:
