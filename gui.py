@@ -79,6 +79,10 @@ STRINGS = {
         "adv_disable_ik_label": "無効化するIK名(カンマ区切り)",
         "adv_step_label": "サンプリング間隔(--step)",
         "adv_anim_name_label": "アニメーション名",
+        "adv_bake_hair": "物理演算をベイクする(--bake-physics)",
+        "adv_bake_target": "対象",
+        "adv_target_hair": "髪のみ",
+        "adv_target_all": "全部(チェーン型: 髪・ネクタイ等。スカートは除外)",
         "run_button": "変換する",
         "frame_log": "ログ",
         "err_title": "入力エラー",
@@ -133,6 +137,10 @@ STRINGS = {
         "adv_disable_ik_label": "IK names to disable (comma-separated)",
         "adv_step_label": "Sampling step (--step)",
         "adv_anim_name_label": "Animation clip name",
+        "adv_bake_hair": "Bake rigid-body physics (--bake-physics)",
+        "adv_bake_target": "Target",
+        "adv_target_hair": "Hair only",
+        "adv_target_all": "All (chains: hair, tie, etc. skirt excluded)",
         "run_button": "Convert",
         "frame_log": "Log",
         "err_title": "Input error",
@@ -323,6 +331,8 @@ class App(_BaseTk):
         self.disik_var = tk.StringVar()
         self.step_var = tk.IntVar(value=1)
         self.anim_var = tk.StringVar()
+        self.bakehair_var = tk.BooleanVar(value=False)
+        self.baketarget_var = tk.StringVar(value="hair")
 
         cb3 = ttk.Checkbutton(self.adv, variable=self.noik_var)
         cb3.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
@@ -351,6 +361,24 @@ class App(_BaseTk):
         lbl_anim.grid(row=6, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_anim, "adv_anim_name_label"))
         ttk.Entry(self.adv, textvariable=self.anim_var).grid(row=6, column=1, sticky="ew", **pad)
+
+        cb7 = ttk.Checkbutton(self.adv, variable=self.bakehair_var)
+        cb7.grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+        self._i18n_widgets.append((cb7, "adv_bake_hair"))
+
+        lbl_tgt = ttk.Label(self.adv, text="")
+        lbl_tgt.grid(row=8, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_tgt, "adv_bake_target"))
+        tgt_frame = ttk.Frame(self.adv)
+        tgt_frame.grid(row=8, column=1, sticky="w", **pad)
+        rb_hair = ttk.Radiobutton(tgt_frame, variable=self.baketarget_var,
+                                  value="hair")
+        rb_hair.pack(side="left")
+        self._i18n_widgets.append((rb_hair, "adv_target_hair"))
+        rb_all = ttk.Radiobutton(tgt_frame, variable=self.baketarget_var,
+                                 value="all")
+        rb_all.pack(side="left", padx=8)
+        self._i18n_widgets.append((rb_all, "adv_target_all"))
 
         run = ttk.Frame(frm)
         run.pack(fill="x", **pad)
@@ -462,6 +490,8 @@ class App(_BaseTk):
             force_double_sided=self.dside_var.get(),
             custom_attrs=not self.nocustom_var.get(),
             scale=scale,
+            bake_physics=self.bakehair_var.get(),
+            bake_target=self.baketarget_var.get(),
         )
         self.run_btn.configure(state="disabled")
         self.prog.start(12)
