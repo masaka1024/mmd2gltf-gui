@@ -18,6 +18,7 @@ from .pmx import parse_pmx
 from .vmd import parse_vmd
 from . import gltf as G
 from . import physics
+from .bake_hair import bake_hair_into_gltf
 from .animation import bake, Track, FPS
 
 try:
@@ -221,7 +222,9 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             step=1, extras=True, anim_name=None, disable_ik=None,
             use_vmd_ik_frames=True, morph_mode="sparse",
             alpha_mode="auto", force_double_sided=False,
-            custom_attrs=True, scale=0.08):
+            custom_attrs=True, scale=0.08,
+            bake_physics=False, bake_target="hair",
+            hair_drag=0.85, hair_stiffness=1.5, hair_gravity=0.02):
     """`scale` converts MMD units to glTF units (meters). PMX models are
     conventionally authored at roughly 1 MMD unit = 8cm (a ~160cm-tall
     character is about 20 units tall), but glTF assumes 1 unit = 1 meter, so
@@ -602,8 +605,34 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                 log("  %d VMD bone tracks had no matching PMX bone"
                     % len(unmatched))
             t_acc = g.add_accessor(times, G.FLOAT, "SCALAR", minmax=True)
+
+            # --- 剛体物理ベイク（PBD）: チェーン型剛体の回転を物理シミュで生成 ---
+            # bake_target: "hair"=髪のみ / "all"=チェーン型の全dynamic剛体
+            #   （スカート等のリング構造は自動除外される）
+            hair_keys = {}
+            if bake_physics:
+                _phys = g.j.get("extras", {}).get("mmd", {}).get("physicsGltf")
+                if _phys is None:
+                    _mmdx = {"unitScale": scale,
+                             "rigidBodies": model["rigid_bodies"],
+                             "joints": model["joints"]}
+                    _phys = physics.build_physics_gltf(
+                        _mmdx, physics.compute_bone_world_matrices(g.j))
+                if _phys.get("rigidBodies"):
+                    _only = ["髪"] if bake_target == "hair" else None
+                    hair_keys, _n_excl = bake_hair_into_gltf(
+                        g.j, baked, len(times), _phys, scale,
+                        drag_force=hair_drag, stiffness_force=hair_stiffness,
+                        gravity_power=hair_gravity, fps=FPS, only_names=_only)
+                    log("  physics baked: %d bone(s) (%s)"
+                        % (len(hair_keys),
+                           "hair only" if bake_target == "hair" else "all chains"))
+                    if _n_excl:
+                        log("  excluded %d non-chain (e.g. skirt ring) rigid "
+                            "bodies" % _n_excl)
+            hair_bones = set(hair_keys)
             for bi, data in sorted(baked.items()):
-                if data["r"]:
+                if data["r"] and bi not in hair_bones:
                     flat = []
                     prev = None
                     for q in data["r"]:
@@ -629,6 +658,23 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                     anim["channels"].append({
                         "sampler": len(anim["samplers"]) - 1,
                         "target": {"node": bi, "path": "translation"}})
+            for bi, qs in sorted(hair_keys.items()):
+                flat = []
+                prev = None
+                for q in qs:                       # 既にglTF局所回転（cquat不要）
+                    if prev and (q[0] * prev[0] + q[1] * prev[1] +
+                                 q[2] * prev[2] + q[3] * prev[3]) < 0:
+                        q = (-q[0], -q[1], -q[2], -q[3])
+                    flat += list(q)
+                    prev = q
+                out = g.add_accessor(flat, G.FLOAT, "VEC4")
+                anim["samplers"].append({"input": t_acc, "output": out,
+                                         "interpolation": "LINEAR"})
+                anim["channels"].append({
+                    "sampler": len(anim["samplers"]) - 1,
+                    "target": {"node": bi, "path": "rotation"}})
+            if hair_keys:
+                log("  physics rotation channels: %d" % len(hair_keys))
             log("  bone animation: %d channels, %d key frames"
                 % (len(anim["channels"]), len(times)))
 

@@ -54,6 +54,21 @@ def main(argv=None):
                     "otherwise appear ~12.5x too large in glTF viewers "
                     "that treat glTF units as meters. Pass --scale 1.0 to "
                     "disable scaling (default: 0.08)")
+    ap.add_argument("--bake-physics", action="store_true",
+                    help="bake rigid-body physics into bone keyframes (PBD "
+                    "spring sim); fixes frozen/IK-locked hair, ties, etc.")
+    ap.add_argument("--bake-target", choices=["hair", "all"], default="hair",
+                    help="which rigid bodies to bake: hair=hair only, "
+                    "all=all chain-type bodies (hair, tie, tail...). Ring "
+                    "structures like skirts are excluded automatically "
+                    "(default: hair)")
+    ap.add_argument("--hair-drag", type=float, default=0.85, metavar="F",
+                    help="velocity retention 0..1 (default 0.85; higher = "
+                    "floppier)")
+    ap.add_argument("--hair-stiffness", type=float, default=1.5, metavar="F",
+                    help="rest-shape restoring force (default 1.5)")
+    ap.add_argument("--hair-gravity", type=float, default=0.02, metavar="F",
+                    help="gravity strength (default 0.02; 0 keeps rest shape)")
     a = ap.parse_args(argv)
 
     out = a.output or os.path.splitext(a.pmx)[0] + ".glb"
@@ -65,7 +80,10 @@ def main(argv=None):
                 use_vmd_ik_frames=not a.ignore_vmd_ik,
                 morph_mode=a.morph_mode, alpha_mode=a.alpha_mode,
                 force_double_sided=a.force_double_sided,
-                custom_attrs=not a.no_custom_attrs, scale=a.scale)
+                custom_attrs=not a.no_custom_attrs, scale=a.scale,
+                bake_physics=a.bake_physics, bake_target=a.bake_target,
+                hair_drag=a.hair_drag, hair_stiffness=a.hair_stiffness,
+                hair_gravity=a.hair_gravity)
     except Exception as e:
         print("error:", e, file=sys.stderr)
         return 1
