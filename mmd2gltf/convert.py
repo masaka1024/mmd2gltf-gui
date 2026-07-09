@@ -606,9 +606,9 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                     % len(unmatched))
             t_acc = g.add_accessor(times, G.FLOAT, "SCALAR", minmax=True)
 
-            # --- 剛体物理ベイク（PBD）: チェーン型剛体の回転を物理シミュで生成 ---
-            # bake_target: "hair"=髪のみ / "all"=チェーン型の全dynamic剛体
-            #   （スカート等のリング構造は自動除外される）
+            # --- 剛体物理ベイク（PBD/クロス）: 剛体の回転を物理シミュで生成 ---
+            # bake_target: "hair"=髪のみ / "all"=全dynamic剛体
+            #   （スカート等のリング構造もクロスシミュで扱う）
             hair_keys = {}
             if bake_physics:
                 _phys = g.j.get("extras", {}).get("mmd", {}).get("physicsGltf")
@@ -626,10 +626,9 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         gravity_power=hair_gravity, fps=FPS, only_names=_only)
                     log("  physics baked: %d bone(s) (%s)"
                         % (len(hair_keys),
-                           "hair only" if bake_target == "hair" else "all chains"))
+                           "hair only" if bake_target == "hair" else "all"))
                     if _n_excl:
-                        log("  excluded %d non-chain (e.g. skirt ring) rigid "
-                            "bodies" % _n_excl)
+                        log("  skipped %d unreachable rigid bodies" % _n_excl)
             hair_bones = set(hair_keys)
             for bi, data in sorted(baked.items()):
                 if data["r"] and bi not in hair_bones:

@@ -59,9 +59,8 @@ def main(argv=None):
                     "spring sim); fixes frozen/IK-locked hair, ties, etc.")
     ap.add_argument("--bake-target", choices=["hair", "all"], default="hair",
                     help="which rigid bodies to bake: hair=hair only, "
-                    "all=all chain-type bodies (hair, tie, tail...). Ring "
-                    "structures like skirts are excluded automatically "
-                    "(default: hair)")
+                    "all=all dynamic bodies incl. skirts (cloth solver "
+                    "handles ring structures) (default: hair)")
     ap.add_argument("--hair-drag", type=float, default=0.85, metavar="F",
                     help="velocity retention 0..1 (default 0.85; higher = "
                     "floppier)")

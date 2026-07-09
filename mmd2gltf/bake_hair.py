@@ -391,7 +391,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     """
     nodes = gltf_json["nodes"]
     bwm = compute_bone_world_matrices(gltf_json)
-    chains, parts, excluded = extract_chains(physics_gltf, bwm, only_names=only_names)
+    chains, parts, excluded, lateral = extract_chains_bfs(
+        physics_gltf, bwm, only_names=only_names)
 
     # 親マップ
     parent = [-1] * len(nodes)
@@ -438,13 +439,327 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             out[rb] = ((M[0][3], M[1][3], M[2][3]), q)
         return out
 
-    keys = bake_hair_rotations(chains, anchor_fn, num_frames,
-                               drag_force=drag_force, stiffness_force=stiffness_force,
-                               gravity_power=gravity_power, gravity_dir=gravity_dir,
-                               dt=1.0 / fps)
-    # {bone: [(f,quat)...]} -> {bone: [quat...]}（フレーム順）
+    # コライダー収集: mode0 のカプセル/球（脚・体など）。dynamic を押し出す障害物。
+    rbs_pg = physics_gltf["rigidBodies"]
+    colliders_def = []   # (shape, bone_path, size, local_pos, local_rot)
+    for rb in rbs_pg:
+        if rb.get("mode") == 0 and rb.get("shape") in (0, 2):  # 0=球 2=カプセル
+            bi = rb.get("bone", -1)
+            if not (0 <= bi < len(nodes)):
+                continue
+            path = []
+            bb = bi
+            while bb != -1:
+                path.append(bb); bb = parent[bb]
+            path.reverse()
+            colliders_def.append((rb["shape"], path, rb["size"],
+                                  rb["position"], rb["rotation"]))
+
+    def colliders_at(f):
+        cols = []
+        for shape, path, size, lpos, lrot in colliders_def:
+            W = world_at(path, f)
+            M = mat_mul(W, trs_to_mat(lpos, lrot))
+            c = (M[0][3], M[1][3], M[2][3])
+            if shape == 0:               # 球
+                cols.append(("sphere", c, size[0]))
+            else:                        # カプセル（長軸=ローカルY）
+                _, wq = mat_to_trs(M)
+                ay = q_rotate_vec(wq, (0.0, 1.0, 0.0))
+                half = size[1] * 0.5
+                p0 = (c[0] - ay[0]*half, c[1] - ay[1]*half, c[2] - ay[2]*half)
+                p1 = (c[0] + ay[0]*half, c[1] + ay[1]*half, c[2] + ay[2]*half)
+                cols.append(("capsule", p0, p1, size[0]))
+        return cols
+
+    # クロスソルバでベイク（縦チェーン＋横距離拘束）。髪は lateral=[] で従来同等。
+    state = SpringState(chains)
+    dt = 1.0 / fps
+    warmup = 20
+    a0 = anchor_fn(0)
+    for _ in range(warmup):
+        for rb, (wp, wr) in a0.items():
+            state.set_anchor(rb, wp, wr)
+        simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
+                            lateral, gravity_power=gravity_power, iterations=6,
+                            colliders=colliders_at(0))
+    keys = {}
+    for f in range(num_frames):
+        a = anchor_fn(f)
+        for rb, (wp, wr) in a.items():
+            state.set_anchor(rb, wp, wr)
+        seg = simulate_step_cloth(state, gravity_dir, dt, drag_force,
+                                  stiffness_force, lateral,
+                                  gravity_power=gravity_power, iterations=6,
+                                  colliders=colliders_at(f))
+        loc = seg_rot_to_local(state, seg)
+        for bone, q in loc.items():
+            keys.setdefault(bone, []).append((f, q))
     out = {}
     for bone, ks in keys.items():
         ks.sort(key=lambda x: x[0])
         out[bone] = [q for _, q in ks]
     return out, len(excluded)
+
+
+# ======================================================================
+# クロス対応: BFSベースのチェーン抽出（リング構造を正しく分解）
+# ======================================================================
+def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
+    """アンカー(mode0剛体)からのBFSで親を決め、縦チェーン＋横距離拘束に分解。
+    髪(単純チェーン)もスカート(リング)も統一的に扱える。
+
+    戻り値: (chains, parts, excluded, lateral)
+      lateral = [(rb_i, rb_j, rest_len), ...]  非ツリー辺（横リング）の距離拘束
+    """
+    rbs = physics_gltf["rigidBodies"]
+    jts = physics_gltf["joints"]
+    bwm = bone_world_matrices
+
+    def target(rb):
+        if only_names is None:
+            return True
+        return any(k in rb["name"] for k in only_names)
+
+    def bpos(bi):
+        m = bwm[bi]
+        return (m[0][3], m[1][3], m[2][3]) if (0 <= bi < len(bwm) and m) else None
+
+    # 無向隣接（joint経由）。辺ごとに joint を保持
+    adj = {}   # rb_index -> list of (neighbor_rb, joint)
+    for j in jts:
+        a, b = j["rigidA"], j["rigidB"]
+        adj.setdefault(a, []).append((b, j))
+        adj.setdefault(b, []).append((a, j))
+
+    # 対象 dynamic 剛体
+    dyn = set(i for i, rb in enumerate(rbs) if rb["mode"] in (1, 2) and target(rb))
+    # アンカー = dynでない剛体で、dynに隣接するもの（mode0の親）
+    anchors = set()
+    for i in dyn:
+        for nb, j in adj.get(i, []):
+            if nb not in dyn:
+                anchors.add(nb)
+
+    # Particle 生成
+    parts = {}
+    for i in dyn:
+        p = Particle(rbs[i]["rb"] if False else i, rbs[i]["bone"], rbs[i]["mass"],
+                     kinematic=False)
+        p.rest_pos = bpos(rbs[i]["bone"])
+        parts[i] = p
+    for i in anchors:
+        p = Particle(i, rbs[i]["bone"], rbs[i]["mass"], kinematic=True)
+        p.rest_pos = bpos(rbs[i]["bone"])
+        parts[i] = p
+
+    # BFS（全アンカー同時開始）→ 親(ツリー辺)・深さ確定、非ツリー辺=横拘束
+    from collections import deque
+    depth = {i: 0 for i in anchors}
+    tree_joint = {}     # child_rb -> joint（親との辺）
+    dq = deque(anchors)
+    visited = set(anchors)
+    lateral = []
+    seen_pairs = set()
+    while dq:
+        cur = dq.popleft()
+        for nb, j in adj.get(cur, []):
+            if nb not in parts:      # 対象外(別カテゴリのdyn等)は無視
+                continue
+            if nb not in visited:
+                visited.add(nb)
+                depth[nb] = depth[cur] + 1
+                parts[nb].parent = cur
+                tree_joint[nb] = j
+                dq.append(nb)
+            else:
+                # 既訪問 = 非ツリー辺（横リング等）。距離拘束として1回だけ登録
+                if nb in dyn or cur in dyn:
+                    key = frozenset((cur, nb))
+                    if key not in seen_pairs and cur != nb:
+                        seen_pairs.add(key)
+                        # ツリーの親子辺は除外（それは距離拘束で別途張る）
+                        if parts[nb].parent != cur and parts[cur].parent != nb:
+                            rp_a, rp_b = parts[cur].rest_pos, parts[nb].rest_pos
+                            if rp_a and rp_b:
+                                lateral.append((cur, nb, _len(_sub(rp_a, rp_b))))
+
+    # rest_len / 角度制限 を tree_joint から埋める
+    for c_rb, p in parts.items():
+        if p.kinematic or p.parent == -1:
+            continue
+        j = tree_joint.get(c_rb)
+        if j:
+            p.ang_min = j["angularLimitMin"]
+            p.ang_max = j["angularLimitMax"]
+        pa = parts[p.parent]
+        if p.rest_pos and pa.rest_pos:
+            p.rest_len = _len(_sub(p.rest_pos, pa.rest_pos))
+
+    # 到達不能(アンカー無)を除外
+    excluded = set(i for i in dyn if parts[i].parent == -1)
+
+    # チェーン化: 各 dynamic を chain_root(最上位dynamic)でグループ化
+    def chain_root(i):
+        seen = 0
+        while parts[i].parent != -1 and not parts[parts[i].parent].kinematic:
+            i = parts[i].parent; seen += 1
+            if seen > 500:
+                break
+        return i
+
+    groups = {}
+    for i in dyn:
+        if i in excluded:
+            continue
+        groups.setdefault(chain_root(i), []).append(i)
+
+    chains = []
+    for r, members in groups.items():
+        members.sort(key=lambda i: depth.get(i, 0))
+        ch = Chain()
+        anchor_i = parts[members[0]].parent
+        if anchor_i in parts and parts[anchor_i].kinematic:
+            ch.particles.append(parts[anchor_i])
+        for i in members:
+            ch.particles.append(parts[i])
+        chains.append(ch)
+    chains.sort(key=lambda c: -len(c))
+    return chains, parts, excluded, lateral
+
+
+# ======================================================================
+# クロス対応ソルバ: 積分 → 縦横拘束を反復 → 回転出力（髪も包含）
+# ======================================================================
+def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
+                        lateral, gravity_power=0.02, iterations=6,
+                        colliders=None):
+    """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
+    lateral: [(rb_i, rb_j, rest_len), ...]
+    戻り値: seg_rot[rb]
+    """
+    pos, prev, part, rest_dir = state.pos, state.prev, state.part, state.rest_dir
+    anchor_rot = getattr(state, "_anchor_rot", {})
+    last_seg = getattr(state, "_last_seg", {})
+    stiff = stiffness_force * dt
+    grav = _scale(_norm(gravity_dir), gravity_power * dt) if gravity_power else (0.0, 0.0, 0.0)
+
+    # --- 1. 積分（慣性＋重力＋rest方向へのstiffness nudge） ---
+    for rb, p in part.items():
+        if p.kinematic:
+            continue
+        pa = part.get(p.parent)
+        q_par = (anchor_rot.get(p.parent, (0, 0, 0, 1)) if (pa and pa.kinematic)
+                 else last_seg.get(p.parent, (0, 0, 0, 1)))
+        tgt_dir = q_rotate_vec(q_par, rest_dir[rb]) if rb in rest_dir else (0, 0, 0)
+        inertia = _scale(_sub(pos[rb], prev[rb]), 1.0 - drag_force)
+        prev[rb] = pos[rb]
+        nxt = _add(pos[rb], inertia)
+        nxt = _add(nxt, grav)
+        if tgt_dir != (0, 0, 0):
+            nxt = _add(nxt, _scale(tgt_dir, stiff))
+        pos[rb] = nxt
+
+    # --- 2. 拘束を反復（縦length＋角度、横length、アンカー固定） ---
+    for _ in range(iterations):
+        # 縦: 各チェーン top-down（length + 角度クランプ）
+        for ch in state.chains:
+            plist = ch.particles
+            q_par = anchor_rot.get(plist[0].rb, (0, 0, 0, 1)) if plist[0].kinematic \
+                else (0, 0, 0, 1)
+            for k in range(1, len(plist)):
+                c = plist[k]; pa = plist[k-1]
+                rdir = rest_dir[c.rb]
+                tgt_dir = q_rotate_vec(q_par, rdir)
+                if c.inv_mass > 0:
+                    d = _sub(pos[c.rb], pos[pa.rb]); dl = _len(d)
+                    if dl > 1e-9:
+                        cur_dir = _scale(d, 1.0 / dl)
+                        # 角度クランプ
+                        if c.ang_max:
+                            amax = max(abs(c.ang_max[0]), abs(c.ang_max[2]))
+                            if amax > 1e-4:
+                                cang = max(-1.0, min(1.0, _dot(tgt_dir, cur_dir)))
+                                if cang < math.cos(amax):
+                                    ax = _cross(tgt_dir, cur_dir)
+                                    if _len(ax) > 1e-9:
+                                        cur_dir = _rotate_about(tgt_dir, _norm(ax), amax)
+                        pos[c.rb] = _add(pos[pa.rb], _scale(cur_dir, c.rest_len))
+                q_par = q_mul(q_from_to(tgt_dir, _norm(_sub(pos[c.rb], pos[pa.rb]))), q_par)
+        # 横: 距離拘束（両者dynamicなのでinv_mass比で配分）
+        for a, b, rl in lateral:
+            pa_, pb_ = part.get(a), part.get(b)
+            if not pa_ or not pb_:
+                continue
+            d = _sub(pos[b], pos[a]); dist = _len(d)
+            if dist < 1e-9:
+                continue
+            wa, wb = pa_.inv_mass, pb_.inv_mass
+            ws = wa + wb
+            if ws <= 0:
+                continue
+            corr = _scale(d, (dist - rl) / dist)
+            pos[a] = _add(pos[a], _scale(corr, wa / ws))
+            pos[b] = _sub(pos[b], _scale(corr, wb / ws))
+        # コライダー衝突（脚カプセル等への push-out）
+        if colliders:
+            resolve_collisions(state, colliders)
+        # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
+
+    # --- 3. 回転出力（top-down, 捻り保存）＋ last_seg キャッシュ ---
+    seg_rot = {}
+    for ch in state.chains:
+        plist = ch.particles
+        q_par = anchor_rot.get(plist[0].rb, (0, 0, 0, 1)) if plist[0].kinematic \
+            else (0, 0, 0, 1)
+        for k in range(1, len(plist)):
+            c = plist[k]; pa = plist[k-1]
+            cur_dir = _norm(_sub(pos[c.rb], pos[pa.rb]))
+            aim = q_from_to(q_rotate_vec(q_par, rest_dir[c.rb]), cur_dir)
+            seg_rot[c.rb] = q_mul(aim, q_par)
+            q_par = seg_rot[c.rb]
+    state._last_seg = seg_rot
+    return seg_rot
+
+
+# ======================================================================
+# コライダー衝突（push-out）: スカート等が脚カプセルを突き抜けないように
+# ======================================================================
+def _closest_on_segment(p, a, b):
+    ab = _sub(b, a)
+    denom = _dot(ab, ab)
+    if denom < 1e-12:
+        return a
+    t = _dot(_sub(p, a), ab) / denom
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    return _add(a, _scale(ab, t))
+
+def resolve_collisions(state, colliders, margin=0.0):
+    """dynamic パーティクルを各コライダーの外へ押し出す（片方向）。
+    colliders: [("capsule", p0, p1, radius), ("sphere", center, radius), ...]
+    """
+    if not colliders:
+        return
+    pos, part = state.pos, state.part
+    for rb, p in part.items():
+        if p.kinematic:
+            continue
+        P = pos[rb]
+        for col in colliders:
+            kind = col[0]
+            if kind == "capsule":
+                _, a, b, rad = col
+                C = _closest_on_segment(P, a, b)
+            elif kind == "sphere":
+                _, C, rad = col
+            else:
+                continue
+            dvec = _sub(P, C)
+            d = _len(dvec)
+            R = rad + margin
+            if d < R:
+                if d > 1e-9:
+                    P = _add(C, _scale(dvec, R / d))
+                else:
+                    P = _add(C, (R, 0.0, 0.0))  # 中心一致は適当な方向へ
+        pos[rb] = P
