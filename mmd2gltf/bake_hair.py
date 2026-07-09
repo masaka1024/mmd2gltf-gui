@@ -201,8 +201,13 @@ def q_from_to(a, b):
 
 
 class SpringState:
-    """スプリングボーン方式の状態。パーティクル=各ボーンの位置(tail)。"""
-    def __init__(self, chains):
+    """スプリングボーン方式の状態。パーティクル=各ボーンの位置(tail)。
+
+    rest_pos / rest_dir は形状の基準なので常に rest（変えない）。
+    pos / prev の初期値だけ init_pos で上書きできる（開始ポーズからシード）。
+    init_pos: {rb:(x,y,z)} または None。None or 未含有なら rest_pos でシード。
+    """
+    def __init__(self, chains, init_pos=None):
         self.chains = chains
         self.pos = {}       # rb -> world pos
         self.prev = {}
@@ -212,9 +217,10 @@ class SpringState:
             for p in ch.particles:
                 if p.rb not in self.part:
                     self.part[p.rb] = p
-                    self.pos[p.rb] = p.rest_pos
-                    self.prev[p.rb] = p.rest_pos
-            # rest方向を各子で計算
+                    seed = init_pos.get(p.rb) if init_pos else None
+                    seed = seed if seed is not None else p.rest_pos
+                    self.pos[p.rb] = seed
+                    self.prev[p.rb] = seed   # prev も同位置 = 初速ゼロ
             plist = ch.particles
             for k in range(1, len(plist)):
                 c = plist[k]; pa = plist[k-1]
@@ -431,6 +437,25 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             M = mat_mul(M, local_mat_at(bi, f))
         return M
 
+    def bone_path(bi):
+        path = []
+        bb = bi
+        while bb != -1:
+            path.append(bb); bb = parent[bb]
+        path.reverse()
+        return path
+
+    def bone_world_pos(bi, f):
+        M = world_at(bone_path(bi), f)
+        return (M[0][3], M[1][3], M[2][3])
+
+    # 下半身系(スカート等)判定用の腰Y（下半身→腰→センターの順で探す）
+    _node_names = [nd.get("name", "") for nd in nodes]
+    _waist = -1
+    for _nm in ("下半身", "腰", "センター", "Center"):
+        if _nm in _node_names:
+            _waist = _node_names.index(_nm); break
+
     def anchor_fn(f):
         out = {}
         for rb, (b, path) in anchors.items():
@@ -472,10 +497,29 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 cols.append(("capsule", p0, p1, size[0]))
         return cols
 
+    # 修正1: 初期位置シードは「下半身系(スカート等: アンカーが腰以下)」のみ
+    #   1F目FK位置に。髪などは rest シードのまま（=ベースライン挙動を厳密維持。
+    #   髪ボーンは凍結IK回転を含みうるので FK シードは形状を歪めるため）。
+    skirt_rbs = set()
+    if _waist >= 0:
+        _wy = bone_world_pos(_waist, 0)[1]
+        for ch in chains:
+            a0p = ch.particles[0]
+            if a0p.kinematic and 0 <= a0p.bone < len(nodes):
+                if bone_world_pos(a0p.bone, 0)[1] <= _wy + 0.05:
+                    for p in ch.particles:
+                        if not p.kinematic:
+                            skirt_rbs.add(p.rb)
+    init_pos = {}
+    for ch in chains:
+        for p in ch.particles:
+            if (not p.kinematic) and (p.rb in skirt_rbs) and 0 <= p.bone < len(nodes):
+                init_pos[p.rb] = bone_world_pos(p.bone, 0)
+
     # クロスソルバでベイク（縦チェーン＋横距離拘束）。髪は lateral=[] で従来同等。
-    state = SpringState(chains)
+    state = SpringState(chains, init_pos=init_pos)
     dt = 1.0 / fps
-    warmup = 20
+    warmup = 20   # 修正1のinit_posシードで十分。warmup増は髪の揺れを損なうため20維持
     a0 = anchor_fn(0)
     for _ in range(warmup):
         for rb, (wp, wr) in a0.items():
