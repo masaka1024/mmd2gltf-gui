@@ -500,6 +500,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # 修正1: 初期位置シードは「下半身系(スカート等: アンカーが腰以下)」のみ
     #   1F目FK位置に。髪などは rest シードのまま（=ベースライン挙動を厳密維持。
     #   髪ボーンは凍結IK回転を含みうるので FK シードは形状を歪めるため）。
+    def body_axis_at(f):
+        if _waist < 0:
+            return None
+        return (bone_world_pos(_waist, f), (0.0, 1.0, 0.0))
+
     skirt_rbs = set()
     if _waist >= 0:
         _wy = bone_world_pos(_waist, 0)[1]
@@ -526,8 +531,27 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             state.set_anchor(rb, wp, wr)
         simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                             lateral, gravity_power=gravity_power, iterations=6,
-                            colliders=colliders_at(0))
-    keys = {}
+                            colliders=colliders_at(0), body_axis=body_axis_at(0),
+                            radial_rbs=skirt_rbs)
+    # 剛体変換の逆・点変換（translation焼き用）
+    def _inv_rigid(M):
+        Rt = [[M[0][0], M[1][0], M[2][0]],
+              [M[0][1], M[1][1], M[2][1]],
+              [M[0][2], M[1][2], M[2][2]]]
+        t = (M[0][3], M[1][3], M[2][3])
+        ti = tuple(-(Rt[i][0]*t[0] + Rt[i][1]*t[1] + Rt[i][2]*t[2]) for i in range(3))
+        return [[Rt[0][0], Rt[0][1], Rt[0][2], ti[0]],
+                [Rt[1][0], Rt[1][1], Rt[1][2], ti[1]],
+                [Rt[2][0], Rt[2][1], Rt[2][2], ti[2]],
+                [0.0, 0.0, 0.0, 1.0]]
+
+    def _apply(M, p):
+        return (M[0][0]*p[0] + M[0][1]*p[1] + M[0][2]*p[2] + M[0][3],
+                M[1][0]*p[0] + M[1][1]*p[1] + M[1][2]*p[2] + M[1][3],
+                M[2][0]*p[0] + M[2][1]*p[1] + M[2][2]*p[2] + M[2][3])
+
+    keys = {}    # bone -> [(f, quat_local)]
+    tkeys = {}   # bone -> [(f, (x,y,z) local translation)]  スカート等のみ
     for f in range(num_frames):
         a = anchor_fn(f)
         for rb, (wp, wr) in a.items():
@@ -535,15 +559,42 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         seg = simulate_step_cloth(state, gravity_dir, dt, drag_force,
                                   stiffness_force, lateral,
                                   gravity_power=gravity_power, iterations=6,
-                                  colliders=colliders_at(f))
+                                  colliders=colliders_at(f), body_axis=body_axis_at(f),
+                                  radial_rbs=skirt_rbs)
         loc = seg_rot_to_local(state, seg)
         for bone, q in loc.items():
             keys.setdefault(bone, []).append((f, q))
+        # スカート(skirt_rbs)は位置も焼く: 回転のみだとボーン長が rest 固定で、
+        # 衝突押し出し(3D)を表現できず貫入が残るため。世界行列を top-down に構築し、
+        # 各スカートボーンの局所translationでパーティクル世界位置に正確に一致させる。
+        for ch in chains:
+            plist = ch.particles
+            a0p = plist[0]
+            if a0p.kinematic and a0p.rb in a:
+                (apx, apy, apz), aq = a[a0p.rb]
+                pw = trs_to_mat((apx, apy, apz), aq)
+            else:
+                pw = mat_ident()
+            for k in range(1, len(plist)):
+                c = plist[k]
+                lq = loc.get(c.bone, (0.0, 0.0, 0.0, 1.0))
+                if c.rb in skirt_rbs:
+                    lt = _apply(_inv_rigid(pw), state.pos[c.rb])
+                    tkeys.setdefault(c.bone, []).append((f, lt))
+                    pw = mat_mul(pw, trs_to_mat(lt, lq))
+                else:
+                    rdir = state.rest_dir.get(c.rb, (0.0, 0.0, 0.0))
+                    rl = c.rest_len
+                    pw = mat_mul(pw, trs_to_mat((rdir[0]*rl, rdir[1]*rl, rdir[2]*rl), lq))
     out = {}
     for bone, ks in keys.items():
         ks.sort(key=lambda x: x[0])
         out[bone] = [q for _, q in ks]
-    return out, len(excluded)
+    tout = {}
+    for bone, ts in tkeys.items():
+        ts.sort(key=lambda x: x[0])
+        tout[bone] = [t for _, t in ts]
+    return out, tout, len(excluded)
 
 
 # ======================================================================
@@ -677,7 +728,7 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
 # ======================================================================
 def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         lateral, gravity_power=0.02, iterations=6,
-                        colliders=None):
+                        colliders=None, body_axis=None, radial_rbs=None):
     """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
     lateral: [(rb_i, rb_j, rest_len), ...]
     戻り値: seg_rot[rb]
@@ -747,8 +798,15 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
             pos[b] = _sub(pos[b], _scale(corr, wb / ws))
         # コライダー衝突（脚カプセル等への push-out）
         if colliders:
-            resolve_collisions(state, colliders)
+            resolve_collisions(state, colliders, body_axis=body_axis,
+                               radial_rbs=radial_rbs)
         # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
+
+    # 反復後にもう一度押し出し: 直前の length 拘束が侵入を復活させても、
+    # 記録される最終位置は必ずコライダー外になるようにする（修正2）。
+    if colliders:
+        resolve_collisions(state, colliders, body_axis=body_axis,
+                           radial_rbs=radial_rbs)
 
     # --- 3. 回転出力（top-down, 捻り保存）＋ last_seg キャッシュ ---
     seg_rot = {}
@@ -778,13 +836,40 @@ def _closest_on_segment(p, a, b):
     t = 0.0 if t < 0 else (1.0 if t > 1 else t)
     return _add(a, _scale(ab, t))
 
-def resolve_collisions(state, colliders, margin=0.0):
+def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
+                       radial_rbs=None):
     """dynamic パーティクルを各コライダーの外へ押し出す（片方向）。
+
+    body_axis: (center, up) 下半身(腰)の世界位置と縦軸。指定時、かつ対象が
+      radial_rbs に含まれ、コライダーが腰より下(脚)のとき「体中心軸からの放射
+      外向き」に押し出す。深い侵入でも内側=逆側へ貫通せず、内股のひだが体中心へ
+      押し込まれない。それ以外は従来の最近傍表面方向（髪等の挙動を壊さない）。
+    radial_rbs: 放射押し出しの対象 rb 集合（スカート等の下半身系のみ）。None=全て。
     colliders: [("capsule", p0, p1, radius), ("sphere", center, radius), ...]
     """
     if not colliders:
         return
     pos, part = state.pos, state.part
+    bc = bup = None
+    if body_axis is not None:
+        bc, bup = body_axis
+
+    def body_out(P, u_axis):
+        """体中心軸からの水平放射外向き（u_axis=コライダー軸があれば直交化）。"""
+        if bc is None:
+            return None
+        rel = _sub(P, bc)
+        horiz = _sub(rel, _scale(bup, _dot(rel, bup)))  # 縦成分を除去
+        if _len(horiz) < 1e-6:
+            return None
+        n = _norm(horiz)
+        if u_axis is not None:
+            n = _sub(n, _scale(u_axis, _dot(n, u_axis)))
+            if _len(n) < 1e-6:
+                return None
+            n = _norm(n)
+        return n
+
     for rb, p in part.items():
         if p.kinematic:
             continue
@@ -794,16 +879,43 @@ def resolve_collisions(state, colliders, margin=0.0):
             if kind == "capsule":
                 _, a, b, rad = col
                 C = _closest_on_segment(P, a, b)
+                u_axis = _norm(_sub(b, a))
             elif kind == "sphere":
                 _, C, rad = col
+                u_axis = None
             else:
                 continue
             dvec = _sub(P, C)
             d = _len(dvec)
             R = rad + margin
-            if d < R:
+            if d >= R:
+                continue
+            # 放射外向きは「腰より下のコライダー(脚)」かつ「下半身系パーティクル」限定。
+            # 髪等・腰より上のコライダー(頭)は従来の表面法線に戻す。
+            # 放射は「深い侵入(d < R*0.5=軸に近く逆側へ貫通しうる)」のみ。
+            # 腰際の最上段スカートが腰コライダーと常時浅く重なる場合は最近傍を使い、
+            # 放射の毎フレーム外向き累積による「腰への巻き込み・戻らない」を防ぐ。
+            use_radial = ((bc is not None) and (C[1] < bc[1])
+                          and (radial_rbs is None or rb in radial_rbs)
+                          and (d < R * 0.5))
+            n = body_out(P, u_axis) if use_radial else None
+            if n is None:
                 if d > 1e-9:
                     P = _add(C, _scale(dvec, R / d))
                 else:
-                    P = _add(C, (R, 0.0, 0.0))  # 中心一致は適当な方向へ
+                    P = _add(C, (R, 0.0, 0.0))
+                continue
+            # 放射方向 n に沿って軸距離が R になる t>=0 を解く（逆側貫通しない）
+            perp = _sub(P, C)
+            pn = _dot(perp, n)
+            pp = _dot(perp, perp)
+            disc = pn * pn - (pp - R * R)
+            if disc < 0.0:
+                if d > 1e-9:
+                    P = _add(C, _scale(dvec, R / d))
+                continue
+            t = -pn + math.sqrt(disc)
+            if t < 0.0:
+                t = 0.0
+            P = _add(P, _scale(n, t))
         pos[rb] = P

@@ -610,6 +610,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             # bake_target: "hair"=髪のみ / "all"=全dynamic剛体
             #   （スカート等のリング構造もクロスシミュで扱う）
             hair_keys = {}
+            hair_tkeys = {}
             if bake_physics:
                 _phys = g.j.get("extras", {}).get("mmd", {}).get("physicsGltf")
                 if _phys is None:
@@ -620,7 +621,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         _mmdx, physics.compute_bone_world_matrices(g.j))
                 if _phys.get("rigidBodies"):
                     _only = ["髪"] if bake_target == "hair" else None
-                    hair_keys, _n_excl = bake_hair_into_gltf(
+                    hair_keys, hair_tkeys, _n_excl = bake_hair_into_gltf(
                         g.j, baked, len(times), _phys, scale,
                         drag_force=hair_drag, stiffness_force=hair_stiffness,
                         gravity_power=hair_gravity, fps=FPS, only_names=_only)
@@ -672,8 +673,22 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                 anim["channels"].append({
                     "sampler": len(anim["samplers"]) - 1,
                     "target": {"node": bi, "path": "rotation"}})
+            # スカート等はクロス衝突を回転だけで表現できないため位置も焼く。
+            # hair_tkeys は glTF 局所translation（cpos不要）。
+            for bi, ts in sorted(hair_tkeys.items()):
+                flat = []
+                for t in ts:
+                    flat += [t[0], t[1], t[2]]
+                out = g.add_accessor(flat, G.FLOAT, "VEC3")
+                anim["samplers"].append({"input": t_acc, "output": out,
+                                         "interpolation": "LINEAR"})
+                anim["channels"].append({
+                    "sampler": len(anim["samplers"]) - 1,
+                    "target": {"node": bi, "path": "translation"}})
             if hair_keys:
                 log("  physics rotation channels: %d" % len(hair_keys))
+            if hair_tkeys:
+                log("  physics translation channels: %d" % len(hair_tkeys))
             log("  bone animation: %d channels, %d key frames"
                 % (len(anim["channels"]), len(times)))
 
