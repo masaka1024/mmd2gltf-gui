@@ -633,6 +633,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                     if _n_excl:
                         log("  skipped %d unreachable rigid bodies" % _n_excl)
             hair_bones = set(hair_keys)
+            hair_tbones = set(hair_tkeys)
             for bi, data in sorted(baked.items()):
                 if data["r"] and bi not in hair_bones:
                     flat = []
@@ -650,7 +651,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                     anim["channels"].append({
                         "sampler": len(anim["samplers"]) - 1,
                         "target": {"node": bi, "path": "rotation"}})
-                if data["t"]:
+                if data["t"] and bi not in hair_tbones:
                     flat = []
                     for t in data["t"]:
                         flat += cpos(t, scale)

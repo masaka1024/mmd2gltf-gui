@@ -175,8 +175,9 @@ class PBDState:
             for p in ch.particles:
                 if p.rb not in self.part:
                     self.part[p.rb] = p
-                    self.pos[p.rb] = p.rest_pos
-                    self.prev[p.rb] = p.rest_pos
+                    seed = p.rest_pos if p.rest_pos is not None else (0.0, 0.0, 0.0)
+                    self.pos[p.rb] = seed
+                    self.prev[p.rb] = seed
 
     def set_anchor(self, rb_index, world_pos):
         self.pos[rb_index] = world_pos
@@ -218,13 +219,19 @@ class SpringState:
                 if p.rb not in self.part:
                     self.part[p.rb] = p
                     seed = init_pos.get(p.rb) if init_pos else None
-                    seed = seed if seed is not None else p.rest_pos
+                    if seed is None:
+                        seed = p.rest_pos
+                    if seed is None:
+                        seed = (0.0, 0.0, 0.0)  # rest_pos 欠落時の保険
                     self.pos[p.rb] = seed
                     self.prev[p.rb] = seed   # prev も同位置 = 初速ゼロ
             plist = ch.particles
             for k in range(1, len(plist)):
                 c = plist[k]; pa = plist[k-1]
-                self.rest_dir[c.rb] = _norm(_sub(c.rest_pos, pa.rest_pos))
+                if c.rest_pos and pa.rest_pos:
+                    self.rest_dir[c.rb] = _norm(_sub(c.rest_pos, pa.rest_pos))
+                else:
+                    self.rest_dir[c.rb] = (0.0, -1.0, 0.0)  # 安全側の既定方向
 
     def set_anchor(self, rb, world_pos, world_rot=(0.0, 0.0, 0.0, 1.0)):
         self.pos[rb] = world_pos
@@ -553,7 +560,12 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
 
     keys = {}    # bone -> [(f, quat_local)]
     tkeys = {}   # bone -> [(f, (x,y,z) local translation)]  スカート等のみ
+    _ndyn = sum(1 for ch in chains for pp in ch.particles if not pp.kinematic)
+    print("  [physics] baking %d cloth bones over %d frames..."
+          % (_ndyn, num_frames))
     for f in range(num_frames):
+        if f % 500 == 0 and f > 0:
+            print("  [physics]   frame %d/%d" % (f, num_frames))
         a = anchor_fn(f)
         for rb, (wp, wr) in a.items():
             state.set_anchor(rb, wp, wr)
@@ -568,6 +580,9 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         # スカート(skirt_rbs)は位置も焼く: 回転のみだとボーン長が rest 固定で、
         # 衝突押し出し(3D)を表現できず貫入が残るため。世界行列を top-down に構築し、
         # 各スカートボーンの局所translationでパーティクル世界位置に正確に一致させる。
+        # 複数剛体が同一ボーンを共有する場合、そのボーンには1フレーム1回だけ記録する
+        # （でないと出力アクセサのカウントが frame数×共有数 に膨れ、glTF検証エラー）。
+        t_written = set()
         for ch in chains:
             plist = ch.particles
             a0p = plist[0]
@@ -581,7 +596,9 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 lq = loc.get(c.bone, (0.0, 0.0, 0.0, 1.0))
                 if c.rb in skirt_rbs:
                     lt = _apply(_inv_rigid(pw), state.pos[c.rb])
-                    tkeys.setdefault(c.bone, []).append((f, lt))
+                    if c.bone not in t_written:
+                        tkeys.setdefault(c.bone, []).append((f, lt))
+                        t_written.add(c.bone)
                     pw = mat_mul(pw, trs_to_mat(lt, lq))
                 else:
                     rdir = state.rest_dir.get(c.rb, (0.0, 0.0, 0.0))
@@ -628,13 +645,16 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
         adj.setdefault(a, []).append((b, j))
         adj.setdefault(b, []).append((a, j))
 
-    # 対象 dynamic 剛体
-    dyn = set(i for i, rb in enumerate(rbs) if rb["mode"] in (1, 2) and target(rb))
-    # アンカー = dynでない剛体で、dynに隣接するもの（mode0の親）
+    # 対象 dynamic 剛体。rest_pos が取れない(bone=-1 等でNone)剛体は
+    # 位置も回転も焼けないため最初から除外する（None混入によるクラッシュ防止）。
+    dyn = set(i for i, rb in enumerate(rbs)
+              if rb["mode"] in (1, 2) and target(rb) and bpos(rb["bone"]) is not None)
+    # アンカー = dynでない剛体で、dynに隣接するもの（mode0の親）。
+    # アンカーも rest_pos が None のものは使えないので除外。
     anchors = set()
     for i in dyn:
         for nb, j in adj.get(i, []):
-            if nb not in dyn:
+            if nb not in dyn and bpos(rbs[nb]["bone"]) is not None:
                 anchors.add(nb)
 
     # Particle 生成
@@ -856,6 +876,24 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
     if body_axis is not None:
         bc, bup = body_axis
 
+    # ブロードフェーズ用: 各コライダーの中心と「カル半径^2」を前計算。
+    # パーティクルが中心からカル半径より遠ければ詳細判定(closest_on_segment)を省く。
+    # 大規模モデル(多数の揺れ物×多数コライダー)で致命的に効く。
+    _bp = []   # (col, cx, cy, cz, cull_sq)
+    for col in colliders:
+        if col[0] == "capsule":
+            _, a, b, rad = col
+            cx = (a[0] + b[0]) * 0.5; cy = (a[1] + b[1]) * 0.5; cz = (a[2] + b[2]) * 0.5
+            half = 0.5 * math.sqrt((b[0]-a[0])**2 + (b[1]-a[1])**2 + (b[2]-a[2])**2)
+            cull = half + rad + margin
+        elif col[0] == "sphere":
+            _, c, rad = col
+            cx, cy, cz = c
+            cull = rad + margin
+        else:
+            continue
+        _bp.append((col, cx, cy, cz, cull * cull))
+
     def body_out(P, u_axis):
         """体中心軸からの水平放射外向き（u_axis=コライダー軸があれば直交化）。"""
         if bc is None:
@@ -876,7 +914,12 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
         if p.kinematic:
             continue
         P = pos[rb]
-        for col in colliders:
+        px, py, pz = P
+        for col, ccx, ccy, ccz, cull_sq in _bp:
+            # ブロードフェーズ: 中心から遠ければ詳細判定を省く
+            dxc = px - ccx; dyc = py - ccy; dzc = pz - ccz
+            if dxc*dxc + dyc*dyc + dzc*dzc > cull_sq:
+                continue
             kind = col[0]
             if kind == "capsule":
                 _, a, b, rad = col
