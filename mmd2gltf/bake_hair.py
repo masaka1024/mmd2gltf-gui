@@ -383,6 +383,7 @@ def _cpos(t, s):
 
 
 def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
+                        collision_margin=0.0,
                         drag_force=0.85, stiffness_force=1.5, gravity_power=0.02,
                         gravity_dir=(0.0, -1.0, 0.0), fps=30.0,
                         only_names=("髪",)):
@@ -532,7 +533,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                             lateral, gravity_power=gravity_power, iterations=6,
                             colliders=colliders_at(0), body_axis=body_axis_at(0),
-                            radial_rbs=skirt_rbs)
+                            radial_rbs=skirt_rbs, margin=collision_margin)
     # 剛体変換の逆・点変換（translation焼き用）
     def _inv_rigid(M):
         Rt = [[M[0][0], M[1][0], M[2][0]],
@@ -560,7 +561,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                   stiffness_force, lateral,
                                   gravity_power=gravity_power, iterations=6,
                                   colliders=colliders_at(f), body_axis=body_axis_at(f),
-                                  radial_rbs=skirt_rbs)
+                                  radial_rbs=skirt_rbs, margin=collision_margin)
         loc = seg_rot_to_local(state, seg)
         for bone, q in loc.items():
             keys.setdefault(bone, []).append((f, q))
@@ -728,7 +729,8 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
 # ======================================================================
 def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         lateral, gravity_power=0.02, iterations=6,
-                        colliders=None, body_axis=None, radial_rbs=None):
+                        colliders=None, body_axis=None, radial_rbs=None,
+                        margin=0.0):
     """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
     lateral: [(rb_i, rb_j, rest_len), ...]
     戻り値: seg_rot[rb]
@@ -799,14 +801,14 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
         # コライダー衝突（脚カプセル等への push-out）
         if colliders:
             resolve_collisions(state, colliders, body_axis=body_axis,
-                               radial_rbs=radial_rbs)
+                               radial_rbs=radial_rbs, margin=margin)
         # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
 
     # 反復後にもう一度押し出し: 直前の length 拘束が侵入を復活させても、
     # 記録される最終位置は必ずコライダー外になるようにする（修正2）。
     if colliders:
         resolve_collisions(state, colliders, body_axis=body_axis,
-                           radial_rbs=radial_rbs)
+                           radial_rbs=radial_rbs, margin=margin)
 
     # --- 3. 回転出力（top-down, 捻り保存）＋ last_seg キャッシュ ---
     seg_rot = {}

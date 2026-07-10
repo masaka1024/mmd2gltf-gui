@@ -68,6 +68,11 @@ def main(argv=None):
                     help="rest-shape restoring force (default 1.5)")
     ap.add_argument("--hair-gravity", type=float, default=0.02, metavar="F",
                     help="gravity strength (default 0.02; 0 keeps rest shape)")
+    ap.add_argument("--collision-margin", type=float, default=0.01, metavar="F",
+                    help="clearance kept between cloth and body colliders in "
+                    "glTF units (default 0.01). Increase if the skirt visually "
+                    "touches/clips the legs; 0 = push to the collider surface "
+                    "exactly")
     a = ap.parse_args(argv)
 
     out = a.output or os.path.splitext(a.pmx)[0] + ".glb"
@@ -82,7 +87,8 @@ def main(argv=None):
                 custom_attrs=not a.no_custom_attrs, scale=a.scale,
                 bake_physics=a.bake_physics, bake_target=a.bake_target,
                 hair_drag=a.hair_drag, hair_stiffness=a.hair_stiffness,
-                hair_gravity=a.hair_gravity)
+                hair_gravity=a.hair_gravity,
+                collision_margin=a.collision_margin)
     except Exception as e:
         print("error:", e, file=sys.stderr)
         return 1
