@@ -83,6 +83,7 @@ STRINGS = {
         "adv_bake_target": "対象",
         "adv_target_hair": "髪のみ",
         "adv_target_all": "全部(髪・スカート・ネクタイ等)",
+        "adv_margin_label": "衝突クリアランス",
         "run_button": "変換する",
         "frame_log": "ログ",
         "err_title": "入力エラー",
@@ -141,6 +142,7 @@ STRINGS = {
         "adv_bake_target": "Target",
         "adv_target_hair": "Hair only",
         "adv_target_all": "All (hair, skirt, tie, etc.)",
+        "adv_margin_label": "Collision clearance",
         "run_button": "Convert",
         "frame_log": "Log",
         "err_title": "Input error",
@@ -333,6 +335,7 @@ class App(_BaseTk):
         self.anim_var = tk.StringVar()
         self.bakehair_var = tk.BooleanVar(value=False)
         self.baketarget_var = tk.StringVar(value="hair")
+        self.margin_var = tk.StringVar(value="0.01")
 
         cb3 = ttk.Checkbutton(self.adv, variable=self.noik_var)
         cb3.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
@@ -379,6 +382,12 @@ class App(_BaseTk):
                                  value="all")
         rb_all.pack(side="left", padx=8)
         self._i18n_widgets.append((rb_all, "adv_target_all"))
+
+        lbl_mg = ttk.Label(self.adv, text="")
+        lbl_mg.grid(row=9, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
+        ttk.Entry(self.adv, textvariable=self.margin_var, width=8).grid(
+            row=9, column=1, sticky="w", **pad)
 
         run = ttk.Frame(frm)
         run.pack(fill="x", **pad)
@@ -476,6 +485,10 @@ class App(_BaseTk):
         except Exception:
             messagebox.showwarning(self.t("err_title"), self.t("err_scale_invalid"))
             return
+        try:
+            margin = float(self.margin_var.get())
+        except Exception:
+            margin = 0.01
         kwargs = dict(
             vmd_path=vmd,
             unlit=self.unlit_var.get(),
@@ -492,6 +505,7 @@ class App(_BaseTk):
             scale=scale,
             bake_physics=self.bakehair_var.get(),
             bake_target=self.baketarget_var.get(),
+            collision_margin=margin,
         )
         self.run_btn.configure(state="disabled")
         self.prog.start(12)
