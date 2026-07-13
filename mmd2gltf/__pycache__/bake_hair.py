@@ -559,20 +559,6 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                     for p in ch.particles:
                         if not p.kinematic:
                             skirt_rbs.add(p.rb)
-
-    # 横拘束(lateral)はスカートのリング(2次元クロス)専用。髪・ネクタイ・胸などの
-    # チェーン型揺れ物は、モデルにストランド間ジョイントがあると非ツリー辺として
-    # lateral 化され、ハード距離拘束で2次元網に固まり中間ボーンが偽平衡に固着する
-    # (実測: IAの髪FLB2が頭姿勢に無関係に67°固着。lateral除去で静止1.4°/動的に解放)。
-    # lateral は両端がスカート剛体のものだけ残す(髪等のチェーンは lateral=[] が本来の設計)。
-    _lat_before = len(lateral)
-    lateral = [(a, b, rl) for (a, b, rl) in lateral
-               if a in skirt_rbs and b in skirt_rbs]
-    if _lat_before != len(lateral):
-        print("  [physics] dropped %d non-skirt lateral constraint(s) "
-              "(hair/necktie/etc. are chains, not cloth)"
-              % (_lat_before - len(lateral)))
-
     init_pos = {}
     for ch in chains:
         for p in ch.particles:
@@ -606,7 +592,6 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # クロスソルバでベイク（縦チェーン＋横距離拘束）。髪は lateral=[] で従来同等。
     state = SpringState(chains, init_pos=init_pos)
     dt = 1.0 / fps
-
     warmup = 20   # 修正1のinit_posシードで十分。warmup増は髪の揺れを損なうため20維持
     a0 = anchor_fn(0)
     for _ in range(warmup):
@@ -617,7 +602,6 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                             colliders=colliders_at(0), body_axis=body_axis_at(0),
                             radial_rbs=skirt_rbs, margin=collision_margin,
                             exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs)
-
     # 剛体変換の逆・点変換（translation焼き用）
     def _inv_rigid(M):
         Rt = [[M[0][0], M[1][0], M[2][0]],
@@ -848,68 +832,6 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
             ch.particles.append(parts[i])
         chains.append(ch)
     chains.sort(key=lambda c: -len(c))
-
-    # 警告用: 複数アンカー(腰＋脚など、輪を複数箇所で固定する構造)の検出。
-    # ツリー辺(parent)＋横拘束(lateral)を辿った連結成分内に、異なるアンカー
-    # (kinematic剛体)が複数あれば、裾を脚に密着させる等の「巻きつき」設計。
-    # このソルバーは単一アンカー(腰のみ)のチェーンを主に想定しており、
-    # 複数アンカー構造では衝突・振動が不安定になりやすい（既知の制限）。
-    def true_anchor(i):
-        seen = 0
-        cur = i
-        while parts[cur].parent != -1:
-            cur = parts[cur].parent; seen += 1
-            if seen > 1000:
-                break
-        return cur
-
-    uf = {}
-    def uf_find(x):
-        while uf.get(x, x) != x:
-            uf[x] = uf.get(uf[x], uf[x])
-            x = uf[x]
-        return x
-    def uf_union(a, b):
-        ra, rb = uf_find(a), uf_find(b)
-        if ra != rb:
-            uf[ra] = rb
-
-    all_ids = set(dyn) | anchors
-    for i in all_ids:
-        uf.setdefault(i, i)
-    for i in dyn:
-        if i not in excluded:
-            uf_union(i, true_anchor(i))
-    for a, b, _rl in lateral:
-        uf_union(a, b)
-
-    comp_anchors = {}
-    for i in dyn:
-        if i in excluded:
-            continue
-        root = uf_find(i)
-        comp_anchors.setdefault(root, set()).add(true_anchor(i))
-
-    multi_anchor_groups = [(root, anc) for root, anc in comp_anchors.items() if len(anc) > 1]
-    if multi_anchor_groups:
-        seen_names = set()
-        for root, anc in multi_anchor_groups:
-            for a in anc:
-                bi = rbs[a].get("bone", -1)
-                if 0 <= bi < len(bone_world_matrices):
-                    pass
-                seen_names.add(rbs[a]["name"])
-        names_list = sorted(seen_names)
-        shown = names_list[:8]
-        names_str = ", ".join(shown)
-        if len(names_list) > 8:
-            names_str += " 他%d件" % (len(names_list) - 8)
-        print("  [physics] 警告: 複数アンカー構造を検出 (%d グループ, アンカー候補: %s)。"
-              % (len(multi_anchor_groups), names_str))
-        print("  [physics]   例: 裾を脚に密着させる等の「巻きつき」設計。腰のみアンカーの"
-              "通常のスカート/髪と異なり、この構造は物理挙動が不安定(振動)になる場合が"
-              "あります。目視で確認してください。")
-
     return chains, parts, excluded, lateral
 
 
