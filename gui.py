@@ -85,6 +85,10 @@ STRINGS = {
         "adv_target_hair": "髪のみ",
         "adv_target_all": "全部(髪・スカート・ネクタイ等)",
         "adv_margin_label": "衝突クリアランス",
+        "adv_hem_margin_label": "裾だけ追加クリアランス",
+        "adv_hem_margin_hint": "スカートの末端(裾)だけに、上のクリアランスを上乗せします。"
+                                "腰側には影響しません。太もも等への見た目の食い込みが\n"
+                                "気になる場合、0.01前後から試してください。",
         "adv_collision_mode_label": "衝突モード",
         "adv_collision_mode_normal": "通常（リストの剛体だけ衝突させない）",
         "adv_collision_mode_allow": "限定（リストの剛体だけ衝突させる）",
@@ -162,6 +166,10 @@ STRINGS = {
         "adv_target_hair": "Hair only",
         "adv_target_all": "All (hair, skirt, tie, etc.)",
         "adv_margin_label": "Collision clearance",
+        "adv_hem_margin_label": "Extra clearance (hem only)",
+        "adv_hem_margin_hint": "Adds extra clearance on top of the setting above, but only "
+                                "at the skirt's hem (tip). The waist side is unaffected. "
+                                "Try around 0.01 if the legs visually poke through the hem.",
         "adv_collision_mode_label": "Collision mode",
         "adv_collision_mode_normal": "Normal (exclude only the listed bodies)",
         "adv_collision_mode_allow": "Restricted (only the listed bodies collide)",
@@ -375,6 +383,7 @@ class App(_BaseTk):
         self.bakehair_var = tk.BooleanVar(value=False)
         self.baketarget_var = tk.StringVar(value="hair")
         self.margin_var = tk.StringVar(value="0.01")
+        self.hemmargin_var = tk.StringVar(value="0.0")
         self.collmode_var = tk.StringVar(value="normal")
         self.collnames_var = tk.StringVar()
 
@@ -429,6 +438,16 @@ class App(_BaseTk):
         self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
         ttk.Entry(self.adv, textvariable=self.margin_var, width=8).grid(
             row=9, column=1, sticky="w", **pad)
+
+        lbl_hmg = ttk.Label(self.adv, text="")
+        lbl_hmg.grid(row=15, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_hmg, "adv_hem_margin_label"))
+        ttk.Entry(self.adv, textvariable=self.hemmargin_var, width=8).grid(
+            row=15, column=1, sticky="w", **pad)
+        self.lbl_hmg_hint = ttk.Label(self.adv, text="", foreground="#666666",
+                                      wraplength=380, justify="left")
+        self.lbl_hmg_hint.grid(row=16, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_hmg_hint, "adv_hem_margin_hint"))
 
         lbl_cm = ttk.Label(self.adv, text="")
         lbl_cm.grid(row=10, column=0, sticky="w", **pad)
@@ -661,6 +680,10 @@ class App(_BaseTk):
             margin = float(self.margin_var.get())
         except Exception:
             margin = 0.01
+        try:
+            hem_margin = float(self.hemmargin_var.get())
+        except Exception:
+            hem_margin = 0.0
         _coll_names = [s.strip() for s in self.collnames_var.get().split(",") if s.strip()] or None
         force_no_collision = _coll_names if self.collmode_var.get() == "normal" else None
         allowed_collider = _coll_names if self.collmode_var.get() == "allow" else None
@@ -683,6 +706,7 @@ class App(_BaseTk):
             collision_margin=margin,
             force_no_collision_names=force_no_collision,
             allowed_collider_names=allowed_collider,
+            hem_extra_margin=hem_margin,
         )
         self.run_btn.configure(state="disabled")
         self.prog.start(12)
