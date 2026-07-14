@@ -225,7 +225,8 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             custom_attrs=True, scale=0.08,
             bake_physics=False, bake_target="hair",
             hair_drag=0.85, hair_stiffness=1.5, hair_gravity=0.02,
-            collision_margin=0.01):
+            collision_margin=0.01,
+            force_no_collision_names=None, allowed_collider_names=None):
     """`scale` converts MMD units to glTF units (meters). PMX models are
     conventionally authored at roughly 1 MMD unit = 8cm (a ~160cm-tall
     character is about 20 units tall), but glTF assumes 1 unit = 1 meter, so
@@ -626,7 +627,9 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         g.j, baked, len(times), _phys, scale,
                         drag_force=hair_drag, stiffness_force=hair_stiffness,
                         gravity_power=hair_gravity, fps=FPS, only_names=_only,
-                        collision_margin=collision_margin)
+                        collision_margin=collision_margin,
+                        force_no_collision_names=force_no_collision_names,
+                        allowed_collider_names=allowed_collider_names)
                     log("  physics baked: %d bone(s) (%s)"
                         % (len(hair_keys),
                            "hair only" if bake_target == "hair" else "all"))

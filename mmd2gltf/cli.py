@@ -73,6 +73,18 @@ def main(argv=None):
                     "glTF units (default 0.01). Increase if the skirt visually "
                     "touches/clips the legs; 0 = push to the collider surface "
                     "exactly")
+    ap.add_argument("--force-no-collision", action="append", metavar="NAME",
+                    help="rigid body name to force fully non-colliding, "
+                    "overriding its PMX group/noCollisionMask (denylist "
+                    "escape hatch; repeatable). Use when a specific collider "
+                    "pins/stretches cloth in extreme poses despite the PMX "
+                    "data appearing correctly configured")
+    ap.add_argument("--allowed-collider", action="append", metavar="NAME",
+                    help="switch collision to allowlist mode: only the named "
+                    "rigid bodies are treated as colliders at all (repeatable; "
+                    "ignores PMX group/noCollisionMask entirely once any "
+                    "--allowed-collider is given). Mirrors VRM SpringBone / "
+                    "VRChat PhysBones-style per-chain collider scoping")
     a = ap.parse_args(argv)
 
     out = a.output or os.path.splitext(a.pmx)[0] + ".glb"
@@ -88,7 +100,9 @@ def main(argv=None):
                 bake_physics=a.bake_physics, bake_target=a.bake_target,
                 hair_drag=a.hair_drag, hair_stiffness=a.hair_stiffness,
                 hair_gravity=a.hair_gravity,
-                collision_margin=a.collision_margin)
+                collision_margin=a.collision_margin,
+                force_no_collision_names=a.force_no_collision,
+                allowed_collider_names=a.allowed_collider)
     except Exception as e:
         print("error:", e, file=sys.stderr)
         return 1

@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-14d (hair-lateral-fix + skirt length-restore + MMD group/noCollisionMask respected)"
+BAKE_HAIR_VERSION = "2026-07-14f (+ allowed_collider_names: switchable denylist/allowlist collision modes)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -438,7 +438,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         collision_margin=0.0,
                         drag_force=0.85, stiffness_force=1.5, gravity_power=0.02,
                         gravity_dir=(0.0, -1.0, 0.0), fps=30.0,
-                        only_names=("髪",)):
+                        only_names=("髪",), force_no_collision_names=None,
+                        allowed_collider_names=None):
     """体アニメ baked を駆動源に、髪ボーンのローカル回転キーを生成する。
 
     gltf_json    : 組み上がった g.j（nodes 必須）
@@ -446,6 +447,25 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     num_frames   : len(times)
     physics_gltf : extras.mmd.physicsGltf（build_physics_gltf の出力）
     scale        : unitScale
+    force_no_collision_names : 剛体名の集合(set/list)。指定すると、その名前に
+        一致する剛体を全グループ非衝突として扱う(PMXのgroup/noCollisionMask
+        設定を上書き)。デフォルトNoneなら何もしない(既存挙動と完全に同じ)。
+        PMX側のnoCollisionMaskが正しく保存されていない、あるいはMMD側が
+        正しく反映していない可能性がある剛体を、変換時に個別に除外するための
+        逃げ道。両側(揺れ物の粒子側・静的コライダー側)どちらの名前を指定しても
+        機能する(例: {"下半身02"} や、髪/スカートのグループをまとめて除外する
+        名前リストなど)。
+    allowed_collider_names : コライダー剛体名の集合(set/list)。指定すると、
+        揺れ物の衝突判定を「デナイリスト方式」(MMD/PMX標準: 全コライダーと
+        衝突する。noCollisionMask/force_no_collision_namesで個別に除外する)
+        から「アローリスト方式」(VRM SpringBone/VRChat PhysBones方式: この
+        リストに列挙したコライダーだけを見る。それ以外は最初から存在しない
+        ものとして扱う)へ切り替える。デフォルトNoneならデナイリスト方式
+        (既存挙動と完全に同じ)。指定した場合、PMXのgroup/noCollisionMaskや
+        force_no_collision_namesは一切参照されない(アローリストが唯一の
+        判定基準になる)。モデル制作者が非衝突グループの設定を誤った/MMD側が
+        正しく反映していない可能性がある場合に、脚・腰など本当に必要な
+        コライダーだけを明示して安全に運用するための代替モード。
     戻り値       : { node_index: [ (x,y,z,w), ... num_frames ] }（glTF局所回転）
     """
     nodes = gltf_json["nodes"]
@@ -453,6 +473,26 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     bwm = compute_bone_world_matrices(gltf_json)
     chains, parts, excluded, lateral = extract_chains_bfs(
         physics_gltf, bwm, only_names=only_names)
+    rbs_names_all = physics_gltf["rigidBodies"]
+    if force_no_collision_names:
+        _force_set = set(force_no_collision_names)
+        _forced = 0
+        for p in parts.values():
+            if rbs_names_all[p.rb]["name"] in _force_set:
+                p.no_collision_mask = 0xFFFF
+                _forced += 1
+        if _forced:
+            print("  [physics] force_no_collision_names: %d particle(s) forced "
+                  "to non-colliding (%s)" % (_forced, sorted(_force_set)))
+
+    allowed_collider_rbi = None
+    if allowed_collider_names is not None:
+        _allow_set = set(allowed_collider_names)
+        allowed_collider_rbi = set(i for i, rb in enumerate(rbs_names_all)
+                                   if rb["name"] in _allow_set)
+        print("  [physics] allowed_collider_names: allowlist mode ON, "
+              "%d/%d requested name(s) matched a rigid body (%s)"
+              % (len(allowed_collider_rbi), len(_allow_set), sorted(_allow_set)))
 
     # 親マップ
     parent = [-1] * len(nodes)
@@ -531,9 +571,12 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             while bb != -1:
                 path.append(bb); bb = parent[bb]
             path.reverse()
+            _mask = rb.get("noCollisionMask", 0)
+            if force_no_collision_names and rb["name"] in force_no_collision_names:
+                _mask = 0xFFFF
             colliders_def.append((rb["shape"], path, rb["size"],
                                   rb["position"], rb["rotation"],
-                                  rb.get("group", 0), rb.get("noCollisionMask", 0), _rbi))
+                                  rb.get("group", 0), _mask, _rbi))
 
     def colliders_at(f):
         cols = []
@@ -627,7 +670,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                             lateral, gravity_power=gravity_power, iterations=6,
                             colliders=colliders_at(0), body_axis=body_axis_at(0),
                             radial_rbs=skirt_rbs, margin=collision_margin,
-                            exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs)
+                            exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                            allowed_collider_rbi=allowed_collider_rbi)
 
     # 剛体変換の逆・点変換（translation焼き用）
     def _inv_rigid(M):
@@ -662,7 +706,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                   gravity_power=gravity_power, iterations=6,
                                   colliders=colliders_at(f), body_axis=body_axis_at(f),
                                   radial_rbs=skirt_rbs, margin=collision_margin,
-                                  exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs)
+                                  exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                                  allowed_collider_rbi=allowed_collider_rbi)
         loc = seg_rot_to_local(state, seg)
         for bone in skirt_bone_set:
             if bone in loc:
@@ -934,7 +979,8 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
 def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         lateral, gravity_power=0.02, iterations=6,
                         colliders=None, body_axis=None, radial_rbs=None,
-                        margin=0.0, exclude_rb=None, skip_angle_clamp_rbs=None):
+                        margin=0.0, exclude_rb=None, skip_angle_clamp_rbs=None,
+                        allowed_collider_rbi=None):
     """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
     lateral: [(rb_i, rb_j, rest_len), ...]
     戻り値: seg_rot[rb]
@@ -1016,7 +1062,8 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
         if colliders:
             resolve_collisions(state, colliders, body_axis=body_axis,
                                radial_rbs=radial_rbs, margin=margin,
-                               exclude_rb=exclude_rb)
+                               exclude_rb=exclude_rb,
+                               allowed_collider_rbi=allowed_collider_rbi)
         # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
 
     # 反復後にもう一度押し出し: 直前の length 拘束が侵入を復活させても、
@@ -1024,7 +1071,8 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
     if colliders:
         resolve_collisions(state, colliders, body_axis=body_axis,
                            radial_rbs=radial_rbs, margin=margin,
-                           exclude_rb=exclude_rb)
+                           exclude_rb=exclude_rb,
+                           allowed_collider_rbi=allowed_collider_rbi)
 
         # 修正3: 上の念押し押し出しの後、長さ拘束だけを再適用してrest_lenへ戻す。
         # 押し出しが決めた方向(=衝突を避けた向き)はそのまま維持し、長さだけを
@@ -1107,7 +1155,7 @@ def _closest_on_segment(p, a, b):
     return _add(a, _scale(ab, t))
 
 def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
-                       radial_rbs=None, exclude_rb=None):
+                       radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None):
     """dynamic パーティクルを各コライダーの外へ押し出す（片方向）。
 
     body_axis: (center, up) 下半身(腰)の世界位置と縦軸。指定時、かつ対象が
@@ -1119,6 +1167,10 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
       チェーンのアンカー自身がコライダーでもある場合（脚に密着させる裾など）、
       その組だけ衝突判定から除外する。アンカーへ引き寄せる拘束と押し出しが
       毎フレーム綱引きして震動するのを防ぐ。None なら除外なし。
+    allowed_collider_rbi: rb_index の集合。指定すると「アローリスト方式」に
+      切り替わり、このリストに無いコライダーは(group/noCollisionMaskの設定に
+      関わらず)最初から存在しないものとして扱う。None なら従来の
+      「デナイリスト方式」(group/noCollisionMaskで個別に除外)のまま。
     colliders: [("capsule", p0, p1, radius, group, no_collision_mask, rb_index),
                 ("sphere", center, radius, group, no_collision_mask, rb_index), ...]
     """
@@ -1132,9 +1184,13 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
     # ブロードフェーズ用: 各コライダーの中心と「カル半径^2」を前計算。
     # パーティクルが中心からカル半径より遠ければ詳細判定(closest_on_segment)を省く。
     # 大規模モデル(多数の揺れ物×多数コライダー)で致命的に効く。
+    # allowed_collider_rbi指定時は、ここでアローリスト外のコライダーを
+    # 丸ごと弾く(以降の一切の判定から除外)。
     _bp = []   # (col, cx, cy, cz, cull_sq, rbi)
     for col in colliders:
         rbi = col[-1]
+        if allowed_collider_rbi is not None and rbi not in allowed_collider_rbi:
+            continue
         if col[0] == "capsule":
             _, a, b, rad, _grp, _msk, _rbi = col
             cx = (a[0] + b[0]) * 0.5; cy = (a[1] + b[1]) * 0.5; cz = (a[2] + b[2]) * 0.5
@@ -1197,8 +1253,12 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
             # 無視すると本来当たらないはずのコライダーにスカートが押し当てられて
             # 伸びたり戻らなくなったりする。相手側のmaskが自分のgroupを、または
             # 自分のmaskが相手のgroupを除外していれば、双方向にスキップする。
-            if (cmask & (1 << p.group)) or (p.no_collision_mask & (1 << cgroup)):
-                continue
+            # アローリスト方式(allowed_collider_rbi指定)の場合は、この判定自体を
+            # 行わない。アローリストに入っているコライダーは無条件に有効な相手と
+            # みなす(group/noCollisionMaskの設定がどうであれ関係ない)。
+            if allowed_collider_rbi is None:
+                if (cmask & (1 << p.group)) or (p.no_collision_mask & (1 << cgroup)):
+                    continue
             dvec = _sub(P, C)
             d = _len(dvec)
             R = rad + margin
