@@ -92,6 +92,12 @@ STRINGS = {
         "adv_collision_names_hint": "スカートや髪が体の一部に食い込む／開いたまま戻らない、といった場合に使います。\n"
                                      "下の「剛体名を確認」で、モデルの剛体名を見ながら入力できます。",
         "adv_show_rigidbodies_btn": "剛体名を確認...",
+        "adv_vrm_compat_btn": "VRM互換モードにする",
+        "adv_vrm_compat_hint": "脚まわりの剛体だけを自動で選び、「限定」モードに切り替えます"
+                                "（VRMのSpringBone/VRChat PhysBonesと同じ考え方）。",
+        "vrm_compat_no_match": "脚に該当しそうな剛体名が見つかりませんでした。"
+                                "「剛体名を確認」で手動で選んでください。",
+        "vrm_compat_applied": "%d 個の剛体を「限定」モードに設定しました。",
         "rigidbody_picker_title": "剛体一覧（ダブルクリックで追加）",
         "rigidbody_picker_static": "■ 静的（脚・胴体など、コライダーになるもの）",
         "rigidbody_picker_dynamic": "■ 揺れ物（髪・スカートなど）",
@@ -164,6 +170,13 @@ STRINGS = {
                                      "or stays flared open. \"Browse rigid bodies\" below lets you "
                                      "see the model's names while you type.",
         "adv_show_rigidbodies_btn": "Browse rigid bodies...",
+        "adv_vrm_compat_btn": "Use VRM-compatible mode",
+        "adv_vrm_compat_hint": "Auto-selects leg/hip rigid bodies and switches to "
+                                "Restricted mode (same idea as VRM SpringBone / "
+                                "VRChat PhysBones).",
+        "vrm_compat_no_match": "Couldn't find any leg-like rigid body names. "
+                                "Use \"Browse rigid bodies\" to pick manually.",
+        "vrm_compat_applied": "Set %d rigid body name(s) to Restricted mode.",
         "rigidbody_picker_title": "Rigid bodies (double-click to add)",
         "rigidbody_picker_static": "\u25a0 Static (legs, torso, etc. \u2014 these act as colliders)",
         "rigidbody_picker_dynamic": "\u25a0 Dynamic (hair, skirt, etc. \u2014 these sway)",
@@ -447,6 +460,16 @@ class App(_BaseTk):
         self.lbl_cn_hint.grid(row=12, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_cn_hint, "adv_collision_names_hint"))
 
+        vrm_frame = ttk.Frame(self.adv)
+        vrm_frame.grid(row=13, column=1, sticky="w", **pad)
+        self.vrm_compat_btn = ttk.Button(vrm_frame, command=self._apply_vrm_compat_mode)
+        self.vrm_compat_btn.pack(side="left")
+        self._i18n_widgets.append((self.vrm_compat_btn, "adv_vrm_compat_btn"))
+        self.lbl_vrm_hint = ttk.Label(self.adv, text="", foreground="#666666",
+                                      wraplength=380, justify="left")
+        self.lbl_vrm_hint.grid(row=14, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_vrm_hint, "adv_vrm_compat_hint"))
+
 
         run = ttk.Frame(frm)
         run.pack(fill="x", **pad)
@@ -481,6 +504,39 @@ class App(_BaseTk):
             self.pmx_var.set(p)
             if not self._out_edited or not self.out_var.get():
                 self.out_var.set(os.path.splitext(p)[0] + ".glb")
+
+    def _apply_vrm_compat_mode(self):
+        pmx_path = self.pmx_var.get().strip()
+        if not pmx_path or not os.path.isfile(pmx_path):
+            messagebox.showinfo(self.t("adv_vrm_compat_btn"),
+                                self.t("rigidbody_picker_no_pmx"))
+            return
+        try:
+            self.config(cursor="watch")
+            self.update_idletasks()
+            model = pmx_module.parse_pmx(pmx_path)
+            rigids = model.get("rigid_bodies", [])
+        except Exception as e:
+            messagebox.showerror(self.t("err_title"), str(e))
+            return
+        finally:
+            self.config(cursor="")
+
+        # VRM SpringBone/VRChat PhysBonesと同じ考え方：スカート/揺れ物は
+        # 「脚まわりのコライダーだけ」を見れば十分、というヒューリスティック。
+        # 足/ひざ/太もも系の名前を持つ静的剛体を拾い、下半身(胴体側)は除外する。
+        leg_names = [r["name"] for r in rigids
+                    if r.get("mode") == 0
+                    and any(k in r["name"] for k in ("足", "ひざ", "太もも"))
+                    and "下半身" not in r["name"]]
+        if not leg_names:
+            messagebox.showwarning(self.t("adv_vrm_compat_btn"),
+                                   self.t("vrm_compat_no_match"))
+            return
+        self.collmode_var.set("allow")
+        self.collnames_var.set(",".join(leg_names))
+        messagebox.showinfo(self.t("adv_vrm_compat_btn"),
+                            self.t("vrm_compat_applied") % len(leg_names))
 
     def _show_rigidbody_picker(self):
         pmx_path = self.pmx_var.get().strip()
