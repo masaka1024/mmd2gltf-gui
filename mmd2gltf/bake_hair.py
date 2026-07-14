@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-14g (+ hem_extra_margin: extra clearance for skirt hem only, waist unaffected)"
+BAKE_HAIR_VERSION = "2026-07-14h (hem_extra_margin now smoothly interpolates root->hem)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -466,13 +466,15 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         判定基準になる)。モデル制作者が非衝突グループの設定を誤った/MMD側が
         正しく反映していない可能性がある場合に、脚・腰など本当に必要な
         コライダーだけを明示して安全に運用するための代替モード。
-    hem_extra_margin : 各スカートチェーンの末端(裾)パーティクルにだけ、
-        collision_marginへ上乗せする追加クリアランス。デフォルト0.0で無効
-        (既存挙動と完全に同じ)。太もも等へのメッシュ面の見た目上の食い込みは
-        裾で起きやすい一方、collision_margin自体を全体で上げると腰に近い
-        セグメントが押し出されて「傘化」に近づいてしまう(実測: margin
-        0.08でほぼ元の傘化相当まで戻る)ため、裾だけに限定して安全に
-        クリアランスを稼ぐための逃げ道。
+    hem_extra_margin : 各スカートチェーンの根元(腰側)から裾にかけて、0→この値まで
+        滑らかに線形補間しながら collision_margin へ上乗せする追加クリアランス
+        (根元=0、裾=hem_extra_margin全量)。デフォルト0.0で無効(既存挙動と
+        完全に同じ)。太もも等へのメッシュ面の見た目上の食い込みは裾で起きやすい
+        一方、collision_margin自体を全体で上げると腰に近いセグメントが押し
+        出されて「傘化」に近づいてしまう(実測: margin 0.08でほぼ元の傘化
+        相当まで戻る)ため、根元は完全に不変のまま裾へ向けて安全にクリアランスを
+        稼ぐための逃げ道。裾の1パーティクルだけをON/OFFする段差ではなく、
+        チェーンの深さに比例して連続的に変化するので不自然な継ぎ目が出ない。
     戻り値       : { node_index: [ (x,y,z,w), ... num_frames ] }（glTF局所回転）
     """
     nodes = gltf_json["nodes"]
@@ -621,15 +623,17 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         if not p.kinematic:
                             skirt_rbs.add(p.rb)
 
-    # 各スカートチェーンの末端(裾)パーティクル。Chain.particlesは親→子の順で
-    # 並んでいるため、非kinematicな最後の要素がそのチェーンの裾にあたる。
-    # hem_extra_margin はこの集合にのみ追加クリアランスを適用する。
-    hem_rbs = set()
+    # 各スカートチェーンの「裾からの深さ比率」。根元=0.0、裾=1.0、間は線形補間。
+    # hem_extra_margin は margin へ hem_weight[rb] 倍だけ上乗せする(裾ほど強く、
+    # 根元では0=無効)。ON/OFFの段差ではなく、根元から裾へ滑らかに繋げるため。
+    hem_weight = {}
     for ch in chains:
-        for p in reversed(ch.particles):
-            if p.rb in skirt_rbs and not p.kinematic:
-                hem_rbs.add(p.rb)
-                break
+        dyn = [p for p in ch.particles if p.rb in skirt_rbs and not p.kinematic]
+        k = len(dyn)
+        if k == 0:
+            continue
+        for i, p in enumerate(dyn):
+            hem_weight[p.rb] = 1.0 if k == 1 else i / (k - 1)
 
     # 横拘束(lateral)はスカートのリング(2次元クロス)専用。髪・ネクタイ・胸などの
     # チェーン型揺れ物は、モデルにストランド間ジョイントがあると非ツリー辺として
@@ -689,7 +693,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                             radial_rbs=skirt_rbs, margin=collision_margin,
                             exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                             allowed_collider_rbi=allowed_collider_rbi,
-                            hem_rbs=hem_rbs, hem_extra_margin=hem_extra_margin)
+                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
 
     # 剛体変換の逆・点変換（translation焼き用）
     def _inv_rigid(M):
@@ -726,7 +730,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                   radial_rbs=skirt_rbs, margin=collision_margin,
                                   exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                                   allowed_collider_rbi=allowed_collider_rbi,
-                                  hem_rbs=hem_rbs, hem_extra_margin=hem_extra_margin)
+                                  hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
         loc = seg_rot_to_local(state, seg)
         for bone in skirt_bone_set:
             if bone in loc:
@@ -999,7 +1003,7 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         lateral, gravity_power=0.02, iterations=6,
                         colliders=None, body_axis=None, radial_rbs=None,
                         margin=0.0, exclude_rb=None, skip_angle_clamp_rbs=None,
-                        allowed_collider_rbi=None, hem_rbs=None, hem_extra_margin=0.0):
+                        allowed_collider_rbi=None, hem_weight=None, hem_extra_margin=0.0):
     """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
     lateral: [(rb_i, rb_j, rest_len), ...]
     戻り値: seg_rot[rb]
@@ -1083,7 +1087,7 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                                radial_rbs=radial_rbs, margin=margin,
                                exclude_rb=exclude_rb,
                                allowed_collider_rbi=allowed_collider_rbi,
-                               hem_rbs=hem_rbs, hem_extra_margin=hem_extra_margin)
+                               hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
         # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
 
     # 反復後にもう一度押し出し: 直前の length 拘束が侵入を復活させても、
@@ -1093,7 +1097,7 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                            radial_rbs=radial_rbs, margin=margin,
                            exclude_rb=exclude_rb,
                            allowed_collider_rbi=allowed_collider_rbi,
-                           hem_rbs=hem_rbs, hem_extra_margin=hem_extra_margin)
+                           hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
 
         # 修正3: 上の念押し押し出しの後、長さ拘束だけを再適用してrest_lenへ戻す。
         # 押し出しが決めた方向(=衝突を避けた向き)はそのまま維持し、長さだけを
@@ -1177,7 +1181,7 @@ def _closest_on_segment(p, a, b):
 
 def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                        radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None,
-                       hem_rbs=None, hem_extra_margin=0.0):
+                       hem_weight=None, hem_extra_margin=0.0):
     """dynamic パーティクルを各コライダーの外へ押し出す（片方向）。
 
     body_axis: (center, up) 下半身(腰)の世界位置と縦軸。指定時、かつ対象が
@@ -1193,11 +1197,12 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
       切り替わり、このリストに無いコライダーは(group/noCollisionMaskの設定に
       関わらず)最初から存在しないものとして扱う。None なら従来の
       「デナイリスト方式」(group/noCollisionMaskで個別に除外)のまま。
-    hem_rbs: rb_index の集合。各スカートチェーンの末端(裾)パーティクル。
-      指定時、このパーティクルに対してだけ margin へ hem_extra_margin を
-      上乗せする。太もも等へのメッシュ面の見た目上の食い込みは裾で起きやすい
-      一方、marginを全体で上げると腰に近いセグメントが押し出されて傘化に
-      近づくため、裾だけへ限定して安全にクリアランスを稼ぐ。
+    hem_weight: {rb_index: 0.0〜1.0} の辞書。各スカートチェーンの裾からの
+      深さ比率(根元=0.0、裾=1.0、間は線形補間)。指定時、margin へ
+      hem_extra_margin * hem_weight[rb] だけ上乗せする。太もも等への
+      メッシュ面の見た目上の食い込みは裾で起きやすい一方、marginを全体で
+      上げると腰に近いセグメントが押し出されて傘化に近づくため、根元から
+      裾へ滑らかに繋げつつ安全にクリアランスを稼ぐ。
     colliders: [("capsule", p0, p1, radius, group, no_collision_mask, rb_index),
                 ("sphere", center, radius, group, no_collision_mask, rb_index), ...]
     """
@@ -1254,7 +1259,7 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
         P = pos[rb]
         px, py, pz = P
         excl = exclude_rb.get(rb) if exclude_rb else None
-        _eff_margin = margin + hem_extra_margin if (hem_rbs and rb in hem_rbs) else margin
+        _eff_margin = margin + hem_extra_margin * (hem_weight.get(rb, 0.0) if hem_weight else 0.0)
         for col, ccx, ccy, ccz, cull_sq, rbi in _bp:
             if excl is not None and rbi in excl:
                 # このパーティクルのチェーンが直接ぶら下がっているコライダー自身。
