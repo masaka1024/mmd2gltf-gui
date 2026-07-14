@@ -84,6 +84,8 @@ STRINGS = {
         "adv_target_hair": "髪のみ",
         "adv_target_all": "全部(髪・スカート・ネクタイ等)",
         "adv_margin_label": "衝突クリアランス",
+        "adv_force_no_collision_label": "強制非衝突にする剛体名(カンマ区切り)",
+        "adv_allowed_collider_label": "アローリスト: 許可するコライダー名のみ(カンマ区切り、指定時のみ有効)",
         "run_button": "変換する",
         "frame_log": "ログ",
         "err_title": "入力エラー",
@@ -143,6 +145,8 @@ STRINGS = {
         "adv_target_hair": "Hair only",
         "adv_target_all": "All (hair, skirt, tie, etc.)",
         "adv_margin_label": "Collision clearance",
+        "adv_force_no_collision_label": "Force non-colliding rigid body names (comma-separated)",
+        "adv_allowed_collider_label": "Allowlist: only these collider names (comma-separated, switches to allowlist mode)",
         "run_button": "Convert",
         "frame_log": "Log",
         "err_title": "Input error",
@@ -336,6 +340,8 @@ class App(_BaseTk):
         self.bakehair_var = tk.BooleanVar(value=False)
         self.baketarget_var = tk.StringVar(value="hair")
         self.margin_var = tk.StringVar(value="0.01")
+        self.forcenocol_var = tk.StringVar()
+        self.allowcol_var = tk.StringVar()
 
         cb3 = ttk.Checkbutton(self.adv, variable=self.noik_var)
         cb3.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
@@ -388,6 +394,19 @@ class App(_BaseTk):
         self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
         ttk.Entry(self.adv, textvariable=self.margin_var, width=8).grid(
             row=9, column=1, sticky="w", **pad)
+
+        lbl_fnc = ttk.Label(self.adv, text="")
+        lbl_fnc.grid(row=10, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_fnc, "adv_force_no_collision_label"))
+        ttk.Entry(self.adv, textvariable=self.forcenocol_var).grid(
+            row=10, column=1, sticky="ew", **pad)
+
+        lbl_alc = ttk.Label(self.adv, text="")
+        lbl_alc.grid(row=11, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_alc, "adv_allowed_collider_label"))
+        ttk.Entry(self.adv, textvariable=self.allowcol_var).grid(
+            row=11, column=1, sticky="ew", **pad)
+
 
         run = ttk.Frame(frm)
         run.pack(fill="x", **pad)
@@ -489,6 +508,8 @@ class App(_BaseTk):
             margin = float(self.margin_var.get())
         except Exception:
             margin = 0.01
+        force_no_collision = [s.strip() for s in self.forcenocol_var.get().split(",") if s.strip()] or None
+        allowed_collider = [s.strip() for s in self.allowcol_var.get().split(",") if s.strip()] or None
         kwargs = dict(
             vmd_path=vmd,
             unlit=self.unlit_var.get(),
@@ -506,6 +527,8 @@ class App(_BaseTk):
             bake_physics=self.bakehair_var.get(),
             bake_target=self.baketarget_var.get(),
             collision_margin=margin,
+            force_no_collision_names=force_no_collision,
+            allowed_collider_names=allowed_collider,
         )
         self.run_btn.configure(state="disabled")
         self.prog.start(12)
