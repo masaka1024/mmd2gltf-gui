@@ -11,13 +11,20 @@ from .physics import (q_mul, q_rotate_vec, q_conj,
                      compute_bone_world_matrices, trs_to_mat, mat_mul,
                      mat_ident, mat_to_trs)
 
+# このファイルが実際にどのビルドかをログで確認するためのバージョン識別子。
+# ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
+# ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
+# ログだけで切り分けられるようにする。
+BAKE_HAIR_VERSION = "2026-07-14d (hair-lateral-fix + skirt length-restore + MMD group/noCollisionMask respected)"
+
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
 
 class Particle:
     __slots__ = ("rb", "bone", "mass", "inv_mass", "parent", "rest_len",
-                 "rest_dir_local", "ang_min", "ang_max", "rest_pos", "kinematic")
-    def __init__(self, rb, bone, mass, kinematic):
+                 "rest_dir_local", "ang_min", "ang_max", "rest_pos", "kinematic",
+                 "group", "no_collision_mask")
+    def __init__(self, rb, bone, mass, kinematic, group=0, no_collision_mask=0):
         self.rb = rb              # physicsGltf.rigidBodies のindex
         self.bone = bone          # node index
         self.mass = mass
@@ -28,6 +35,8 @@ class Particle:
         self.ang_min = None       # jointの角度制限（ラジアン, x,y,z）
         self.ang_max = None
         self.rest_pos = None      # rest世界座標(glTF)
+        self.group = group                      # MMDの非衝突グループ番号(0-15)
+        self.no_collision_mask = no_collision_mask  # このグループとは衝突しない、というビットマスク
 
 class Chain:
     def __init__(self):
@@ -440,6 +449,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     戻り値       : { node_index: [ (x,y,z,w), ... num_frames ] }（glTF局所回転）
     """
     nodes = gltf_json["nodes"]
+    print("  [physics] bake_hair.py version: %s" % BAKE_HAIR_VERSION)
     bwm = compute_bone_world_matrices(gltf_json)
     chains, parts, excluded, lateral = extract_chains_bfs(
         physics_gltf, bwm, only_names=only_names)
@@ -510,7 +520,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
 
     # コライダー収集: mode0 のカプセル/球（脚・体など）。dynamic を押し出す障害物。
     rbs_pg = physics_gltf["rigidBodies"]
-    colliders_def = []   # (shape, bone_path, size, local_pos, local_rot, rb_index)
+    colliders_def = []   # (shape, bone_path, size, local_pos, local_rot, group, mask, rb_index)
     for _rbi, rb in enumerate(rbs_pg):
         if rb.get("mode") == 0 and rb.get("shape") in (0, 2):  # 0=球 2=カプセル
             bi = rb.get("bone", -1)
@@ -522,23 +532,24 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 path.append(bb); bb = parent[bb]
             path.reverse()
             colliders_def.append((rb["shape"], path, rb["size"],
-                                  rb["position"], rb["rotation"], _rbi))
+                                  rb["position"], rb["rotation"],
+                                  rb.get("group", 0), rb.get("noCollisionMask", 0), _rbi))
 
     def colliders_at(f):
         cols = []
-        for shape, path, size, lpos, lrot, rbi in colliders_def:
+        for shape, path, size, lpos, lrot, group, mask, rbi in colliders_def:
             W = world_at(path, f)
             M = mat_mul(W, trs_to_mat(lpos, lrot))
             c = (M[0][3], M[1][3], M[2][3])
             if shape == 0:               # 球
-                cols.append(("sphere", c, size[0], rbi))
+                cols.append(("sphere", c, size[0], group, mask, rbi))
             else:                        # カプセル（長軸=ローカルY）
                 _, wq = mat_to_trs(M)
                 ay = q_rotate_vec(wq, (0.0, 1.0, 0.0))
                 half = size[1] * 0.5
                 p0 = (c[0] - ay[0]*half, c[1] - ay[1]*half, c[2] - ay[2]*half)
                 p1 = (c[0] + ay[0]*half, c[1] + ay[1]*half, c[2] + ay[2]*half)
-                cols.append(("capsule", p0, p1, size[0], rbi))
+                cols.append(("capsule", p0, p1, size[0], group, mask, rbi))
         return cols
 
     # 修正1: 初期位置シードは「下半身系(スカート等: アンカーが腰以下)」のみ
@@ -584,7 +595,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # でもあり、チェーンの拘束(アンカーへ引き寄せる)と衝突押し出しが毎フレーム
     # 綱引きして震動する。そのチェーンの全パーティクルから、アンカーと同じ
     # コライダーだけを除外する（他のチェーン・他の揺れ物には影響しない）。
-    _collider_rbs = set(c[5] for c in colliders_def)
+    _collider_rbs = set(c[-1] for c in colliders_def)
     exclude_rb = {}
     for ch in chains:
         a0p = ch.particles[0]
@@ -742,11 +753,15 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
     parts = {}
     for i in dyn:
         p = Particle(rbs[i]["rb"] if False else i, rbs[i]["bone"], rbs[i]["mass"],
-                     kinematic=False)
+                     kinematic=False,
+                     group=rbs[i].get("group", 0),
+                     no_collision_mask=rbs[i].get("noCollisionMask", 0))
         p.rest_pos = bpos(rbs[i]["bone"])
         parts[i] = p
     for i in anchors:
-        p = Particle(i, rbs[i]["bone"], rbs[i]["mass"], kinematic=True)
+        p = Particle(i, rbs[i]["bone"], rbs[i]["mass"], kinematic=True,
+                     group=rbs[i].get("group", 0),
+                     no_collision_mask=rbs[i].get("noCollisionMask", 0))
         p.rest_pos = bpos(rbs[i]["bone"])
         parts[i] = p
 
@@ -1011,6 +1026,31 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                            radial_rbs=radial_rbs, margin=margin,
                            exclude_rb=exclude_rb)
 
+        # 修正3: 上の念押し押し出しの後、長さ拘束だけを再適用してrest_lenへ戻す。
+        # 押し出しが決めた方向(=衝突を避けた向き)はそのまま維持し、長さだけを
+        # rest_len にスケールし直す(同じ方向への縮小なので新たな貫入は生まない)。
+        # 実測: これが無いと、念押しの押し出しで伸びた分を戻す機会が二度と無く、
+        # 伸びたまま確定する(実測: 極端な姿勢でセグメントが最大2.1倍まで伸びを確認、
+        # 36セグメント中22本が5%超の伸び)。
+        # 対象は radial_rbs(スカート等の下半身系)の子パーティクルのみに限定する。
+        # 全チェーンに適用すると、衝突と無関係な胸物理・髪等のwarmup挙動まで
+        # わずかに変わり、減衰の弱いチェーンで長時間シミュレーション後に大きく
+        # 発散する副作用が実測で確認された(左胸先の回転が最大52.8°変化)。
+        # radial_rbs限定なら、この副作用は原理上生じない(対象外チェーンの
+        # posを一切変更しないため)。
+        if radial_rbs:
+            for ch in state.chains:
+                plist = ch.particles
+                for k in range(1, len(plist)):
+                    c = plist[k]; pa = plist[k-1]
+                    if c.rb not in radial_rbs:
+                        continue
+                    if c.inv_mass <= 0:
+                        continue
+                    d = _sub(pos[c.rb], pos[pa.rb]); dl = _len(d)
+                    if dl > 1e-9:
+                        pos[c.rb] = _add(pos[pa.rb], _scale(d, c.rest_len / dl))
+
     # 安全弁: 1フレームあたりの最大変位クランプ。乱れたツリー構造(複数アンカー・
     # リング横断)を持つ揺れ物は、rest_dir/角度クランプの相互作用で稀に位置が
     # 1フレームで大きく跳ねることがある(実測 最大0.5 unit)。物理的に妥当な動きは
@@ -1079,7 +1119,8 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
       チェーンのアンカー自身がコライダーでもある場合（脚に密着させる裾など）、
       その組だけ衝突判定から除外する。アンカーへ引き寄せる拘束と押し出しが
       毎フレーム綱引きして震動するのを防ぐ。None なら除外なし。
-    colliders: [("capsule", p0, p1, radius, rb_index), ("sphere", center, radius, rb_index), ...]
+    colliders: [("capsule", p0, p1, radius, group, no_collision_mask, rb_index),
+                ("sphere", center, radius, group, no_collision_mask, rb_index), ...]
     """
     if not colliders:
         return
@@ -1095,12 +1136,12 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
     for col in colliders:
         rbi = col[-1]
         if col[0] == "capsule":
-            _, a, b, rad, _rbi = col
+            _, a, b, rad, _grp, _msk, _rbi = col
             cx = (a[0] + b[0]) * 0.5; cy = (a[1] + b[1]) * 0.5; cz = (a[2] + b[2]) * 0.5
             half = 0.5 * math.sqrt((b[0]-a[0])**2 + (b[1]-a[1])**2 + (b[2]-a[2])**2)
             cull = half + rad + margin
         elif col[0] == "sphere":
-            _, c, rad, _rbi = col
+            _, c, rad, _grp, _msk, _rbi = col
             cx, cy, cz = c
             cull = rad + margin
         else:
@@ -1140,13 +1181,23 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                 continue
             kind = col[0]
             if kind == "capsule":
-                _, a, b, rad, _rbi = col
+                _, a, b, rad, cgroup, cmask, _rbi = col
                 C = _closest_on_segment(P, a, b)
                 u_axis = _norm(_sub(b, a))
             elif kind == "sphere":
-                _, C, rad, _rbi = col
+                _, C, rad, cgroup, cmask, _rbi = col
                 u_axis = None
             else:
+                continue
+            # MMDの非衝突グループ判定: PMXの剛体はgroup(0-15)とnoCollisionMask
+            # (自分がどのgroupと衝突しないかのビットマスク)を持つ。モデル制作者が
+            # 明示的に「このコライダーとこの揺れ物は衝突させない」と設定している
+            # 場合があり(実測: あるモデルの下半身の球コライダーはスカートの
+            # groupを、腕/ひじのカプセルは全groupを非衝突に設定していた)、これを
+            # 無視すると本来当たらないはずのコライダーにスカートが押し当てられて
+            # 伸びたり戻らなくなったりする。相手側のmaskが自分のgroupを、または
+            # 自分のmaskが相手のgroupを除外していれば、双方向にスキップする。
+            if (cmask & (1 << p.group)) or (p.no_collision_mask & (1 << cgroup)):
                 continue
             dvec = _sub(P, C)
             d = _len(dvec)
