@@ -85,6 +85,12 @@ def main(argv=None):
                     "ignores PMX group/noCollisionMask entirely once any "
                     "--allowed-collider is given). Mirrors VRM SpringBone / "
                     "VRChat PhysBones-style per-chain collider scoping")
+    ap.add_argument("--hem-extra-margin", type=float, default=0.0, metavar="F",
+                    help="extra clearance added on top of --collision-margin, "
+                    "applied only to the last (hem/tip) particle of each skirt "
+                    "chain (default 0.0 = off). Unlike raising --collision-margin "
+                    "globally, this does not push waist-side segments outward "
+                    "(verified: waist angle stays fixed while raising this)")
     a = ap.parse_args(argv)
 
     out = a.output or os.path.splitext(a.pmx)[0] + ".glb"
@@ -102,7 +108,8 @@ def main(argv=None):
                 hair_gravity=a.hair_gravity,
                 collision_margin=a.collision_margin,
                 force_no_collision_names=a.force_no_collision,
-                allowed_collider_names=a.allowed_collider)
+                allowed_collider_names=a.allowed_collider,
+                hem_extra_margin=a.hem_extra_margin)
     except Exception as e:
         print("error:", e, file=sys.stderr)
         return 1
