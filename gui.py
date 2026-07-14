@@ -20,6 +20,7 @@ from tkinter import ttk, filedialog, messagebox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mmd2gltf.convert import convert, HAS_PIL  # noqa: E402
+from mmd2gltf import pmx as pmx_module  # noqa: E402
 
 # ドラッグ&ドロップは標準のtkinterには無いため tkinterdnd2 を使う(任意)。
 # 無ければ従来通りの「参照...」ボタンのみで動作する(機能を静かに無効化)。
@@ -84,8 +85,18 @@ STRINGS = {
         "adv_target_hair": "髪のみ",
         "adv_target_all": "全部(髪・スカート・ネクタイ等)",
         "adv_margin_label": "衝突クリアランス",
-        "adv_force_no_collision_label": "強制非衝突にする剛体名(カンマ区切り)",
-        "adv_allowed_collider_label": "アローリスト: 許可するコライダー名のみ(カンマ区切り、指定時のみ有効)",
+        "adv_collision_mode_label": "衝突モード",
+        "adv_collision_mode_normal": "通常（リストの剛体だけ衝突させない）",
+        "adv_collision_mode_allow": "限定（リストの剛体だけ衝突させる）",
+        "adv_collision_names_label": "対象の剛体名(カンマ区切り)",
+        "adv_collision_names_hint": "スカートや髪が体の一部に食い込む／開いたまま戻らない、といった場合に使います。\n"
+                                     "下の「剛体名を確認」で、モデルの剛体名を見ながら入力できます。",
+        "adv_show_rigidbodies_btn": "剛体名を確認...",
+        "rigidbody_picker_title": "剛体一覧（ダブルクリックで追加）",
+        "rigidbody_picker_static": "■ 静的（脚・胴体など、コライダーになるもの）",
+        "rigidbody_picker_dynamic": "■ 揺れ物（髪・スカートなど）",
+        "rigidbody_picker_no_pmx": "先にPMXファイルを選択してください。",
+        "rigidbody_picker_close": "閉じる",
         "run_button": "変換する",
         "frame_log": "ログ",
         "err_title": "入力エラー",
@@ -145,8 +156,19 @@ STRINGS = {
         "adv_target_hair": "Hair only",
         "adv_target_all": "All (hair, skirt, tie, etc.)",
         "adv_margin_label": "Collision clearance",
-        "adv_force_no_collision_label": "Force non-colliding rigid body names (comma-separated)",
-        "adv_allowed_collider_label": "Allowlist: only these collider names (comma-separated, switches to allowlist mode)",
+        "adv_collision_mode_label": "Collision mode",
+        "adv_collision_mode_normal": "Normal (exclude only the listed bodies)",
+        "adv_collision_mode_allow": "Restricted (only the listed bodies collide)",
+        "adv_collision_names_label": "Rigid body names (comma-separated)",
+        "adv_collision_names_hint": "Use this when a skirt or hair pokes through part of the body, "
+                                     "or stays flared open. \"Browse rigid bodies\" below lets you "
+                                     "see the model's names while you type.",
+        "adv_show_rigidbodies_btn": "Browse rigid bodies...",
+        "rigidbody_picker_title": "Rigid bodies (double-click to add)",
+        "rigidbody_picker_static": "\u25a0 Static (legs, torso, etc. \u2014 these act as colliders)",
+        "rigidbody_picker_dynamic": "\u25a0 Dynamic (hair, skirt, etc. \u2014 these sway)",
+        "rigidbody_picker_no_pmx": "Select a PMX file first.",
+        "rigidbody_picker_close": "Close",
         "run_button": "Convert",
         "frame_log": "Log",
         "err_title": "Input error",
@@ -340,8 +362,8 @@ class App(_BaseTk):
         self.bakehair_var = tk.BooleanVar(value=False)
         self.baketarget_var = tk.StringVar(value="hair")
         self.margin_var = tk.StringVar(value="0.01")
-        self.forcenocol_var = tk.StringVar()
-        self.allowcol_var = tk.StringVar()
+        self.collmode_var = tk.StringVar(value="normal")
+        self.collnames_var = tk.StringVar()
 
         cb3 = ttk.Checkbutton(self.adv, variable=self.noik_var)
         cb3.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
@@ -395,17 +417,35 @@ class App(_BaseTk):
         ttk.Entry(self.adv, textvariable=self.margin_var, width=8).grid(
             row=9, column=1, sticky="w", **pad)
 
-        lbl_fnc = ttk.Label(self.adv, text="")
-        lbl_fnc.grid(row=10, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_fnc, "adv_force_no_collision_label"))
-        ttk.Entry(self.adv, textvariable=self.forcenocol_var).grid(
-            row=10, column=1, sticky="ew", **pad)
+        lbl_cm = ttk.Label(self.adv, text="")
+        lbl_cm.grid(row=10, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_cm, "adv_collision_mode_label"))
+        cm_frame = ttk.Frame(self.adv)
+        cm_frame.grid(row=10, column=1, sticky="w", **pad)
+        rb_normal = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
+                                    value="normal")
+        rb_normal.pack(anchor="w")
+        self._i18n_widgets.append((rb_normal, "adv_collision_mode_normal"))
+        rb_allow = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
+                                   value="allow")
+        rb_allow.pack(anchor="w")
+        self._i18n_widgets.append((rb_allow, "adv_collision_mode_allow"))
 
-        lbl_alc = ttk.Label(self.adv, text="")
-        lbl_alc.grid(row=11, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_alc, "adv_allowed_collider_label"))
-        ttk.Entry(self.adv, textvariable=self.allowcol_var).grid(
-            row=11, column=1, sticky="ew", **pad)
+        lbl_cn = ttk.Label(self.adv, text="")
+        lbl_cn.grid(row=11, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_cn, "adv_collision_names_label"))
+        cn_frame = ttk.Frame(self.adv)
+        cn_frame.grid(row=11, column=1, sticky="ew", **pad)
+        ttk.Entry(cn_frame, textvariable=self.collnames_var).pack(
+            side="left", fill="x", expand=True)
+        self.browse_rb_btn = ttk.Button(cn_frame, command=self._show_rigidbody_picker)
+        self.browse_rb_btn.pack(side="left", padx=(6, 0))
+        self._i18n_widgets.append((self.browse_rb_btn, "adv_show_rigidbodies_btn"))
+
+        self.lbl_cn_hint = ttk.Label(self.adv, text="", foreground="#666666",
+                                     wraplength=380, justify="left")
+        self.lbl_cn_hint.grid(row=12, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_cn_hint, "adv_collision_names_hint"))
 
 
         run = ttk.Frame(frm)
@@ -441,6 +481,63 @@ class App(_BaseTk):
             self.pmx_var.set(p)
             if not self._out_edited or not self.out_var.get():
                 self.out_var.set(os.path.splitext(p)[0] + ".glb")
+
+    def _show_rigidbody_picker(self):
+        pmx_path = self.pmx_var.get().strip()
+        if not pmx_path or not os.path.isfile(pmx_path):
+            messagebox.showinfo(self.t("adv_show_rigidbodies_btn"),
+                                self.t("rigidbody_picker_no_pmx"))
+            return
+        try:
+            self.config(cursor="watch")
+            self.update_idletasks()
+            model = pmx_module.parse_pmx(pmx_path)
+            rigids = model.get("rigid_bodies", [])
+        except Exception as e:
+            messagebox.showerror(self.t("err_title"), str(e))
+            return
+        finally:
+            self.config(cursor="")
+
+        win = tk.Toplevel(self)
+        win.title(self.t("rigidbody_picker_title"))
+        win.geometry("380x440")
+        win.transient(self)
+
+        lb = tk.Listbox(win, selectmode="extended", exportselection=False)
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # リストの各行に対応する実剛体名(見出し行はNone、ダブルクリック対象外)
+        entries = []
+        static_names = [r["name"] for r in rigids if r.get("mode") == 0]
+        dynamic_names = [r["name"] for r in rigids if r.get("mode") in (1, 2)]
+
+        def add_section(title, names):
+            lb.insert("end", title)
+            entries.append(None)
+            for nm in names:
+                lb.insert("end", "    " + nm)
+                entries.append(nm)
+
+        add_section(self.t("rigidbody_picker_static"), static_names)
+        lb.insert("end", "")
+        entries.append(None)
+        add_section(self.t("rigidbody_picker_dynamic"), dynamic_names)
+
+        def on_double_click(event):
+            for idx in lb.curselection():
+                nm = entries[idx]
+                if nm is None:
+                    continue
+                cur = self.collnames_var.get().strip()
+                parts = [s.strip() for s in cur.split(",") if s.strip()]
+                if nm not in parts:
+                    parts.append(nm)
+                self.collnames_var.set(",".join(parts))
+
+        lb.bind("<Double-Button-1>", on_double_click)
+        ttk.Button(win, text=self.t("rigidbody_picker_close"),
+                  command=win.destroy).pack(pady=(0, 8))
 
     def _pick_vmd(self):
         p = filedialog.askopenfilename(
@@ -508,8 +605,9 @@ class App(_BaseTk):
             margin = float(self.margin_var.get())
         except Exception:
             margin = 0.01
-        force_no_collision = [s.strip() for s in self.forcenocol_var.get().split(",") if s.strip()] or None
-        allowed_collider = [s.strip() for s in self.allowcol_var.get().split(",") if s.strip()] or None
+        _coll_names = [s.strip() for s in self.collnames_var.get().split(",") if s.strip()] or None
+        force_no_collision = _coll_names if self.collmode_var.get() == "normal" else None
+        allowed_collider = _coll_names if self.collmode_var.get() == "allow" else None
         kwargs = dict(
             vmd_path=vmd,
             unlit=self.unlit_var.get(),
