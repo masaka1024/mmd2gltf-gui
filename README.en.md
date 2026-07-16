@@ -16,6 +16,8 @@ A tool that converts MMD PMX models (plus VMD motions) to **glTF 2.0 (.glb)** as
 
 Includes a **physics-baking feature** that bakes rigid-body physics (hair, skirts, ties, etc.) into bone animation, so secondary motion plays back naturally even in glTF viewers that have no physics engine.
 
+The real goal of this tool is not just viewer-oriented conversion, but **carrying MMD data out to other formats and environments as accurately as possible** (see [Goal of this tool](#goal-of-this-tool)).
+
 > **▶ Quick start (Windows):** [Download the latest EXE](https://github.com/masaka1024/mmd2gltf-gui/releases/latest) — no Python required.
 
 <p align="center">
@@ -24,6 +26,7 @@ Includes a **physics-baking feature** that bakes rigid-body physics (hair, skirt
 
 ## Table of contents
 
+- [Goal of this tool](#goal-of-this-tool)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Windows EXE (no Python needed)](#windows-exe-no-python-needed)
@@ -39,6 +42,28 @@ Includes a **physics-baking feature** that bakes rigid-body physics (hair, skirt
 - [Project layout](#project-layout)
 - [License](#license)
 
+## Goal of this tool
+
+The primary purpose of mmd2gltf is to **carry MMD data out to other formats and environments as accurately as possible**. glTF (.glb) is used as the "container" for that journey.
+
+To achieve this, every converted file has a **two-layer structure**:
+
+1. **Preservation layer (`extras.mmd`)** — Everything glTF cannot express — rigid bodies, joints, IK settings, append/grant parents, toon / sphere-map / edge material settings, and more — is **fully preserved as raw PMX values**. A receiving application (a game engine or another tool) can reconstruct the original MMD model's structure from this layer with high fidelity.
+2. **Baked layer (standard glTF animation)** — Motion and secondary physics (hair, skirts) are baked into standard keyframes so the model "just looks right" in ordinary glTF viewers that have no physics engine. This layer is an approximate fallback by design.
+
+Physics baking never discards the preservation layer, so you can have both: viewers play the baked motion as-is, while engines rebuild real physics from the raw data.
+
+### Proof of concept: the Unity importer
+
+To verify that this design actually works, an editor extension that reads `extras.mmd` and reconstructs the model inside Unity was developed. The following has been confirmed on multiple models:
+
+- **Rebuilding physics (secondary motion) from the rigid-body / joint data** — Rigidbody / ConfigurableJoint components are set up on the bones, so hair and skirts sway under Unity's real physics engine
+- **Restoring MMD-style toon rendering** from the toon / sphere-map / shared-toon / outline material settings (based on lilToon)
+
+In other words, a .glb produced by this tool is not only viewable as-is — it carries **enough information for an engine to bring back real physics and toon shading**.
+
+> The importer is published as a separate repository: **[mmd2gltf-unity-physics-importer](https://github.com/masaka1024/mmd2gltf-unity-physics-importer)** (requires UniGLTF / lilToon, for URP projects; README in Japanese)
+
 ## Features
 
 - **No extra libraries required** — runs on the standard library alone (Pillow is optional, for texture conversion only).
@@ -46,7 +71,7 @@ Includes a **physics-baking feature** that bakes rigid-body physics (hair, skirt
 - **VMD motion baking** — evaluates Bézier interpolation and bakes every frame in MMD's exact deformation order (deform hierarchy → append/grant → CCD-IK with axis limits).
 - **Physics baking** — simulates rigid-body physics for hair, ties, skirts, etc. and bakes the result into bone keyframes, so secondary motion works in viewers without a physics engine.
 - **Fine-grained IK control, 4 modes** — from full bake to "don't solve at all" (see [IK handling](#ik-handling)).
-- **Nothing that glTF can't express is lost** — rigid bodies, joints, IK settings, append parents, and more are fully preserved as raw data under `extras.mmd`. Even when physics baking is on, the original physics data stays intact, so a game engine (e.g. Unity) can rebuild real physics from it.
+- **Nothing that glTF can't express is lost** — rigid bodies, joints, IK settings, append parents, and more are fully preserved as raw data under `extras.mmd`. Even when physics baking is on, the original physics data stays intact, so a game engine (e.g. Unity) can rebuild real physics from it (see the published [Unity importer](https://github.com/masaka1024/mmd2gltf-unity-physics-importer)).
 - **GUI and CLI** — the GUI supports Japanese/English switching and drag & drop.
 - **Prebuilt Windows EXE** — download and run without installing Python.
 
