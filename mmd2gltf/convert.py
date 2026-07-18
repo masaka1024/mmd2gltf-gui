@@ -110,6 +110,9 @@ def _alpha_class(img):
               (faces look inside-out / see-through in many viewers).
     'blend' = significant fraction of semi-transparent texels
               (e.g. hair tips) -> real alpha blending.
+
+    Returns (class_str, stats_dict_or_None) -- stats_dict has
+    below_frac / semi_low_frac / mean_alpha_of_below_0_255 for logging.
     """
     if "A" not in img.getbands():
         # Palette ('P') images can carry transparency via a side-channel
@@ -120,38 +123,145 @@ def _alpha_class(img):
         if img.mode == "P" and "transparency" in img.info:
             img = img.convert("RGBA")
         else:
-            return "opaque"
+            return "opaque", None
     hist = img.getchannel("A").histogram()
     total = sum(hist) or 1
     below = sum(hist[:250]) / total
     if below == 0.0:
-        return "opaque"
+        return "opaque", None
     # Only texels that are *really* see-through (alpha < 0.5) argue for
     # true blending.  Hair/skin textures are mostly high-alpha cutouts;
     # rendering them as BLEND disables depth writes in most viewers and
     # makes them look nearly transparent / wrongly sorted.
     semi_low = sum(hist[5:128]) / total
-    return "blend" if semi_low > 0.25 else "mask"
+    below_count = sum(hist[:250])
+    mean_below = (
+        sum(v * cnt for v, cnt in enumerate(hist[:250])) / below_count
+        if below_count else None
+    )
+    stats = {
+        "below_frac": below,
+        "semi_low_frac": semi_low,
+        "mean_alpha_of_below_0_255": mean_below,
+    }
+    cls = "blend" if semi_low > 0.25 else "mask"
+    return cls, stats
+
+
+def _average_color(img):
+    """Return the average (r, g, b) of a PIL image as 0..1 floats, or None.
+
+    Used as a static fallback baseColorFactor for materials whose color
+    comes entirely from a sphere map (diffuse=ambient=black, MMD metal
+    materials). glTF's baseColorFactor can't express a dynamic sphere
+    reflection, so a flat average color is the closest static substitute
+    -- far better than the pure black that results from leaving diffuse
+    as-is.
+    """
+    if not HAS_PIL:
+        return None
+    try:
+        small = img.convert("RGB").resize((32, 32))
+        pixels = list(small.getdata())
+        n = len(pixels) or 1
+        r = sum(p[0] for p in pixels) / n
+        g = sum(p[1] for p in pixels) / n
+        b = sum(p[2] for p in pixels) / n
+        return (r / 255.0, g / 255.0, b / 255.0)
+    except Exception:
+        return None
+
+
+def _prebake_mask_alpha(img, cutoff_0_255=25):
+    """Pre-blend soft-alpha painted pixels (e.g. eyebrows) into the RGB
+    color, then flatten alpha to a hard 0/255 cutout.
+
+    MMD renders these textures with real alpha blending: a dark, ~25%
+    opaque ink stroke over skin produces a soft brownish look. Our glTF
+    export uses alphaMode=MASK (a hard binary cutout) instead of BLEND,
+    specifically to avoid the depth-sorting/see-through artifacts that
+    BLEND causes on overlapping geometry (hair, face overlays). But MASK
+    shows whichever pixels pass the cutoff at their *raw, unblended*
+    color -- so a soft ~25%-opacity dark stroke shows up as a harsh,
+    nearly-black line instead of the intended light brown.
+
+    This bakes the blend in ahead of time: for texels whose alpha sits
+    between cutoff_0_255 and ~250 (softly painted, not fully opaque),
+    replace the RGB with a blend of that RGB and the texture's own
+    "fully opaque" average color (a stand-in for the skin tone showing
+    through), weighted by the real alpha. The alpha channel is then
+    flattened to a hard cutout (0 or 255) so MASK mode still avoids any
+    sort-order dependency.
+    """
+    try:
+        rgba = numpy_array_rgba(img)
+    except Exception:
+        return img
+    if rgba is None:
+        return img
+    r, g, b, a = rgba[..., 0], rgba[..., 1], rgba[..., 2], rgba[..., 3]
+
+    opaque_mask = a >= 250
+    if not opaque_mask.any():
+        return img  # nothing to use as a background reference
+    bg = [float(ch[opaque_mask].mean()) for ch in (r, g, b)]
+
+    soft_mask = (a >= cutoff_0_255) & (a < 250)
+    if soft_mask.any():
+        af = a[soft_mask].astype("float64") / 255.0
+        for ci, ch in enumerate((r, g, b)):
+            blended = ch[soft_mask].astype("float64") * af + bg[ci] * (1.0 - af)
+            ch[soft_mask] = blended.round().clip(0, 255).astype(ch.dtype)
+
+    new_alpha = numpy_where(a >= cutoff_0_255, 255, 0).astype(a.dtype)
+    out = numpy_stack([r, g, b, new_alpha])
+    return Image.fromarray(out, mode="RGBA")
+
+
+def numpy_array_rgba(img):
+    import numpy as np
+    if img.mode != "RGBA":
+        if "A" not in img.getbands():
+            return None
+        img = img.convert("RGBA")
+    return np.array(img)
+
+
+def numpy_where(cond, a, b):
+    import numpy as np
+    return np.where(cond, a, b)
+
+
+def numpy_stack(channels):
+    import numpy as np
+    return np.stack(channels, axis=-1)
 
 
 def load_texture(path):
-    """Return (png_or_jpg_bytes, mime, alpha_class) or None."""
+    """Return (png_or_jpg_bytes, mime, alpha_class, avg_color) or None.
+
+    avg_color is an (r, g, b) 0..1 tuple (or None if unavailable) used as
+    a static fallback for sphere-only materials -- see _average_color().
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext in (".jpg", ".jpeg") or (ext == ".png" and not HAS_PIL):
         with open(path, "rb") as f:
             data = f.read()
         mime = "image/png" if ext == ".png" else "image/jpeg"
-        return data, mime, "opaque"
+        return data, mime, "opaque", None, None
     if ext == ".png" and HAS_PIL:
         # re-encode to strip ICC/gamma chunks the glTF validator flags
         try:
             img = Image.open(path)
-            aclass = _alpha_class(img)
+            aclass, alpha_stats = _alpha_class(img)
+            avg = _average_color(img)
+            if aclass == "mask":
+                img = _prebake_mask_alpha(img)
             if img.mode not in ("RGB", "RGBA"):
                 img = img.convert("RGB" if aclass == "opaque" else "RGBA")
             buf = io.BytesIO()
             img.save(buf, "PNG", icc_profile=None)
-            return buf.getvalue(), "image/png", aclass
+            return buf.getvalue(), "image/png", aclass, avg, alpha_stats
         except Exception as e:
             log("WARNING: failed to load texture %s (%s)" % (path, e))
             return None
@@ -160,12 +270,15 @@ def load_texture(path):
         return None
     try:
         img = Image.open(path)
-        aclass = _alpha_class(img)
+        aclass, alpha_stats = _alpha_class(img)
+        avg = _average_color(img)
+        if aclass == "mask":
+            img = _prebake_mask_alpha(img)
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGB" if aclass == "opaque" else "RGBA")
         buf = io.BytesIO()
         img.save(buf, "PNG")
-        return buf.getvalue(), "image/png", aclass
+        return buf.getvalue(), "image/png", aclass, avg, alpha_stats
     except Exception as e:
         log("WARNING: failed to load texture %s (%s)" % (path, e))
         return None
@@ -408,6 +521,8 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
     # ---------------- textures -------------------------------------------
     tex_map = {}   # pmx texture index -> gltf texture index
     tex_alpha = {}
+    tex_avg_color = {}
+    tex_alpha_stats = {}
     if model["textures"]:
         g.j["samplers"] = [{"magFilter": 9729, "minFilter": 9987,
                             "wrapS": 10497, "wrapT": 10497}]
@@ -420,12 +535,14 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
         res = load_texture(p)
         if res is None:
             continue
-        data, mime, aclass = res
+        data, mime, aclass, avg, alpha_stats = res
         img = g.add_image(data, mime, name=os.path.basename(rel))
         g.j["textures"].append({"sampler": 0, "source": img,
                                 "name": os.path.basename(rel)})
         tex_map[ti] = len(g.j["textures"]) - 1
         tex_alpha[ti] = aclass
+        tex_alpha_stats[ti] = alpha_stats
+        tex_avg_color[ti] = avg
 
     # ---------------- materials -------------------------------------------
     g.j["materials"] = []
@@ -445,6 +562,43 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             mat["pbrMetallicRoughness"]["baseColorTexture"] = {
                 "index": tex_map[ti]}
             aclass = tex_alpha.get(ti, "opaque")
+            # 【診断ログ】眉毛が消える/前髪に穴が開く等の切り分け用。
+            # alphaMode判定に使った実際のアルファ分布を出す。
+            st = tex_alpha_stats.get(ti)
+            if st is not None:
+                log(
+                    "MATERIAL '%s': texture=%s alphaClass=%s "
+                    "below0.5=%.3f semiLow(5-128)=%.3f meanAlphaOfBelow(0-255)=%s"
+                    % (
+                        m["name"] or m["name_en"],
+                        model["textures"][ti] if ti < len(model["textures"]) else "?",
+                        aclass,
+                        st["below_frac"],
+                        st["semi_low_frac"],
+                        ("%.1f" % st["mean_alpha_of_below_0_255"])
+                        if st["mean_alpha_of_below_0_255"] is not None else "N/A",
+                    )
+                )
+        # 【スフィア専用フォールバック】diffuse/ambientが両方ほぼ黒、かつ
+        # ベーステクスチャが無い場合、色の情報源はMMDのスフィアマップ
+        # (extras.mmdにのみ保存され、標準のbaseColorFactorには反映されない)
+        # だけになる。glTF標準ビューアで見ると真っ黒になってしまうため、
+        # スフィア画像の平均色を静的な近似としてbaseColorFactorに採用する。
+        # 動的な反射は再現できないが、真っ黒よりは実態に近い。
+        if ti not in tex_map:
+            diffuse_dark = max(m["diffuse"][0], m["diffuse"][1], m["diffuse"][2]) < 0.05
+            ambient_dark = max(m["ambient"]) < 0.05
+            sph_ti = m.get("sphere_texture", -1)
+            if diffuse_dark and ambient_dark and sph_ti in tex_map:
+                avg = tex_avg_color.get(sph_ti)
+                if avg is not None:
+                    mat["pbrMetallicRoughness"]["baseColorFactor"] = [
+                        avg[0], avg[1], avg[2], m["diffuse"][3]
+                    ]
+                    log("INFO: '%s' has no base texture and black "
+                        "diffuse/ambient; using sphere map average color "
+                        "as a static baseColorFactor fallback"
+                        % (m["name"] or m["name_en"]))
         if alpha_mode != "auto":
             mode = alpha_mode.upper()
         elif m["diffuse"][3] < 1.0 or aclass == "blend":
@@ -455,7 +609,17 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             mode = "OPAQUE"
         mat["alphaMode"] = mode
         if mode == "MASK":
-            mat["alphaCutoff"] = 0.5
+            # 【修正】以前は固定で0.5(=128/255)を使っていたが、実測の結果
+            # 「顔3」(眉毛を含む肌テクスチャ)は透明でない部分の平均アルファが
+            # 64.7/255(≒0.25)しかなく、0.5のカットオフでは眉毛ごと切り捨てて
+            # しまっていた(完全に見えなくなる不具合として実機確認済み)。
+            # 未使用UV領域(背景)は通常アルファがほぼ0に振り切っているため、
+            # カットオフはもっと低い値でも「本当に透明な部分」だけを正しく
+            # 切り捨てられる。0.1(≒25/255)なら、薄めに描かれた線画(眉毛等)は
+            # 生き残りつつ、真の透明領域は変わらず除外される。
+            # 元々ほぼ不透明なテクスチャ(mat5=前髪 mean223.4、後ろ髪 mean181.1)
+            # にはこの変更はほぼ影響しない。
+            mat["alphaCutoff"] = 0.1
         if unlit:
             mat["extensions"] = {"KHR_materials_unlit": {}}
         if extras:
