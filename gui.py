@@ -1,759 +1,780 @@
 # -*- coding: utf-8 -*-
-"""mmd2gltf の tkinter GUI (日本語/English)。
+"""PMX (+VMD) -> glTF 2.0 (.glb) conversion.
 
-使い方 / Usage:
-    python gui.py
-依存 / deps: 標準ライブラリのみ(テクスチャ処理にPillow、
-ドラッグ&ドロップにtkinterdnd2を推奨/optional)。
+Coordinate conversion (MMD left-handed, Y-up  ->  glTF right-handed, Y-up):
+    position / normal : (x, y, z) -> (x, y, -z)
+    quaternion        : (x, y, z, w) -> (-x, -y, z, w)
+    triangle winding  : (a, b, c) -> (a, c, b)
+Everything glTF cannot express natively (IK, physics, sphere/toon shading,
+material & bone morphs, SDEF, display frames, ...) is preserved verbatim
+(MMD coordinate space) under `extras.mmd` in the glTF JSON.
 """
 import io
-import locale
 import os
-import queue
-import re
+import struct
 import sys
-import threading
-import traceback
-import contextlib
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mmd2gltf.convert import convert, HAS_PIL  # noqa: E402
-from mmd2gltf import pmx as pmx_module  # noqa: E402
+from .pmx import parse_pmx
+from .vmd import parse_vmd
+from . import gltf as G
+from . import physics
+from .bake_hair import bake_hair_into_gltf
+from .animation import bake, Track, FPS
 
-# ドラッグ&ドロップは標準のtkinterには無いため tkinterdnd2 を使う(任意)。
-# 無ければ従来通りの「参照...」ボタンのみで動作する(機能を静かに無効化)。
 try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-    HAS_DND = True
+    from PIL import Image
+    HAS_PIL = True
 except ImportError:
-    HAS_DND = False
-
-_BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
+    HAS_PIL = False
 
 
-def _parse_dropped_paths(data):
-    """tkinterdnd2の event.data (例: '{C:/a b.pmx} C:/c.vmd') をパスのリストに変換。"""
-    paths = []
-    for m in re.finditer(r"\{([^{}]*)\}|(\S+)", data):
-        p = m.group(1) if m.group(1) is not None else m.group(2)
-        if p:
-            paths.append(p)
-    return paths
+def log(*a):
+    print("[mmd2gltf]", *a, file=sys.stderr)
 
 
-def _detect_default_lang():
-    try:
-        loc = locale.getdefaultlocale()[0] or ""
-    except Exception:
-        loc = ""
-    return "ja" if loc.lower().startswith("ja") else "en"
+# Pillowが無いと read_texture() が中身をそのまま素通しできず None を返す形式。
+# .png / .jpg はPillow無しでも生バイトのまま読めるためここには含めない。
+_PIL_ONLY_EXTS = (".bmp", ".tga", ".sph", ".spa", ".dds", ".tif", ".tiff", ".gif")
 
 
-# ---------------------------------------------------------------------
-# 翻訳テーブル / translation table
-# ---------------------------------------------------------------------
-STRINGS = {
-    "ja": {
-        "window_title": "mmd2gltf - PMX/VMD → glTF (.glb) 変換",
-        "frame_files": "ファイル",
-        "label_pmx": "PMXモデル *",
-        "label_vmd": "VMDモーション",
-        "label_out": "出力 .glb",
-        "browse": "参照...",
-        "drop_hint": "(ドラッグ&ドロップ可)",
-        "frame_options": "オプション",
-        "opt_unlit": "unlit(MMDのトゥーン見た目に近づける)",
-        "opt_doubleside": "全材質を両面描画(髪・スカートの裏面が消える場合に)",
-        "opt_morph_mode": "モーフ格納方式",
-        "opt_alpha_mode": "アルファモード",
-        "opt_scale": "スケール(MMD単位→m。既定0.08。等倍にしたい場合は1.0)",
-        "adv_toggle_closed": "詳細設定 ▸",
-        "adv_toggle_open": "詳細設定 ▾",
-        "frame_advanced": "詳細設定",
-        "adv_noik": "IKを解かない(--no-ik)",
-        "adv_ignore_vmd_ik": "VMD内のIK ON/OFFキーを無視(--ignore-vmd-ik)",
-        "adv_no_extras": "extras.mmd を出力しない(--no-extras)",
-        "adv_no_custom_attrs": "MMD固有の頂点属性を省略(--no-custom-attrs)\n"
-                                "  ※Blenderで「メッシュを読み込めない」エラーが出る場合はこれをON",
-        "adv_disable_ik_label": "無効化するIK名(カンマ区切り)",
-        "adv_step_label": "サンプリング間隔(--step)",
-        "adv_anim_name_label": "アニメーション名",
-        "adv_bake_hair": "物理演算をベイクする(--bake-physics)",
-        "adv_bake_target": "対象",
-        "adv_target_hair": "髪のみ",
-        "adv_target_all": "全部(髪・スカート・ネクタイ等)",
-        "adv_margin_label": "衝突クリアランス",
-        "adv_hem_margin_label": "裾だけ追加クリアランス",
-        "adv_hem_margin_hint": "スカートの末端(裾)だけに、上のクリアランスを上乗せします。"
-                                "腰側には影響しません。太もも等への見た目の食い込みが\n"
-                                "気になる場合、0.01前後から試してください。",
-        "adv_collision_mode_label": "衝突モード",
-        "adv_collision_mode_normal": "通常（リストの剛体だけ衝突させない）",
-        "adv_collision_mode_allow": "限定（リストの剛体だけ衝突させる）",
-        "adv_collision_names_label": "対象の剛体名(カンマ区切り)",
-        "adv_collision_names_hint": "スカートや髪が体の一部に食い込む／開いたまま戻らない、といった場合に使います。\n"
-                                     "下の「剛体名を確認」で、モデルの剛体名を見ながら入力できます。",
-        "adv_show_rigidbodies_btn": "剛体名を確認...",
-        "adv_vrm_compat_btn": "VRM互換モードにする",
-        "adv_vrm_compat_hint": "脚まわりの剛体だけを自動で選び、「限定」モードに切り替えます"
-                                "（VRMのSpringBone/VRChat PhysBonesと同じ考え方）。",
-        "vrm_compat_no_match": "脚に該当しそうな剛体名が見つかりませんでした。"
-                                "「剛体名を確認」で手動で選んでください。",
-        "vrm_compat_applied": "%d 個の剛体を「限定」モードに設定しました。",
-        "rigidbody_picker_title": "剛体一覧（ダブルクリックで追加）",
-        "rigidbody_picker_static": "■ 静的（脚・胴体など、コライダーになるもの）",
-        "rigidbody_picker_dynamic": "■ 揺れ物（髪・スカートなど）",
-        "rigidbody_picker_no_pmx": "先にPMXファイルを選択してください。",
-        "rigidbody_picker_close": "閉じる",
-        "run_button": "変換する",
-        "frame_log": "ログ",
-        "err_title": "入力エラー",
-        "err_select_pmx": "PMXモデルを選択してください。",
-        "err_pmx_not_found": "PMXファイルが見つかりません:\n",
-        "err_vmd_not_found": "VMDファイルが見つかりません:\n",
-        "err_scale_invalid": "スケールには数値を入力してください。",
-        "err_drop_pmx": "PMXファイル(.pmx)をドロップしてください:\n",
-        "err_drop_vmd": "VMDファイル(.vmd)をドロップしてください:\n",
-        "info_done_title": "完了",
-        "info_done_msg": "変換が完了しました。\n",
-        "error_title": "エラー",
-        "error_msg": "変換に失敗しました。\n",
-        "log_converting": "変換を開始: %s\n",
-        "log_done": "完了: %s (%.1f MB)\n",
-        "warn_pillow_missing": (
-            "\u26a0 Pillow(PIL)が見つかりません。BMP/TGA/sph/spa形式の"
-            "テクスチャは変換できず、該当する材質は色が抜けます。\n"
-            "  対処: このプロジェクトのvenvで `pip install Pillow` "
-            "(uv環境なら `uv pip install Pillow`) を実行してから、"
-            "このアプリを起動し直してください。\n\n"
-        ),
-        "info_dnd_missing": (
-            "\u2139 ドラッグ&ドロップは無効です(tkinterdnd2が未導入)。\n"
-            "  有効にするには: `uv pip install tkinterdnd2`"
-            "(uv環境でない場合は `pip install tkinterdnd2`) を実行してから、"
-            "このアプリを起動し直してください。\n\n"
-        ),
-    },
-    "en": {
-        "window_title": "mmd2gltf - PMX/VMD to glTF (.glb) Converter",
-        "frame_files": "Files",
-        "label_pmx": "PMX model *",
-        "label_vmd": "VMD motion",
-        "label_out": "Output .glb",
-        "browse": "Browse...",
-        "drop_hint": "(drag & drop supported)",
-        "frame_options": "Options",
-        "opt_unlit": "Unlit (closer to MMD's toon look)",
-        "opt_doubleside": "Force all materials double-sided (fixes disappearing hair/skirt backfaces)",
-        "opt_morph_mode": "Morph storage mode",
-        "opt_alpha_mode": "Alpha mode",
-        "opt_scale": "Scale (MMD units -> m. Default 0.08. Use 1.0 for no scaling)",
-        "adv_toggle_closed": "Advanced \u25b8",
-        "adv_toggle_open": "Advanced \u25be",
-        "frame_advanced": "Advanced settings",
-        "adv_noik": "Don't solve IK (--no-ik)",
-        "adv_ignore_vmd_ik": "Ignore IK on/off keys in VMD (--ignore-vmd-ik)",
-        "adv_no_extras": "Don't output extras.mmd (--no-extras)",
-        "adv_no_custom_attrs": "Omit MMD-specific vertex attributes (--no-custom-attrs)\n"
-                                "  \u2731 Turn this ON if Blender fails to load the mesh",
-        "adv_disable_ik_label": "IK names to disable (comma-separated)",
-        "adv_step_label": "Sampling step (--step)",
-        "adv_anim_name_label": "Animation clip name",
-        "adv_bake_hair": "Bake rigid-body physics (--bake-physics)",
-        "adv_bake_target": "Target",
-        "adv_target_hair": "Hair only",
-        "adv_target_all": "All (hair, skirt, tie, etc.)",
-        "adv_margin_label": "Collision clearance",
-        "adv_hem_margin_label": "Extra clearance (hem only)",
-        "adv_hem_margin_hint": "Adds extra clearance on top of the setting above, but only "
-                                "at the skirt's hem (tip). The waist side is unaffected. "
-                                "Try around 0.01 if the legs visually poke through the hem.",
-        "adv_collision_mode_label": "Collision mode",
-        "adv_collision_mode_normal": "Normal (exclude only the listed bodies)",
-        "adv_collision_mode_allow": "Restricted (only the listed bodies collide)",
-        "adv_collision_names_label": "Rigid body names (comma-separated)",
-        "adv_collision_names_hint": "Use this when a skirt or hair pokes through part of the body, "
-                                     "or stays flared open. \"Browse rigid bodies\" below lets you "
-                                     "see the model's names while you type.",
-        "adv_show_rigidbodies_btn": "Browse rigid bodies...",
-        "adv_vrm_compat_btn": "Use VRM-compatible mode",
-        "adv_vrm_compat_hint": "Auto-selects leg/hip rigid bodies and switches to "
-                                "Restricted mode (same idea as VRM SpringBone / "
-                                "VRChat PhysBones).",
-        "vrm_compat_no_match": "Couldn't find any leg-like rigid body names. "
-                                "Use \"Browse rigid bodies\" to pick manually.",
-        "vrm_compat_applied": "Set %d rigid body name(s) to Restricted mode.",
-        "rigidbody_picker_title": "Rigid bodies (double-click to add)",
-        "rigidbody_picker_static": "\u25a0 Static (legs, torso, etc. \u2014 these act as colliders)",
-        "rigidbody_picker_dynamic": "\u25a0 Dynamic (hair, skirt, etc. \u2014 these sway)",
-        "rigidbody_picker_no_pmx": "Select a PMX file first.",
-        "rigidbody_picker_close": "Close",
-        "run_button": "Convert",
-        "frame_log": "Log",
-        "err_title": "Input error",
-        "err_select_pmx": "Please select a PMX model.",
-        "err_pmx_not_found": "PMX file not found:\n",
-        "err_vmd_not_found": "VMD file not found:\n",
-        "err_scale_invalid": "Scale must be a number.",
-        "err_drop_pmx": "Please drop a PMX file (.pmx):\n",
-        "err_drop_vmd": "Please drop a VMD file (.vmd):\n",
-        "info_done_title": "Done",
-        "info_done_msg": "Conversion complete.\n",
-        "error_title": "Error",
-        "error_msg": "Conversion failed.\n",
-        "log_converting": "Starting conversion: %s\n",
-        "log_done": "Done: %s (%.1f MB)\n",
-        "warn_pillow_missing": (
-            "\u26a0 Pillow (PIL) not found. Textures in .bmp/.tga/.sph/.spa "
-            "format cannot be converted, and those materials will lose "
-            "their color.\n"
-            "  Fix: run `pip install Pillow` (or `uv pip install Pillow` "
-            "in a uv-managed venv) in this project's folder, then restart "
-            "this app.\n\n"
-        ),
-        "info_dnd_missing": (
-            "\u2139 Drag & drop is disabled (tkinterdnd2 not installed).\n"
-            "  To enable it: run `uv pip install tkinterdnd2` (or `pip "
-            "install tkinterdnd2`) in this project's folder, then restart "
-            "this app.\n\n"
-        ),
-    },
-}
+def _warn_missing_pillow(model):
+    """Pillow(PIL)が無いまま変換すると、.bmp/.tga/.sph/.spaなどのテクスチャが
+    load_texture() 内で黙って None になり、材質からごっそり抜け落ちる
+    (見た目は拡散色だけのベタ塗りになり「色が抜け落ちる」原因になる)。
+    通常のWARNINGログは他の出力に埋もれて見逃しやすいため、対象テクスチャが
+    実際にある場合だけ、変換の最初にまとめて目立つ形で警告する。
+    """
+    if HAS_PIL:
+        return
+    affected = [t for t in model["textures"]
+                if os.path.splitext(t)[1].lower() in _PIL_ONLY_EXTS]
+    if not affected:
+        return
+    log("=" * 60)
+    log("警告: Pillow(PIL)が見つかりません。")
+    log("次の %d 個のテクスチャは変換できず、材質から欠落します:"
+        % len(affected))
+    for t in affected[:10]:
+        log("  -", t)
+    if len(affected) > 10:
+        log("  ... 他 %d 個" % (len(affected) - 10))
+    log("修正方法: このプロジェクトのフォルダで次を実行してください:")
+    log("  uv pip install pillow   (uvを使っていない場合は pip install Pillow)")
+    log("インストール後、もう一度変換すると色が復元されます。")
+    log("=" * 60)
 
 
-class QueueWriter(io.TextIOBase):
-    """print 出力をGUIのログへ流すためのファイル風オブジェクト。"""
-
-    def __init__(self, q):
-        self.q = q
-
-    def write(self, s):
-        if s:
-            self.q.put(("log", s))
-        return len(s)
+# ---------------------------------------------------------------- coords
+def cpos(v, s=1.0):
+    return (v[0] * s, v[1] * s, -v[2] * s)
 
 
-class App(_BaseTk):
-    def __init__(self):
-        super().__init__()
-        self.lang = _detect_default_lang()
-        self.minsize(560, 520)
-        self.q = queue.Queue()
-        self.worker = None
-        self._out_edited = False
-        self._i18n_widgets = []   # (widget, key) simple .config(text=...) targets
-        self._build()
-        self._retranslate()
-        if not HAS_PIL:
-            self._log(self.t("warn_pillow_missing"))
-        if not HAS_DND:
-            self._log(self.t("info_dnd_missing"))
-        self.after(100, self._poll)
-
-    # ---------- i18n ----------
-    def t(self, key):
-        return STRINGS[self.lang][key]
-
-    def _on_lang_change(self, event=None):
-        self.lang = "ja" if self.lang_var.get() == "日本語" else "en"
-        self._retranslate()
-
-    def _retranslate(self):
-        self.title(self.t("window_title"))
-        for widget, key in self._i18n_widgets:
-            widget.configure(text=self.t(key))
-        drop_hint = (" " + self.t("drop_hint")) if HAS_DND else ""
-        self.pmx_label.configure(text=self.t("label_pmx") + drop_hint)
-        self.vmd_label.configure(text=self.t("label_vmd") + drop_hint)
-        self.adv_btn.configure(text=self.t("adv_toggle_open") if self.adv_shown.get()
-                                else self.t("adv_toggle_closed"))
-        self.files_frame.configure(text=self.t("frame_files"))
-        self.opts_frame.configure(text=self.t("frame_options"))
-        self.adv.configure(text=self.t("frame_advanced"))
-        self.logf.configure(text=self.t("frame_log"))
-
-    # ---------- UI ----------
-    def _build(self):
-        pad = dict(padx=8, pady=4)
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True)
-
-        top = ttk.Frame(frm)
-        top.pack(fill="x", **pad)
-        ttk.Label(top, text="Language / 言語").pack(side="left")
-        self.lang_var = tk.StringVar(value="日本語" if self.lang == "ja" else "English")
-        lang_box = ttk.Combobox(top, textvariable=self.lang_var, state="readonly",
-                                 values=["日本語", "English"], width=10)
-        lang_box.pack(side="left", padx=6)
-        lang_box.bind("<<ComboboxSelected>>", self._on_lang_change)
-
-        self.files_frame = ttk.LabelFrame(frm, text="")
-        self.files_frame.pack(fill="x", **pad)
-        self.files_frame.columnconfigure(1, weight=1)
-        files = self.files_frame
-
-        self.pmx_var = tk.StringVar()
-        self.vmd_var = tk.StringVar()
-        self.out_var = tk.StringVar()
-
-        self.pmx_label = ttk.Label(files, text="")
-        self.pmx_label.grid(row=0, column=0, sticky="w", **pad)
-        pmx_entry = ttk.Entry(files, textvariable=self.pmx_var)
-        pmx_entry.grid(row=0, column=1, sticky="ew", **pad)
-        btn_pmx = ttk.Button(files, command=self._pick_pmx)
-        btn_pmx.grid(row=0, column=2, **pad)
-        self._i18n_widgets.append((btn_pmx, "browse"))
-
-        self.vmd_label = ttk.Label(files, text="")
-        self.vmd_label.grid(row=1, column=0, sticky="w", **pad)
-        vmd_entry = ttk.Entry(files, textvariable=self.vmd_var)
-        vmd_entry.grid(row=1, column=1, sticky="ew", **pad)
-        btn_vmd = ttk.Button(files, command=self._pick_vmd)
-        btn_vmd.grid(row=1, column=2, **pad)
-        self._i18n_widgets.append((btn_vmd, "browse"))
-
-        if HAS_DND:
-            pmx_entry.drop_target_register(DND_FILES)
-            pmx_entry.dnd_bind("<<Drop>>", self._on_drop_pmx)
-            vmd_entry.drop_target_register(DND_FILES)
-            vmd_entry.dnd_bind("<<Drop>>", self._on_drop_vmd)
-
-        out_label = ttk.Label(files, text="")
-        out_label.grid(row=2, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((out_label, "label_out"))
-        out_entry = ttk.Entry(files, textvariable=self.out_var)
-        out_entry.grid(row=2, column=1, sticky="ew", **pad)
-        out_entry.bind("<KeyRelease>", lambda e: setattr(self, "_out_edited", True))
-        btn_out = ttk.Button(files, command=self._pick_out)
-        btn_out.grid(row=2, column=2, **pad)
-        self._i18n_widgets.append((btn_out, "browse"))
-
-        self.opts_frame = ttk.LabelFrame(frm, text="")
-        self.opts_frame.pack(fill="x", **pad)
-        self.opts_frame.columnconfigure(1, weight=1)
-        opts = self.opts_frame
-
-        self.unlit_var = tk.BooleanVar(value=False)
-        self.dside_var = tk.BooleanVar(value=False)
-        self.morph_var = tk.StringVar(value="sparse")
-        self.alpha_var = tk.StringVar(value="auto")
-        self.scale_var = tk.StringVar(value="0.08")
-
-        cb1 = ttk.Checkbutton(opts, variable=self.unlit_var)
-        cb1.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb1, "opt_unlit"))
-        cb2 = ttk.Checkbutton(opts, variable=self.dside_var)
-        cb2.grid(row=1, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb2, "opt_doubleside"))
-
-        lbl_morph = ttk.Label(opts, text="")
-        lbl_morph.grid(row=2, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_morph, "opt_morph_mode"))
-        ttk.Combobox(opts, textvariable=self.morph_var, state="readonly",
-                     values=["sparse", "dense", "none"], width=10).grid(row=2, column=1, sticky="w", **pad)
-
-        lbl_alpha = ttk.Label(opts, text="")
-        lbl_alpha.grid(row=3, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_alpha, "opt_alpha_mode"))
-        ttk.Combobox(opts, textvariable=self.alpha_var, state="readonly",
-                     values=["auto", "opaque", "mask", "blend"], width=10).grid(row=3, column=1, sticky="w", **pad)
-
-        lbl_scale = ttk.Label(opts, text="")
-        lbl_scale.grid(row=4, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_scale, "opt_scale"))
-        ttk.Entry(opts, textvariable=self.scale_var, width=10).grid(row=4, column=1, sticky="w", **pad)
-
-        # 詳細設定(折りたたみ) / advanced (collapsible)
-        self.adv_shown = tk.BooleanVar(value=False)
-        self.adv_btn = ttk.Checkbutton(frm, text="", variable=self.adv_shown,
-                                       command=self._toggle_adv, style="Toolbutton")
-        self.adv_btn.pack(anchor="w", **pad)
-        self.adv = ttk.LabelFrame(frm, text="")
-        self.adv.columnconfigure(1, weight=1)
-
-        self.noik_var = tk.BooleanVar(value=False)
-        self.igvmdik_var = tk.BooleanVar(value=False)
-        self.noextras_var = tk.BooleanVar(value=False)
-        self.nocustom_var = tk.BooleanVar(value=False)
-        self.disik_var = tk.StringVar()
-        self.step_var = tk.IntVar(value=1)
-        self.anim_var = tk.StringVar()
-        self.bakehair_var = tk.BooleanVar(value=False)
-        self.baketarget_var = tk.StringVar(value="hair")
-        self.margin_var = tk.StringVar(value="0.01")
-        self.hemmargin_var = tk.StringVar(value="0.0")
-        self.collmode_var = tk.StringVar(value="normal")
-        self.collnames_var = tk.StringVar()
-
-        cb3 = ttk.Checkbutton(self.adv, variable=self.noik_var)
-        cb3.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb3, "adv_noik"))
-        cb4 = ttk.Checkbutton(self.adv, variable=self.igvmdik_var)
-        cb4.grid(row=1, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb4, "adv_ignore_vmd_ik"))
-        cb5 = ttk.Checkbutton(self.adv, variable=self.noextras_var)
-        cb5.grid(row=2, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb5, "adv_no_extras"))
-        cb6 = ttk.Checkbutton(self.adv, variable=self.nocustom_var)
-        cb6.grid(row=3, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb6, "adv_no_custom_attrs"))
-
-        lbl_disik = ttk.Label(self.adv, text="")
-        lbl_disik.grid(row=4, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_disik, "adv_disable_ik_label"))
-        ttk.Entry(self.adv, textvariable=self.disik_var).grid(row=4, column=1, sticky="ew", **pad)
-
-        lbl_step = ttk.Label(self.adv, text="")
-        lbl_step.grid(row=5, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_step, "adv_step_label"))
-        ttk.Spinbox(self.adv, from_=1, to=30, textvariable=self.step_var, width=6).grid(row=5, column=1, sticky="w", **pad)
-
-        lbl_anim = ttk.Label(self.adv, text="")
-        lbl_anim.grid(row=6, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_anim, "adv_anim_name_label"))
-        ttk.Entry(self.adv, textvariable=self.anim_var).grid(row=6, column=1, sticky="ew", **pad)
-
-        cb7 = ttk.Checkbutton(self.adv, variable=self.bakehair_var)
-        cb7.grid(row=7, column=0, columnspan=2, sticky="w", **pad)
-        self._i18n_widgets.append((cb7, "adv_bake_hair"))
-
-        lbl_tgt = ttk.Label(self.adv, text="")
-        lbl_tgt.grid(row=8, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_tgt, "adv_bake_target"))
-        tgt_frame = ttk.Frame(self.adv)
-        tgt_frame.grid(row=8, column=1, sticky="w", **pad)
-        rb_hair = ttk.Radiobutton(tgt_frame, variable=self.baketarget_var,
-                                  value="hair")
-        rb_hair.pack(side="left")
-        self._i18n_widgets.append((rb_hair, "adv_target_hair"))
-        rb_all = ttk.Radiobutton(tgt_frame, variable=self.baketarget_var,
-                                 value="all")
-        rb_all.pack(side="left", padx=8)
-        self._i18n_widgets.append((rb_all, "adv_target_all"))
-
-        lbl_mg = ttk.Label(self.adv, text="")
-        lbl_mg.grid(row=9, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
-        ttk.Entry(self.adv, textvariable=self.margin_var, width=8).grid(
-            row=9, column=1, sticky="w", **pad)
-
-        lbl_hmg = ttk.Label(self.adv, text="")
-        lbl_hmg.grid(row=15, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_hmg, "adv_hem_margin_label"))
-        ttk.Entry(self.adv, textvariable=self.hemmargin_var, width=8).grid(
-            row=15, column=1, sticky="w", **pad)
-        self.lbl_hmg_hint = ttk.Label(self.adv, text="", foreground="#666666",
-                                      wraplength=380, justify="left")
-        self.lbl_hmg_hint.grid(row=16, column=1, sticky="w", **pad)
-        self._i18n_widgets.append((self.lbl_hmg_hint, "adv_hem_margin_hint"))
-
-        lbl_cm = ttk.Label(self.adv, text="")
-        lbl_cm.grid(row=10, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_cm, "adv_collision_mode_label"))
-        cm_frame = ttk.Frame(self.adv)
-        cm_frame.grid(row=10, column=1, sticky="w", **pad)
-        rb_normal = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
-                                    value="normal")
-        rb_normal.pack(anchor="w")
-        self._i18n_widgets.append((rb_normal, "adv_collision_mode_normal"))
-        rb_allow = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
-                                   value="allow")
-        rb_allow.pack(anchor="w")
-        self._i18n_widgets.append((rb_allow, "adv_collision_mode_allow"))
-
-        lbl_cn = ttk.Label(self.adv, text="")
-        lbl_cn.grid(row=11, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_cn, "adv_collision_names_label"))
-        cn_frame = ttk.Frame(self.adv)
-        cn_frame.grid(row=11, column=1, sticky="ew", **pad)
-        ttk.Entry(cn_frame, textvariable=self.collnames_var).pack(
-            side="left", fill="x", expand=True)
-        self.browse_rb_btn = ttk.Button(cn_frame, command=self._show_rigidbody_picker)
-        self.browse_rb_btn.pack(side="left", padx=(6, 0))
-        self._i18n_widgets.append((self.browse_rb_btn, "adv_show_rigidbodies_btn"))
-
-        self.lbl_cn_hint = ttk.Label(self.adv, text="", foreground="#666666",
-                                     wraplength=380, justify="left")
-        self.lbl_cn_hint.grid(row=12, column=1, sticky="w", **pad)
-        self._i18n_widgets.append((self.lbl_cn_hint, "adv_collision_names_hint"))
-
-        vrm_frame = ttk.Frame(self.adv)
-        vrm_frame.grid(row=13, column=1, sticky="w", **pad)
-        self.vrm_compat_btn = ttk.Button(vrm_frame, command=self._apply_vrm_compat_mode)
-        self.vrm_compat_btn.pack(side="left")
-        self._i18n_widgets.append((self.vrm_compat_btn, "adv_vrm_compat_btn"))
-        self.lbl_vrm_hint = ttk.Label(self.adv, text="", foreground="#666666",
-                                      wraplength=380, justify="left")
-        self.lbl_vrm_hint.grid(row=14, column=1, sticky="w", **pad)
-        self._i18n_widgets.append((self.lbl_vrm_hint, "adv_vrm_compat_hint"))
+def cquat(q):
+    return (-q[0], -q[1], q[2], q[3])
 
 
-        run = ttk.Frame(frm)
-        run.pack(fill="x", **pad)
-        self.run_btn = ttk.Button(run, command=self._run)
-        self.run_btn.pack(side="left")
-        self._i18n_widgets.append((self.run_btn, "run_button"))
-        self.prog = ttk.Progressbar(run, mode="indeterminate")
-        self.prog.pack(side="left", fill="x", expand=True, padx=8)
+# ---------------------------------------------------------------- textures
+def resolve_path(base_dir, rel):
+    """Resolve a texture path case-insensitively (models authored on Windows)."""
+    rel = rel.replace("\\", "/").strip()
+    if not rel:
+        return None
+    p = os.path.normpath(os.path.join(base_dir, rel))
+    if os.path.isfile(p):
+        return p
+    # case-insensitive walk
+    cur = base_dir
+    for part in os.path.normpath(rel).split(os.sep):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = os.path.dirname(cur)
+            continue
+        try:
+            entries = os.listdir(cur)
+        except OSError:
+            return None
+        match = next((e for e in entries if e.lower() == part.lower()), None)
+        if match is None:
+            return None
+        cur = os.path.join(cur, match)
+    return cur if os.path.isfile(cur) else None
 
-        self.logf = ttk.LabelFrame(frm, text="")
-        self.logf.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(self.logf, height=8, state="disabled", wrap="word")
-        self.log.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(self.logf, command=self.log.yview)
-        sb.pack(side="right", fill="y")
-        self.log.configure(yscrollcommand=sb.set)
 
-    def _toggle_adv(self):
-        if self.adv_shown.get():
-            self.adv_btn.configure(text=self.t("adv_toggle_open"))
-            self.adv.pack(fill="x", padx=8, pady=4, before=self.run_btn.master)
+def _alpha_class(img):
+    """Classify a PIL image's alpha usage: 'opaque' | 'mask' | 'blend'.
+
+    'mask'  = alpha is (almost) binary -> use alphaMode MASK (cutout).
+              Typical for skin/face textures whose unused UV space is
+              transparent; treating those as BLEND breaks depth sorting
+              (faces look inside-out / see-through in many viewers).
+    'blend' = significant fraction of semi-transparent texels
+              (e.g. hair tips) -> real alpha blending.
+    """
+    if "A" not in img.getbands():
+        # Palette ('P') images can carry transparency via a side-channel
+        # (a 'transparency' tag / tRNS chunk) that does not show up as an
+        # 'A' band in getbands(). Treating these as opaque silently drops
+        # real transparency (e.g. cutout hair/eyelash textures authored as
+        # indexed PNGs). Detect that case by converting to RGBA first.
+        if img.mode == "P" and "transparency" in img.info:
+            img = img.convert("RGBA")
         else:
-            self.adv_btn.configure(text=self.t("adv_toggle_closed"))
-            self.adv.pack_forget()
+            return "opaque"
+    hist = img.getchannel("A").histogram()
+    total = sum(hist) or 1
+    below = sum(hist[:250]) / total
+    if below == 0.0:
+        return "opaque"
+    # Only texels that are *really* see-through (alpha < 0.5) argue for
+    # true blending.  Hair/skin textures are mostly high-alpha cutouts;
+    # rendering them as BLEND disables depth writes in most viewers and
+    # makes them look nearly transparent / wrongly sorted.
+    semi_low = sum(hist[5:128]) / total
+    return "blend" if semi_low > 0.25 else "mask"
 
-    # ---------- ファイル選択 / file pickers ----------
-    def _pick_pmx(self):
-        p = filedialog.askopenfilename(
-            title=self.t("label_pmx"),
-            filetypes=[("PMX", "*.pmx"), ("*", "*.*")])
-        if p:
-            self.pmx_var.set(p)
-            if not self._out_edited or not self.out_var.get():
-                self.out_var.set(os.path.splitext(p)[0] + ".glb")
 
-    def _apply_vrm_compat_mode(self):
-        pmx_path = self.pmx_var.get().strip()
-        if not pmx_path or not os.path.isfile(pmx_path):
-            messagebox.showinfo(self.t("adv_vrm_compat_btn"),
-                                self.t("rigidbody_picker_no_pmx"))
-            return
+def load_texture(path):
+    """Return (png_or_jpg_bytes, mime, alpha_class) or None."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".jpg", ".jpeg") or (ext == ".png" and not HAS_PIL):
+        with open(path, "rb") as f:
+            data = f.read()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        return data, mime, "opaque"
+    if ext == ".png" and HAS_PIL:
+        # re-encode to strip ICC/gamma chunks the glTF validator flags
         try:
-            self.config(cursor="watch")
-            self.update_idletasks()
-            model = pmx_module.parse_pmx(pmx_path)
-            rigids = model.get("rigid_bodies", [])
+            img = Image.open(path)
+            aclass = _alpha_class(img)
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB" if aclass == "opaque" else "RGBA")
+            buf = io.BytesIO()
+            img.save(buf, "PNG", icc_profile=None)
+            return buf.getvalue(), "image/png", aclass
         except Exception as e:
-            messagebox.showerror(self.t("err_title"), str(e))
-            return
-        finally:
-            self.config(cursor="")
-
-        # VRM SpringBone/VRChat PhysBonesと同じ考え方：スカート/揺れ物は
-        # 「脚まわりのコライダーだけ」を見れば十分、というヒューリスティック。
-        # 足/ひざ/太もも系の名前を持つ静的剛体を拾い、下半身(胴体側)は除外する。
-        leg_names = [r["name"] for r in rigids
-                    if r.get("mode") == 0
-                    and any(k in r["name"] for k in ("足", "ひざ", "太もも"))
-                    and "下半身" not in r["name"]]
-        if not leg_names:
-            messagebox.showwarning(self.t("adv_vrm_compat_btn"),
-                                   self.t("vrm_compat_no_match"))
-            return
-        self.collmode_var.set("allow")
-        self.collnames_var.set(",".join(leg_names))
-        messagebox.showinfo(self.t("adv_vrm_compat_btn"),
-                            self.t("vrm_compat_applied") % len(leg_names))
-
-    def _show_rigidbody_picker(self):
-        pmx_path = self.pmx_var.get().strip()
-        if not pmx_path or not os.path.isfile(pmx_path):
-            messagebox.showinfo(self.t("adv_show_rigidbodies_btn"),
-                                self.t("rigidbody_picker_no_pmx"))
-            return
-        try:
-            self.config(cursor="watch")
-            self.update_idletasks()
-            model = pmx_module.parse_pmx(pmx_path)
-            rigids = model.get("rigid_bodies", [])
-        except Exception as e:
-            messagebox.showerror(self.t("err_title"), str(e))
-            return
-        finally:
-            self.config(cursor="")
-
-        win = tk.Toplevel(self)
-        win.title(self.t("rigidbody_picker_title"))
-        win.geometry("380x440")
-        win.transient(self)
-
-        lb = tk.Listbox(win, selectmode="extended", exportselection=False)
-        lb.pack(fill="both", expand=True, padx=8, pady=8)
-
-        # リストの各行に対応する実剛体名(見出し行はNone、ダブルクリック対象外)
-        entries = []
-        static_names = [r["name"] for r in rigids if r.get("mode") == 0]
-        dynamic_names = [r["name"] for r in rigids if r.get("mode") in (1, 2)]
-
-        def add_section(title, names):
-            lb.insert("end", title)
-            entries.append(None)
-            for nm in names:
-                lb.insert("end", "    " + nm)
-                entries.append(nm)
-
-        add_section(self.t("rigidbody_picker_static"), static_names)
-        lb.insert("end", "")
-        entries.append(None)
-        add_section(self.t("rigidbody_picker_dynamic"), dynamic_names)
-
-        def on_double_click(event):
-            for idx in lb.curselection():
-                nm = entries[idx]
-                if nm is None:
-                    continue
-                cur = self.collnames_var.get().strip()
-                parts = [s.strip() for s in cur.split(",") if s.strip()]
-                if nm not in parts:
-                    parts.append(nm)
-                self.collnames_var.set(",".join(parts))
-
-        lb.bind("<Double-Button-1>", on_double_click)
-        ttk.Button(win, text=self.t("rigidbody_picker_close"),
-                  command=win.destroy).pack(pady=(0, 8))
-
-    def _pick_vmd(self):
-        p = filedialog.askopenfilename(
-            title=self.t("label_vmd"),
-            filetypes=[("VMD", "*.vmd"), ("*", "*.*")])
-        if p:
-            self.vmd_var.set(p)
-
-    def _pick_out(self):
-        p = filedialog.asksaveasfilename(
-            title=self.t("label_out"), defaultextension=".glb",
-            filetypes=[("glTF binary", "*.glb")])
-        if p:
-            self.out_var.set(p)
-            self._out_edited = True
-
-    # ---------- ドラッグ&ドロップ / drag & drop ----------
-    def _on_drop_pmx(self, event):
-        paths = _parse_dropped_paths(event.data)
-        if not paths:
-            return
-        p = paths[0]
-        if os.path.splitext(p)[1].lower() != ".pmx":
-            messagebox.showwarning(self.t("err_title"), self.t("err_drop_pmx") + p)
-            return
-        self.pmx_var.set(p)
-        if not self._out_edited or not self.out_var.get():
-            self.out_var.set(os.path.splitext(p)[0] + ".glb")
-
-    def _on_drop_vmd(self, event):
-        paths = _parse_dropped_paths(event.data)
-        if not paths:
-            return
-        p = paths[0]
-        if os.path.splitext(p)[1].lower() != ".vmd":
-            messagebox.showwarning(self.t("err_title"), self.t("err_drop_vmd") + p)
-            return
-        self.vmd_var.set(p)
-
-    # ---------- 実行 / run ----------
-    def _run(self):
-        pmx = self.pmx_var.get().strip()
-        if not pmx:
-            messagebox.showwarning(self.t("err_title"), self.t("err_select_pmx"))
-            return
-        if not os.path.isfile(pmx):
-            messagebox.showerror(self.t("err_title"), self.t("err_pmx_not_found") + pmx)
-            return
-        vmd = self.vmd_var.get().strip() or None
-        if vmd and not os.path.isfile(vmd):
-            messagebox.showerror(self.t("err_title"), self.t("err_vmd_not_found") + vmd)
-            return
-        out = self.out_var.get().strip() or os.path.splitext(pmx)[0] + ".glb"
-        disable_ik = [s.strip() for s in self.disik_var.get().split(",") if s.strip()] or None
-        try:
-            step = max(1, int(self.step_var.get()))
-        except Exception:
-            step = 1
-        try:
-            scale = float(self.scale_var.get())
-        except Exception:
-            messagebox.showwarning(self.t("err_title"), self.t("err_scale_invalid"))
-            return
-        try:
-            margin = float(self.margin_var.get())
-        except Exception:
-            margin = 0.01
-        try:
-            hem_margin = float(self.hemmargin_var.get())
-        except Exception:
-            hem_margin = 0.0
-        _coll_names = [s.strip() for s in self.collnames_var.get().split(",") if s.strip()] or None
-        force_no_collision = _coll_names if self.collmode_var.get() == "normal" else None
-        allowed_collider = _coll_names if self.collmode_var.get() == "allow" else None
-        kwargs = dict(
-            vmd_path=vmd,
-            unlit=self.unlit_var.get(),
-            solve_ik=not self.noik_var.get(),
-            step=step,
-            extras=not self.noextras_var.get(),
-            anim_name=self.anim_var.get().strip() or None,
-            disable_ik=disable_ik,
-            use_vmd_ik_frames=not self.igvmdik_var.get(),
-            morph_mode=self.morph_var.get(),
-            alpha_mode=self.alpha_var.get(),
-            force_double_sided=self.dside_var.get(),
-            custom_attrs=not self.nocustom_var.get(),
-            scale=scale,
-            bake_physics=self.bakehair_var.get(),
-            bake_target=self.baketarget_var.get(),
-            collision_margin=margin,
-            force_no_collision_names=force_no_collision,
-            allowed_collider_names=allowed_collider,
-            hem_extra_margin=hem_margin,
-        )
-        self.run_btn.configure(state="disabled")
-        self.prog.start(12)
-        self._log(self.t("log_converting") % os.path.basename(pmx))
-        self.worker = threading.Thread(
-            target=self._convert_thread, args=(pmx, out, kwargs), daemon=True)
-        self.worker.start()
-
-    def _convert_thread(self, pmx, out, kwargs):
-        w = QueueWriter(self.q)
-        try:
-            with contextlib.redirect_stdout(w), contextlib.redirect_stderr(w):
-                convert(pmx, out, **kwargs)
-            self.q.put(("done", out))
-        except Exception:
-            self.q.put(("error", traceback.format_exc()))
-
-    def _poll(self):
-        try:
-            while True:
-                kind, payload = self.q.get_nowait()
-                if kind == "log":
-                    self._log(payload)
-                elif kind == "done":
-                    self._finish()
-                    size = os.path.getsize(payload) / (1024.0 * 1024.0)
-                    self._log(self.t("log_done") % (payload, size))
-                    messagebox.showinfo(self.t("info_done_title"), self.t("info_done_msg") + payload)
-                elif kind == "error":
-                    self._finish()
-                    self._log(payload)
-                    last = payload.strip().splitlines()[-1]
-                    messagebox.showerror(self.t("error_title"), self.t("error_msg") + last)
-        except queue.Empty:
-            pass
-        self.after(100, self._poll)
-
-    def _finish(self):
-        self.prog.stop()
-        self.run_btn.configure(state="normal")
-
-    def _log(self, s):
-        self.log.configure(state="normal")
-        self.log.insert("end", s)
-        self.log.see("end")
-        self.log.configure(state="disabled")
+            log("WARNING: failed to load texture %s (%s)" % (path, e))
+            return None
+    if not HAS_PIL:
+        log("WARNING: Pillow not installed; cannot convert", path)
+        return None
+    try:
+        img = Image.open(path)
+        aclass = _alpha_class(img)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB" if aclass == "opaque" else "RGBA")
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue(), "image/png", aclass
+    except Exception as e:
+        log("WARNING: failed to load texture %s (%s)" % (path, e))
+        return None
 
 
-if __name__ == "__main__":
-    App().mainloop()
+# ---------------------------------------------------------------- morphs
+def collect_target_morphs(model, scale=1.0):
+    """Decide which PMX morphs become glTF morph targets.
+
+    vertex morphs -> POSITION deltas
+    UV morphs     -> TEXCOORD_0 deltas
+    group morphs  -> flattened, if every child is a vertex/UV morph
+    Returns list of (morph_index, {'pos': {vidx: [dx,dy,dz]}, 'uv': {vidx: [du,dv]}}).
+
+    `scale` is the global unit scale (see convert()); it is applied to the
+    position deltas (a morph offset is a displacement in the same units as
+    the vertex positions) but not to UV deltas.
+    """
+    morphs = model["morphs"]
+    out = []
+
+    def vertex_dict(mo, weight=1.0, acc=None):
+        acc = acc if acc is not None else {"pos": {}, "uv": {}}
+        t = mo["type"]
+        if t == 1:
+            for off in mo["offsets"]:
+                d = acc["pos"].setdefault(off["vertex"], [0.0, 0.0, 0.0])
+                for c in range(3):
+                    d[c] += off["offset"][c] * weight * scale
+        elif t == 3:
+            for off in mo["offsets"]:
+                d = acc["uv"].setdefault(off["vertex"], [0.0, 0.0])
+                d[0] += off["offset"][0] * weight
+                d[1] += off["offset"][1] * weight
+        return acc
+
+    for i, mo in enumerate(morphs):
+        t = mo["type"]
+        if t in (1, 3):
+            out.append((i, vertex_dict(mo)))
+        elif t == 0:
+            children = [(o["morph"], o["weight"]) for o in mo["offsets"]]
+            if all(0 <= ci < len(morphs) and morphs[ci]["type"] in (1, 3)
+                   for ci, _ in children):
+                acc = {"pos": {}, "uv": {}}
+                for ci, w in children:
+                    vertex_dict(morphs[ci], w, acc)
+                out.append((i, acc))
+    return out
+
+
+# ---------------------------------------------------------------- main
+def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
+            step=1, extras=True, anim_name=None, disable_ik=None,
+            use_vmd_ik_frames=True, morph_mode="sparse",
+            alpha_mode="auto", force_double_sided=False,
+            custom_attrs=True, scale=0.08,
+            bake_physics=False, bake_target="hair",
+            hair_drag=0.85, hair_stiffness=1.5, hair_gravity=0.02,
+            collision_margin=0.01,
+            force_no_collision_names=None, allowed_collider_names=None,
+            hem_extra_margin=0.0,
+            adaptive_substep_threshold=None, adaptive_substep_max_n=4,
+            adaptive_substep_collider_names=None,
+            midpoint_correction=False, midpoint_correction_iters=2,
+            midpoint_correction_margin=0.0,
+            midpoint_correction_collider_names=None,
+            midpoint_correction_samples=1):
+    """`scale` converts MMD units to glTF units (meters). PMX models are
+    conventionally authored at roughly 1 MMD unit = 8cm (a ~160cm-tall
+    character is about 20 units tall), but glTF assumes 1 unit = 1 meter, so
+    without conversion a model renders ~12.5x too large in viewers that
+    treat glTF units as meters. Default is 0.08; pass scale=1.0 to disable
+    scaling if the source used a different convention. Applies to
+    vertex/bone positions, SDEF params, morph position deltas, and baked
+    animation translations. Normals, UVs, and rotations are unaffected.
+    Data preserved verbatim under extras.mmd (rigid bodies, joints, etc.)
+    stays in the original unscaled MMD units; the scale factor used is
+    recorded there for reference.
+    """
+    model = parse_pmx(pmx_path)
+    base_dir = os.path.dirname(os.path.abspath(pmx_path))
+    log("PMX %.1f  '%s'  %d verts / %d tris / %d mats / %d bones / %d morphs"
+        % (model["version"], model["name"], len(model["vertices"]),
+           len(model["indices"]) // 3, len(model["materials"]),
+           len(model["bones"]), len(model["morphs"])))
+
+    _warn_missing_pillow(model)
+
+    g = G.GltfBuilder()
+    verts = model["vertices"]
+    nv = len(verts)
+    nb = len(model["bones"])
+    if nb > 65535:
+        raise ValueError("more than 65535 bones is not supported")
+
+    # ---------------- vertex attributes ---------------------------------
+    pos, nrm, uv = [], [], []
+    joints, weights = [], []
+    edge = []
+    add_uv_n = model["add_uv_count"]
+    add_uvs = [[] for _ in range(add_uv_n)]
+    has_sdef = any(v["sdef"] for v in verts)
+    sdef_c, sdef_r0, sdef_r1, wtype = [], [], [], []
+
+    for v in verts:
+        p = v["pos"]
+        n = v["normal"]
+        pos += [p[0] * scale, p[1] * scale, -p[2] * scale]
+        nx, ny, nz = n[0], n[1], -n[2]
+        nl = (nx * nx + ny * ny + nz * nz) ** 0.5
+        if nl > 1e-6:
+            nrm += [nx / nl, ny / nl, nz / nl]
+        else:
+            # MMDの一部頂点は法線が (0,0,0)（非表示・物理専用など）。
+            # glTFは単位法線を要求するため、任意の単位ベクトルで補う。
+            nrm += [0.0, 0.0, 1.0]
+        uv += [v["uv"][0], v["uv"][1]]
+        edge.append(v["edge"])
+        for k in range(add_uv_n):
+            add_uvs[k] += v["add_uv"][k]
+        # skinning (SDEF/QDEF approximated as linear blend)
+        # Merge duplicate bone indices before writing. MMD models often
+        # author SDEF (and occasionally BDEF2) vertices with bone0 == bone1
+        # -- common around ankles/elbows -- which would emit JOINTS_0 like
+        # [9, 9, 0, 0]. The glTF validator rejects that
+        # (ACCESSOR_JOINTS_INDEX_DUPLICATE). Summing the duplicate's weights
+        # collapses it to one influence, then we normalize to 1.0.
+        acc = {}
+        for b, w in zip(v["bones"], v["weights"]):
+            if w <= 0.0:
+                continue
+            b = b if 0 <= b < nb else 0
+            acc[b] = acc.get(b, 0.0) + w
+        if acc:
+            top = sorted(acc.items(), key=lambda kv: -kv[1])[:4]
+            bs = [b for b, _ in top]
+            ws = [w for _, w in top]
+            s = sum(ws)
+            ws = [w / s for w in ws]
+        else:
+            bs, ws = [0], [1.0]
+        while len(bs) < 4:
+            bs.append(0)
+            ws.append(0.0)
+        joints += bs
+        weights += ws
+        if has_sdef:
+            wtype.append(v["weight_type"])
+            sd = v["sdef"]
+            if sd:
+                sdef_c += cpos(sd["c"], scale)
+                sdef_r0 += cpos(sd["r0"], scale)
+                sdef_r1 += cpos(sd["r1"], scale)
+            else:
+                sdef_c += [0.0, 0.0, 0.0]
+                sdef_r0 += [0.0, 0.0, 0.0]
+                sdef_r1 += [0.0, 0.0, 0.0]
+
+    AB = G.ARRAY_BUFFER
+    attrs = {
+        "POSITION": g.add_accessor(pos, G.FLOAT, "VEC3", AB, minmax=True),
+        "NORMAL": g.add_accessor(nrm, G.FLOAT, "VEC3", AB),
+        "TEXCOORD_0": g.add_accessor(uv, G.FLOAT, "VEC2", AB),
+        "JOINTS_0": g.add_accessor(joints, G.USHORT, "VEC4", AB),
+        "WEIGHTS_0": g.add_accessor(weights, G.FLOAT, "VEC4", AB),
+    }
+    if custom_attrs:
+        if any(e != 0.0 for e in edge):
+            attrs["_EDGESCALE"] = g.add_accessor(edge, G.FLOAT, "SCALAR", AB)
+        for k in range(add_uv_n):
+            attrs["_ADDUV%d" % (k + 1)] = g.add_accessor(
+                add_uvs[k], G.FLOAT, "VEC4", AB)
+        if has_sdef:
+            attrs["_SDEF_C"] = g.add_accessor(sdef_c, G.FLOAT, "VEC3", AB)
+            attrs["_SDEF_R0"] = g.add_accessor(sdef_r0, G.FLOAT, "VEC3", AB)
+            attrs["_SDEF_R1"] = g.add_accessor(sdef_r1, G.FLOAT, "VEC3", AB)
+            # float, not ubyte: vertex attributes must be 4-byte aligned
+            attrs["_WEIGHTTYPE"] = g.add_accessor([float(w) for w in wtype],
+                                                  G.FLOAT, "SCALAR", AB)
+
+    # ---------------- morph targets --------------------------------------
+    # morph_mode:
+    #   "sparse" - sparse accessors with a shared zero-filled base bufferView
+    #              (small files; needs a loader with proper sparse support)
+    #   "dense"  - plain full-size accessors (maximum compatibility)
+    #   "none"   - no glTF morph targets (data still kept in extras)
+    target_morphs = (collect_target_morphs(model, scale)
+                     if morph_mode != "none" else [])
+    morph_to_target = {mi: ti for ti, (mi, _) in enumerate(target_morphs)}
+    targets = []
+    target_names = []
+    zero_bv3 = zero_bv2 = None
+    if target_morphs and morph_mode == "sparse":
+        # shared zero-filled bases; byteStride + target required by the
+        # validator when several vertex-attribute accessors share one view
+        zero_bv3 = g.add_bv(bytes(nv * 12), target=AB, byte_stride=12)
+        if any(d["uv"] for _, d in target_morphs):
+            zero_bv2 = g.add_bv(bytes(nv * 8), target=AB, byte_stride=8)
+    for mi, deltas in target_morphs:
+        tgt = {}
+        pos_d = deltas["pos"]
+        if morph_mode == "dense":
+            flat = [0.0] * (nv * 3)
+            for vi, d in pos_d.items():
+                flat[vi * 3] = d[0]
+                flat[vi * 3 + 1] = d[1]
+                flat[vi * 3 + 2] = -d[2]
+            tgt["POSITION"] = g.add_accessor(flat, G.FLOAT, "VEC3",
+                                             minmax=True)
+            if deltas["uv"]:
+                flat = [0.0] * (nv * 2)
+                for vi, d in deltas["uv"].items():
+                    flat[vi * 2] = d[0]
+                    flat[vi * 2 + 1] = d[1]
+                tgt["TEXCOORD_0"] = g.add_accessor(flat, G.FLOAT, "VEC2")
+        else:
+            if pos_d:
+                idxs = sorted(pos_d)
+                flat = []
+                for vi in idxs:
+                    d = pos_d[vi]
+                    flat += [d[0], d[1], -d[2]]
+                tgt["POSITION"] = g.add_sparse(nv, idxs, flat, "VEC3",
+                                               base_bv=zero_bv3)
+            else:
+                tgt["POSITION"] = g.add_sparse(nv, [0], [0.0, 0.0, 0.0],
+                                               "VEC3", base_bv=zero_bv3)
+            uv_d = deltas["uv"]
+            if uv_d:
+                idxs = sorted(uv_d)
+                flat = []
+                for vi in idxs:
+                    flat += uv_d[vi]
+                tgt["TEXCOORD_0"] = g.add_sparse(nv, idxs, flat, "VEC2",
+                                                 base_bv=zero_bv2)
+        targets.append(tgt)
+        target_names.append(model["morphs"][mi]["name"])
+
+    # ---------------- textures -------------------------------------------
+    tex_map = {}   # pmx texture index -> gltf texture index
+    tex_alpha = {}
+    if model["textures"]:
+        g.j["samplers"] = [{"magFilter": 9729, "minFilter": 9987,
+                            "wrapS": 10497, "wrapT": 10497}]
+        g.j["textures"] = []
+    for ti, rel in enumerate(model["textures"]):
+        p = resolve_path(base_dir, rel)
+        if p is None:
+            log("WARNING: texture not found:", rel)
+            continue
+        res = load_texture(p)
+        if res is None:
+            continue
+        data, mime, aclass = res
+        img = g.add_image(data, mime, name=os.path.basename(rel))
+        g.j["textures"].append({"sampler": 0, "source": img,
+                                "name": os.path.basename(rel)})
+        tex_map[ti] = len(g.j["textures"]) - 1
+        tex_alpha[ti] = aclass
+
+    # ---------------- materials -------------------------------------------
+    g.j["materials"] = []
+    for m in model["materials"]:
+        mat = {
+            "name": m["name"] or m["name_en"],
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [max(0.0, min(1.0, c)) for c in m["diffuse"]],
+                "metallicFactor": 0.0,
+                "roughnessFactor": 1.0,
+            },
+            "doubleSided": force_double_sided or bool(m["flags"] & 0x01),
+        }
+        ti = m["texture"]
+        aclass = "opaque"
+        if ti in tex_map:
+            mat["pbrMetallicRoughness"]["baseColorTexture"] = {
+                "index": tex_map[ti]}
+            aclass = tex_alpha.get(ti, "opaque")
+        if alpha_mode != "auto":
+            mode = alpha_mode.upper()
+        elif m["diffuse"][3] < 1.0 or aclass == "blend":
+            mode = "BLEND"
+        elif aclass == "mask":
+            mode = "MASK"
+        else:
+            mode = "OPAQUE"
+        mat["alphaMode"] = mode
+        if mode == "MASK":
+            mat["alphaCutoff"] = 0.5
+        if unlit:
+            mat["extensions"] = {"KHR_materials_unlit": {}}
+        if extras:
+            mat["extras"] = {"mmd": {
+                "nameEn": m["name_en"],
+                "ambient": m["ambient"],
+                "specular": m["specular"],
+                "specularPower": m["specular_power"],
+                "flags": m["flags"],
+                "edgeColor": m["edge_color"],
+                "edgeSize": m["edge_size"],
+                "sphereMode": m["sphere_mode"],
+                "sphereTexture": tex_map.get(m["sphere_texture"], -1),
+                "toonTexture": tex_map.get(m["toon_texture"], -1),
+                "toonShared": m["toon_shared"],
+                "memo": m["memo"],
+            }}
+        g.j["materials"].append(mat)
+    if unlit:
+        g.j["extensionsUsed"] = ["KHR_materials_unlit"]
+
+    # ---------------- mesh primitives --------------------------------------
+    idx = model["indices"]
+    prims = []
+    offset = 0
+    for mi, m in enumerate(model["materials"]):
+        cnt = m["index_count"]
+        chunk = idx[offset:offset + cnt]
+        offset += cnt
+        if not chunk:
+            continue
+        flipped = []
+        for t in range(0, len(chunk) - 2, 3):
+            flipped += [chunk[t], chunk[t + 2], chunk[t + 1]]
+        acc = g.add_accessor(flipped, G.UINT, "SCALAR",
+                             G.ELEMENT_ARRAY_BUFFER)
+        prim = {"attributes": attrs, "indices": acc, "material": mi,
+                "mode": 4}
+        if targets:
+            prim["targets"] = targets
+        prims.append(prim)
+
+    mesh = {"name": model["name"] or "mesh", "primitives": prims}
+    if targets:
+        mesh["weights"] = [0.0] * len(targets)
+        mesh["extras"] = {"targetNames": target_names}
+    g.j["meshes"] = [mesh]
+
+    # ---------------- nodes / skeleton -------------------------------------
+    bones = model["bones"]
+    nodes = []
+    world = []
+    for i, b in enumerate(bones):
+        p = b["parent"]
+        wp = tuple(b["pos"])
+        world.append(wp)
+        if 0 <= p < nb:
+            lt = (wp[0] - bones[p]["pos"][0], wp[1] - bones[p]["pos"][1],
+                  wp[2] - bones[p]["pos"][2])
+        else:
+            lt = wp
+        node = {"name": b["name"] or ("bone_%d" % i),
+                "translation": list(cpos(lt, scale))}
+        if extras:
+            ex = {"nameEn": b["name_en"], "flags": b["flags"],
+                  "layer": b["layer"]}
+            for key in ("tail_bone", "tail_offset", "inherit_parent",
+                        "inherit_ratio", "fixed_axis", "local_x", "local_z",
+                        "external_key", "ik"):
+                if key in b:
+                    ex[key] = b[key]
+            node["extras"] = {"mmd": ex}
+        nodes.append(node)
+    root_bones = []
+    for i, b in enumerate(bones):
+        p = b["parent"]
+        if 0 <= p < nb:
+            nodes[p].setdefault("children", []).append(i)
+        else:
+            root_bones.append(i)
+
+    ibm = []
+    for wp in world:
+        w = cpos(wp, scale)
+        ibm += [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -w[0], -w[1], -w[2], 1]
+    ibm_acc = g.add_accessor(ibm, G.FLOAT, "MAT4")
+
+    # skinned mesh node must be a scene root (its transform is ignored)
+    mesh_node = len(nodes)
+    nodes.append({"name": model["name"] or "model", "mesh": 0, "skin": 0})
+    root = len(nodes)
+    nodes.append({"name": (model["name"] or "root") + "_skeleton",
+                  "children": root_bones})
+    g.j["nodes"] = nodes
+    g.j["skins"] = [{"joints": list(range(nb)),
+                     "inverseBindMatrices": ibm_acc,
+                     "skeleton": root}]
+    g.j["scenes"] = [{"nodes": [root, mesh_node]}]
+    g.j["scene"] = 0
+
+    # ---------------- MMD extras --------------------------------------------
+    if extras:
+        morph_extras = []
+        for i, mo in enumerate(model["morphs"]):
+            me = {"name": mo["name"], "nameEn": mo["name_en"],
+                  "panel": mo["panel"], "type": mo["type"],
+                  "target": morph_to_target.get(i)}
+            if mo["type"] not in (1, 3):
+                me["offsets"] = mo["offsets"]
+            morph_extras.append(me)
+        g.j["extras"] = {"mmd": {
+            "coordinateNote": "values under extras.mmd are raw PMX values in "
+                              "MMD left-handed space (x,y,z), unscaled "
+                              "(see unitScale); glTF space is (x,y,-z), "
+                              "quat (-x,-y,z,w)",
+            "unitScale": scale,
+            "format": "pmx",
+            "version": model["version"],
+            "name": model["name"], "nameEn": model["name_en"],
+            "comment": model["comment"], "commentEn": model["comment_en"],
+            "morphs": morph_extras,
+            "displayFrames": model["display_frames"],
+            "rigidBodies": model["rigid_bodies"],
+            "joints": model["joints"],
+        }}
+
+        # 変換済み物理ビュー（後工程向け・ボーンローカル）を併載。
+        # raw の rigidBodies/joints は保持したまま physicsGltf を追加する。
+        _phys = g.j["extras"]["mmd"]
+        if _phys.get("rigidBodies"):
+            _bwm = physics.compute_bone_world_matrices(g.j)
+            _phys["physicsGltf"] = physics.build_physics_gltf(_phys, _bwm)
+
+    # ---------------- animation ---------------------------------------------
+    if vmd_path:
+        vmd = parse_vmd(vmd_path)
+        log("VMD '%s'  %d bone tracks / %d morph tracks / last frame %d"
+            % (vmd["model_name"], len(vmd["bones"]), len(vmd["morphs"]),
+               vmd["max_frame"]))
+        anim = {"name": anim_name or os.path.splitext(
+            os.path.basename(vmd_path))[0], "samplers": [], "channels": []}
+
+        if vmd["bones"]:
+            def prog(i, n):
+                log("  baking frame %d/%d" % (i, n))
+            if disable_ik:
+                log("  IK disabled for bones matching:", disable_ik)
+            if vmd.get("ik_frames"):
+                log("  VMD contains %d IK on/off key frame(s)%s"
+                    % (len(vmd["ik_frames"]),
+                       "" if use_vmd_ik_frames else " (ignored)"))
+            times, baked, unmatched = bake(
+                model, vmd, solve_ik=solve_ik, step=step, progress=prog,
+                disable_ik=disable_ik, use_vmd_ik_frames=use_vmd_ik_frames)
+            if unmatched:
+                log("  %d VMD bone tracks had no matching PMX bone"
+                    % len(unmatched))
+            t_acc = g.add_accessor(times, G.FLOAT, "SCALAR", minmax=True)
+
+            # --- 剛体物理ベイク（PBD/クロス）: 剛体の回転を物理シミュで生成 ---
+            # bake_target: "hair"=髪のみ / "all"=全dynamic剛体
+            #   （スカート等のリング構造もクロスシミュで扱う）
+            hair_keys = {}
+            hair_tkeys = {}
+            if bake_physics:
+                _phys = g.j.get("extras", {}).get("mmd", {}).get("physicsGltf")
+                if _phys is None:
+                    _mmdx = {"unitScale": scale,
+                             "rigidBodies": model["rigid_bodies"],
+                             "joints": model["joints"]}
+                    _phys = physics.build_physics_gltf(
+                        _mmdx, physics.compute_bone_world_matrices(g.j))
+                if _phys.get("rigidBodies"):
+                    _only = ["髪"] if bake_target == "hair" else None
+                    hair_keys, hair_tkeys, _n_excl = bake_hair_into_gltf(
+                        g.j, baked, len(times), _phys, scale,
+                        drag_force=hair_drag, stiffness_force=hair_stiffness,
+                        gravity_power=hair_gravity, fps=FPS, only_names=_only,
+                        collision_margin=collision_margin,
+                        force_no_collision_names=force_no_collision_names,
+                        allowed_collider_names=allowed_collider_names,
+                        hem_extra_margin=hem_extra_margin,
+                        adaptive_substep_threshold=adaptive_substep_threshold,
+                        adaptive_substep_max_n=adaptive_substep_max_n,
+                        adaptive_substep_collider_names=adaptive_substep_collider_names,
+                        midpoint_correction=midpoint_correction,
+                        midpoint_correction_iters=midpoint_correction_iters,
+                        midpoint_correction_margin=midpoint_correction_margin,
+                        midpoint_correction_collider_names=midpoint_correction_collider_names,
+                        midpoint_correction_samples=midpoint_correction_samples)
+                    log("  physics baked: %d bone(s) (%s)"
+                        % (len(hair_keys),
+                           "hair only" if bake_target == "hair" else "all"))
+                    if _n_excl:
+                        log("  skipped %d unreachable rigid bodies" % _n_excl)
+            hair_bones = set(hair_keys)
+            hair_tbones = set(hair_tkeys)
+            for bi, data in sorted(baked.items()):
+                if data["r"] and bi not in hair_bones:
+                    flat = []
+                    prev = None
+                    for q in data["r"]:
+                        q = cquat(q)
+                        if prev and (q[0] * prev[0] + q[1] * prev[1] +
+                                     q[2] * prev[2] + q[3] * prev[3]) < 0:
+                            q = (-q[0], -q[1], -q[2], -q[3])
+                        flat += q
+                        prev = q
+                    out = g.add_accessor(flat, G.FLOAT, "VEC4")
+                    anim["samplers"].append({"input": t_acc, "output": out,
+                                             "interpolation": "LINEAR"})
+                    anim["channels"].append({
+                        "sampler": len(anim["samplers"]) - 1,
+                        "target": {"node": bi, "path": "rotation"}})
+                if data["t"] and bi not in hair_tbones:
+                    flat = []
+                    for t in data["t"]:
+                        flat += cpos(t, scale)
+                    out = g.add_accessor(flat, G.FLOAT, "VEC3")
+                    anim["samplers"].append({"input": t_acc, "output": out,
+                                             "interpolation": "LINEAR"})
+                    anim["channels"].append({
+                        "sampler": len(anim["samplers"]) - 1,
+                        "target": {"node": bi, "path": "translation"}})
+            for bi, qs in sorted(hair_keys.items()):
+                flat = []
+                prev = None
+                for q in qs:                       # 既にglTF局所回転（cquat不要）
+                    if prev and (q[0] * prev[0] + q[1] * prev[1] +
+                                 q[2] * prev[2] + q[3] * prev[3]) < 0:
+                        q = (-q[0], -q[1], -q[2], -q[3])
+                    flat += list(q)
+                    prev = q
+                out = g.add_accessor(flat, G.FLOAT, "VEC4")
+                anim["samplers"].append({"input": t_acc, "output": out,
+                                         "interpolation": "LINEAR"})
+                anim["channels"].append({
+                    "sampler": len(anim["samplers"]) - 1,
+                    "target": {"node": bi, "path": "rotation"}})
+            # スカート等はクロス衝突を回転だけで表現できないため位置も焼く。
+            # hair_tkeys は glTF 局所translation（cpos不要）。
+            for bi, ts in sorted(hair_tkeys.items()):
+                flat = []
+                for t in ts:
+                    flat += [t[0], t[1], t[2]]
+                out = g.add_accessor(flat, G.FLOAT, "VEC3")
+                anim["samplers"].append({"input": t_acc, "output": out,
+                                         "interpolation": "LINEAR"})
+                anim["channels"].append({
+                    "sampler": len(anim["samplers"]) - 1,
+                    "target": {"node": bi, "path": "translation"}})
+            if hair_keys:
+                log("  physics rotation channels: %d" % len(hair_keys))
+            if hair_tkeys:
+                log("  physics translation channels: %d" % len(hair_tkeys))
+            log("  bone animation: %d channels, %d key frames"
+                % (len(anim["channels"]), len(times)))
+
+        # morph (weights) animation -- linear between keys
+        if vmd["morphs"] and targets:
+            tmap = {}   # target index -> key list
+            skipped = 0
+            for i, (mi, _) in enumerate(target_morphs):
+                name = model["morphs"][mi]["name"]
+                key = name.encode("shift-jis", errors="replace")[:15]
+                found = None
+                for vname, keys in vmd["morphs"].items():
+                    if vname.encode("shift-jis", errors="replace")[:15] == key:
+                        found = keys
+                        break
+                if found:
+                    tmap[i] = found
+            for vname in vmd["morphs"]:
+                if not any(model["morphs"][mi]["name"]
+                           .encode("shift-jis", errors="replace")[:15] ==
+                           vname.encode("shift-jis", errors="replace")[:15]
+                           for mi, _ in target_morphs):
+                    skipped += 1
+            if skipped:
+                log("  %d VMD morph tracks target non-vertex/UV morphs "
+                    "(kept in extras only)" % skipped)
+            if tmap:
+                frames = sorted({f for keys in tmap.values()
+                                 for f, _ in keys})
+                w_times = [f / FPS for f in frames]
+                flat = []
+                for f in frames:
+                    for ti in range(len(targets)):
+                        keys = tmap.get(ti)
+                        if not keys:
+                            flat.append(0.0)
+                            continue
+                        # linear evaluation
+                        if f <= keys[0][0]:
+                            flat.append(keys[0][1])
+                        elif f >= keys[-1][0]:
+                            flat.append(keys[-1][1])
+                        else:
+                            for k in range(len(keys) - 1):
+                                f0, w0 = keys[k]
+                                f1, w1 = keys[k + 1]
+                                if f0 <= f <= f1:
+                                    r = (f - f0) / (f1 - f0) if f1 > f0 else 0
+                                    flat.append(w0 + (w1 - w0) * r)
+                                    break
+                in_acc = g.add_accessor(w_times, G.FLOAT, "SCALAR",
+                                        minmax=True)
+                out_acc = g.add_accessor(flat, G.FLOAT, "SCALAR")
+                anim["samplers"].append({"input": in_acc, "output": out_acc,
+                                         "interpolation": "LINEAR"})
+                anim["channels"].append({
+                    "sampler": len(anim["samplers"]) - 1,
+                    "target": {"node": mesh_node, "path": "weights"}})
+                log("  morph animation: %d tracks, %d key frames"
+                    % (len(tmap), len(frames)))
+
+        if anim["channels"]:
+            g.j["animations"] = [anim]
+
+    g.write_glb(out_path)
+    log("wrote", out_path, "(%.1f MB)" % (os.path.getsize(out_path) / 1e6))
+    return out_path
