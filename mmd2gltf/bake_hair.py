@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-14h (hem_extra_margin now smoothly interpolates root->hem)"
+BAKE_HAIR_VERSION = "2026-07-18a (midpoint correction: hem_extra_margin now also applies to lateral-edge clearance, root 0 -> hem full)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -439,7 +439,13 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         drag_force=0.85, stiffness_force=1.5, gravity_power=0.02,
                         gravity_dir=(0.0, -1.0, 0.0), fps=30.0,
                         only_names=("髪",), force_no_collision_names=None,
-                        allowed_collider_names=None, hem_extra_margin=0.0):
+                        allowed_collider_names=None, hem_extra_margin=0.0,
+                        adaptive_substep_threshold=None, adaptive_substep_max_n=4,
+                        adaptive_substep_collider_names=None,
+                        midpoint_correction=False, midpoint_correction_iters=2,
+                        midpoint_correction_margin=0.0,
+                        midpoint_correction_collider_names=None,
+                        midpoint_correction_samples=1):
     """体アニメ baked を駆動源に、髪ボーンのローカル回転キーを生成する。
 
     gltf_json    : 組み上がった g.j（nodes 必須）
@@ -475,6 +481,60 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         相当まで戻る)ため、根元は完全に不変のまま裾へ向けて安全にクリアランスを
         稼ぐための逃げ道。裾の1パーティクルだけをON/OFFする段差ではなく、
         チェーンの深さに比例して連続的に変化するので不自然な継ぎ目が出ない。
+    adaptive_substep_threshold : 適応サブステップの発動閾値(コライダー半径に
+        対する比率)。フレーム間の「布アンカー変位＋近傍コライダー変位」の
+        合計(三角不等式による安全側の上限見積もり)が、最も近いコライダーの
+        半径のこの倍率を超えたフレームだけ、布ソルバ(スカート等)をNステップに
+        分割して呼ぶ(髪など布以外の物理は常にN=1で無改造)。デフォルトNoneは
+        機構自体が無効で、常にN=1(既存挙動とビット単位で完全に同じ)。実測の
+        目安は フェーズA計測(脚コライダーのみ) でぽんぷ/IAとも中央値0.36〜0.40、
+        p95が1.4〜1.8程度だったため、0.5〜0.75あたりが「明らかに怪しいフレーム
+        だけを拾う」現実的な初期値の候補(発動率2〜4割)。値を大きくするほど
+        発動フレームが減り安全側(=無効化に近づく)、小さくするほど発動が増え
+        安全だがベイクが遅くなる方向なので、どちらに振っても破綻はしない。
+    adaptive_substep_max_n : 適応サブステップの分割数の上限。デフォルト4。
+    adaptive_substep_collider_names : 適応サブステップの発動判定で見る
+        コライダー剛体名の集合(set/list)。指定すると、この名前に一致する
+        コライダーの移動だけを発動判定に使う(例: 脚だけに絞って腕の素早い
+        動きを無視する)。デフォルトNoneなら衝突判定に使われている全コライダー
+        を見る。衝突判定そのもの(resolve_collisions)には影響しない、発動
+        タイミングの計算だけに使う絞り込み。
+    midpoint_correction : 隣接するチェーン同士を結ぶ横リングエッジ(lateral、
+        同じ高さの輪)上のサンプル点(既定では中点1点、midpoint_correction_samples
+        で増やせる)がコライダーに食い込んでいたら、その両端の実ボーン位置を
+        少しだけ押し出して緩和する追加パス。デフォルトFalseで無効(既存挙動と
+        完全に同じ)。ボーン(関節点)自体は既に押し出し済みでも、ボーンと
+        ボーンの間のメッシュ面がコライダー体積を視覚的に横切ってしまう現象
+        (ボーンレベルの衝突判定では原理的に検知できない)を近似的に緩和する。
+        チェーン内の縦方向(腰→裾)のセグメントは対象にしない(縦方向を押すと
+        1本のズレが裾側全体に伝わり、傘のように広がってしまうため)。押し出し
+        方向はコライダー表面法線の3D方向。押し出し後は横エッジ長と縦方向の
+        セグメント長をrest_lenへ戻す「念押し」も行うので、チェーンが
+        伸び縮みすることはない。hem_extra_margin が指定されている場合は、
+        ボーン本体の衝突判定と同じ「根元0→裾で全量」の深さ比例で、横リング
+        エッジのクリアランスにも一貫して上乗せされる(エッジの深さは両端
+        パーティクルの hem_weight の平均。hem_extra_margin=0なら無効)。
+        検証の結果、
+        貫入の深さ・面積とも6〜7割程度は減るが、「貫入が発生するフレーム数」
+        自体はほぼ変わらない(浅く広く残る)。あくまで緩和策であり、メッシュ面の
+        完全な非貫入を保証するものではない。適応サブステップが発動している
+        フレームでは、サブステップ1回ごと(N回)に補正をかける(検証の結果、
+        フレーム終わりに1回だけ補正するより面積・貫入フレーム数の両方で
+        わずかに有利だったため)。
+    midpoint_correction_iters : 中間パーティクル補正の反復回数。デフォルト2。
+        コスト増は小さい(実測: 反復6回でも全体の1割程度増)。
+    midpoint_correction_margin : 中間パーティクル補正でのクリアランス
+        (collision_marginとは別扱い)。デフォルト0.0。
+    midpoint_correction_samples : 各セグメント上でチェックするサンプル点の数。
+        デフォルト1(中点のみ、t=0.5)。2以上にすると、セグメントをN+1等分した
+        内側のN点(例: samples=2ならt=1/3, 2/3)をそれぞれチェックし、各サンプル
+        点での押し出しをt(親側からの距離の割合)で親子に案分して適用する
+        (親がkinematicアンカーの場合は常に子へ全量)。値を増やすほど、より
+        細かい範囲の食い込みを拾えるが、その分コストは線形に増える。
+    midpoint_correction_collider_names : 中間パーティクル補正で見るコライダー
+        剛体名の集合。デフォルトNoneなら衝突判定に使われている全コライダーを
+        見る。adaptive_substep_collider_namesと同じ集合を渡すのが典型的な
+        使い方(脚だけに絞る等)。
     戻り値       : { node_index: [ (x,y,z,w), ... num_frames ] }（glTF局所回転）
     """
     nodes = gltf_json["nodes"]
@@ -678,22 +738,167 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # 位置はtranslationで担保済みなので、この跳ねを恒等固定で完全に無効化する。
     skirt_bone_set = set(p.bone for ch in chains for p in ch.particles if p.rb in skirt_rbs)
 
-    # クロスソルバでベイク（縦チェーン＋横距離拘束）。髪は lateral=[] で従来同等。
-    state = SpringState(chains, init_pos=init_pos)
+    # ======================================================================
+    # 髪(その他揺れ物)と布(スカート等)でソルバの状態を完全に分離する。
+    # 適応サブステップ(布のみ対象)を髪・胸などの物理から構造的に隔離するため。
+    # 数学的な根拠: simulate_step_cloth 内の各処理(積分・縦/横拘束・衝突押し出し・
+    # 回転出力)は、いずれもチェーン単位またはパーティクル単位で閉じており、他の
+    # チェーン/パーティクルの結果には依存しない(resolve_collisions のみ全
+    # パーティクルを1関数内でまとめて処理するが、これも1粒子ごとに独立な計算で
+    # あり他粒子の結果を参照しない)。したがって「1つの状態に全チェーンをまとめて
+    # 1回呼ぶ」のと「2つの状態に分けて2回呼ぶ」のとで、数値結果は変わらない。
+    # 適応サブステップが不発動(N=1)のフレームでは、布側もこれまでと全く同じ
+    # 引数で1回だけ simulate_step_cloth を呼ぶため、出力はこれまでと
+    # ビット単位で一致する(adaptive_substep_threshold=None ならこの機構自体が
+    # 無効なので、常にこの経路のみを通る)。
+    chains_cloth = []
+    chains_other = []
+    for ch in chains:
+        if any((not p.kinematic) and p.rb in skirt_rbs for p in ch.particles):
+            chains_cloth.append(ch)
+        else:
+            chains_other.append(ch)
+    _cloth_chain_ids = set(id(ch) for ch in chains_cloth)
+
+    state_cloth = SpringState(chains_cloth, init_pos=init_pos)
+    state_other = SpringState(chains_other)
     dt = 1.0 / fps
+
+    def _set_anchors(state, a):
+        for rb, (wp, wr) in a.items():
+            if rb in state.part:
+                state.set_anchor(rb, wp, wr)
 
     warmup = 20   # 修正1のinit_posシードで十分。warmup増は髪の揺れを損なうため20維持
     a0 = anchor_fn(0)
     for _ in range(warmup):
-        for rb, (wp, wr) in a0.items():
-            state.set_anchor(rb, wp, wr)
-        simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
+        _set_anchors(state_other, a0)
+        _set_anchors(state_cloth, a0)
+        simulate_step_cloth(state_other, gravity_dir, dt, drag_force, stiffness_force,
+                            [], gravity_power=gravity_power, iterations=6,
+                            colliders=colliders_at(0), body_axis=body_axis_at(0),
+                            radial_rbs=skirt_rbs, margin=collision_margin,
+                            exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                            allowed_collider_rbi=allowed_collider_rbi,
+                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+        simulate_step_cloth(state_cloth, gravity_dir, dt, drag_force, stiffness_force,
                             lateral, gravity_power=gravity_power, iterations=6,
                             colliders=colliders_at(0), body_axis=body_axis_at(0),
                             radial_rbs=skirt_rbs, margin=collision_margin,
                             exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                             allowed_collider_rbi=allowed_collider_rbi,
                             hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+
+    # ------------------------------------------------------------------
+    # 適応サブステップ(布のみ対象): フレーム間の「布アンカー変位＋近傍コライダー
+    # 変位」の合計(三角不等式による安全側の上限見積もり。フェーズAの計測と
+    # 同じ考え方)が、最寄りコライダーの半径 × adaptive_substep_threshold を
+    # 超えたフレームだけ、布ソルバを N 分割して呼ぶ。
+    # ------------------------------------------------------------------
+    _substep_enabled = adaptive_substep_threshold is not None
+    chain_reach = {}
+    _substep_collider_defs = colliders_def
+    _substep_slack = 0.3 + max(collision_margin, 0.0)
+    if _substep_enabled:
+        for ch in chains_cloth:
+            p0 = ch.particles[0]
+            if p0.kinematic:
+                reach = sum(p.rest_len for p in ch.particles[1:])
+                chain_reach[p0.rb] = max(chain_reach.get(p0.rb, 0.0), reach)
+        if adaptive_substep_collider_names is not None:
+            _allow = set(adaptive_substep_collider_names)
+            _substep_collider_defs = [c for c in colliders_def
+                                      if rbs_names_all[c[-1]]["name"] in _allow]
+        print("  [physics] adaptive substep: threshold=%.3f (x collider radius), "
+              "max_N=%d, %d collider(s) considered"
+              % (adaptive_substep_threshold, adaptive_substep_max_n,
+                 len(_substep_collider_defs)))
+
+    def _collider_centers(cols, allowed_rbi):
+        out = {}
+        for col in cols:
+            if col[0] == "sphere":
+                _, c, rad, _grp, _msk, rbi = col
+            else:
+                _, p0, p1, rad, _grp, _msk, rbi = col
+                c = ((p0[0]+p1[0])*0.5, (p0[1]+p1[1])*0.5, (p0[2]+p1[2])*0.5)
+            if allowed_rbi is not None and rbi not in allowed_rbi:
+                continue
+            out[rbi] = (c, rad)
+        return out
+
+    _substep_allowed_rbi = (set(c[-1] for c in _substep_collider_defs)
+                            if adaptive_substep_collider_names is not None else None)
+
+    def _compute_substep_n(anchor_prev, anchor_cur, collider_prev, collider_cur):
+        best_ratio = 0.0
+        for rb, reach in chain_reach.items():
+            p, _q = anchor_cur.get(rb, (None, None))
+            if p is None:
+                continue
+            pp, _pq = anchor_prev.get(rb, (p, _q))
+            a_disp = _len(_sub(p, pp))
+            local_max = 0.0
+            local_rad = 0.0
+            for rbi, (c_now, rad) in collider_cur.items():
+                dist = _len(_sub(p, c_now))
+                if dist > reach + rad + _substep_slack:
+                    continue
+                c_prev, _ = collider_prev.get(rbi, (c_now, rad))
+                c_disp = _len(_sub(c_now, c_prev))
+                if c_disp > local_max:
+                    local_max = c_disp
+                    local_rad = rad
+            if local_rad <= 1e-6:
+                continue
+            ratio = (a_disp + local_max) / local_rad
+            if ratio > best_ratio:
+                best_ratio = ratio
+        if best_ratio <= 0.0:
+            return 1
+        n = math.ceil(best_ratio / adaptive_substep_threshold)
+        return max(1, min(adaptive_substep_max_n, n))
+
+    def _lerp(a, b, t):
+        return _add(a, _scale(_sub(b, a), t))
+
+    def _slerp_q(a, b, t):
+        d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
+        if d < 0.0:
+            b = (-b[0], -b[1], -b[2], -b[3]); d = -d
+        d = max(-1.0, min(1.0, d))
+        theta0 = math.acos(d)
+        if theta0 < 1e-9:
+            return a
+        theta = theta0 * t
+        s0 = math.sin(theta0 - theta) / math.sin(theta0)
+        s1 = math.sin(theta) / math.sin(theta0)
+        return (a[0]*s0+b[0]*s1, a[1]*s0+b[1]*s1,
+               a[2]*s0+b[2]*s1, a[3]*s0+b[3]*s1)
+
+    def _lerp_anchor(a_prev, a_cur, t):
+        out = {}
+        for rb, (p, q) in a_cur.items():
+            pp, pq = a_prev.get(rb, (p, q))
+            out[rb] = (_lerp(pp, p, t), _slerp_q(pq, q, t))
+        return out
+
+    def _lerp_colliders(cols_prev, cols_cur, t):
+        prev_by_rbi = {c[-1]: c for c in cols_prev}
+        out = []
+        for col in cols_cur:
+            rbi = col[-1]
+            pcol = prev_by_rbi.get(rbi, col)
+            if col[0] == "sphere":
+                _, c, rad, grp, msk, _rbi = col
+                _, pc, _prad, _pgrp, _pmsk, _prbi = pcol
+                out.append(("sphere", _lerp(pc, c, t), rad, grp, msk, rbi))
+            else:
+                _, p0, p1, rad, grp, msk, _rbi = col
+                _, pp0, pp1, _prad, _pgrp, _pmsk, _prbi = pcol
+                out.append(("capsule", _lerp(pp0, p0, t), _lerp(pp1, p1, t),
+                           rad, grp, msk, rbi))
+        return out
 
     # 剛体変換の逆・点変換（translation焼き用）
     def _inv_rigid(M):
@@ -712,26 +917,198 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 M[1][0]*p[0] + M[1][1]*p[1] + M[1][2]*p[2] + M[1][3],
                 M[2][0]*p[0] + M[2][1]*p[1] + M[2][2]*p[2] + M[2][3])
 
+    # ------------------------------------------------------------------
+    # 中間パーティクル補正(布のみ): 隣接するチェーン同士を結ぶ横リングの辺
+    # (lateral、同じ高さの輪を構成する辺)の途中がコライダーに食い込んで
+    # いたら、その両端の実ボーン位置を少しだけ押し出す。縦方向(チェーン内の
+    # 親子、腰→裾へ垂れる方向)のセグメントは対象にしない — 根元に近い縦
+    # セグメントを押すと、その1本のズレがチェーンを伝って裾側全体を広げて
+    # しまう(傘化)ため。横リングだけを対象にすることで、この縦方向の伝播を
+    # 避けつつ、輪の途中がコライダーにめり込む見た目を緩和する。
+    # 押し出し方向はコライダー表面から最短距離で離れる向き(制限なし)。
+    # 検証の結果、貫入の深さ・面積は6〜7割程度緩和できるが、「貫入が発生する
+    # フレーム数」自体はほぼ変わらない(浅く広く残る)緩和策。
+    # ------------------------------------------------------------------
+    _midpoint_enabled = midpoint_correction
+    _midpoint_allowed_rbi = None
+    if _midpoint_enabled and midpoint_correction_collider_names is not None:
+        _allow_mp = set(midpoint_correction_collider_names)
+        _midpoint_allowed_rbi = set(
+            c[-1] for c in colliders_def
+            if rbs_names_all[c[-1]]["name"] in _allow_mp)
+
+    def _midpoint_push(m, cols, extra_margin=0.0):
+        best_depth = 0.0
+        best_dir = None
+        for col in cols:
+            if _midpoint_allowed_rbi is not None and col[-1] not in _midpoint_allowed_rbi:
+                continue
+            if col[0] == "sphere":
+                C, rad = col[1], col[2]
+            else:
+                C = _closest_on_segment(m, col[1], col[2]); rad = col[3]
+            dvec = _sub(m, C)
+            d = _len(dvec)
+            R = rad + midpoint_correction_margin + extra_margin
+            if d < R:
+                depth = R - d
+                if depth > best_depth:
+                    best_depth = depth
+                    best_dir = _norm(dvec) if d > 1e-9 else (0.0, 1.0, 0.0)
+        if best_dir is None:
+            return None
+        return _scale(best_dir, best_depth)
+
+    def _apply_midpoint_correction(a_full, cols):
+        n_samples = max(1, midpoint_correction_samples)
+        ts = [si / (n_samples + 1) for si in range(1, n_samples + 1)]
+        for _ in range(midpoint_correction_iters):
+            for rb_a, rb_b, rest_len in lateral:
+                pa = state_cloth.part.get(rb_a)
+                pb = state_cloth.part.get(rb_b)
+                if pa is None or pb is None:
+                    continue
+                # hem_extra_margin をボーン本体(resolve_collisions)と同じ
+                # 「根元0→裾で全量」の深さ比例で中間パーティクルにも一貫適用する。
+                # エッジの深さは両端パーティクルの hem_weight の平均。
+                # hem_extra_margin=0 なら加算0で従来挙動と完全に同じ。
+                _hw = (hem_weight.get(rb_a, 0.0) + hem_weight.get(rb_b, 0.0)) * 0.5
+                _edge_extra = hem_extra_margin * _hw
+                for t in ts:
+                    if pa.kinematic:
+                        if rb_a not in a_full:
+                            continue
+                        pos_a = a_full[rb_a][0]
+                    else:
+                        pos_a = state_cloth.pos[rb_a]
+                    if pb.kinematic:
+                        if rb_b not in a_full:
+                            continue
+                        pos_b = a_full[rb_b][0]
+                    else:
+                        pos_b = state_cloth.pos[rb_b]
+                    m = _lerp(pos_a, pos_b, t)
+                    corr = _midpoint_push(m, cols, _edge_extra)
+                    if corr is None:
+                        continue
+                    if pa.kinematic and pb.kinematic:
+                        continue
+                    elif pa.kinematic:
+                        state_cloth.pos[rb_b] = _add(pos_b, corr)
+                    elif pb.kinematic:
+                        state_cloth.pos[rb_a] = _add(pos_a, corr)
+                    else:
+                        state_cloth.pos[rb_a] = _add(pos_a, _scale(corr, 1.0 - t))
+                        state_cloth.pos[rb_b] = _add(pos_b, _scale(corr, t))
+                    base_a = pos_a if pa.kinematic else state_cloth.pos[rb_a]
+                    d2 = _sub(state_cloth.pos[rb_b] if not pb.kinematic else pos_b, base_a)
+                    dl = _len(d2)
+                    if dl > 1e-9 and not pb.kinematic:
+                        state_cloth.pos[rb_b] = _add(base_a, _scale(d2, rest_len / dl))
+            # 横リングの押し出しで動かした粒子は、縦方向のチェーン拘束
+            # (親子間の長さ=rest_len)から見ると長さが崩れている。そのままだと
+            # チェーンが伸び縮みし、見た目が破綻する(傘化含む)ため、
+            # ルートから順に縦方向の長さを rest_len へ戻す「念押し」を行う。
+            # これにより、横リングの押し出しが「セグメントの向きを横に曲げる」
+            # 効果として残り、「セグメントを伸ばす」効果は打ち消される。
+            for ch in chains_cloth:
+                plist = ch.particles
+                for k in range(1, len(plist)):
+                    c = plist[k]; pa2 = plist[k-1]
+                    if c.rb not in skirt_rbs:
+                        continue
+                    if pa2.kinematic:
+                        if pa2.rb not in a_full:
+                            continue
+                        base = a_full[pa2.rb][0]
+                    else:
+                        base = state_cloth.pos[pa2.rb]
+                    d2 = _sub(state_cloth.pos[c.rb], base)
+                    dl = _len(d2)
+                    if dl > 1e-9:
+                        state_cloth.pos[c.rb] = _add(base, _scale(d2, c.rest_len / dl))
+
     keys = {}    # bone -> [(f, quat_local)]
     tkeys = {}   # bone -> [(f, (x,y,z) local translation)]  スカート等のみ
     _ndyn = sum(1 for ch in chains for pp in ch.particles if not pp.kinematic)
     print("  [physics] baking %d cloth bones over %d frames..."
           % (_ndyn, num_frames))
+    if _midpoint_enabled:
+        print("  [physics] midpoint correction: iters=%d, margin=%.4f"
+              % (midpoint_correction_iters, midpoint_correction_margin))
+
+    prev_anchor_full = a0            # frame -1相当 = warmupの最終姿勢(frame0と同じ)
+    prev_colliders_full = colliders_at(0)
+
     for f in range(num_frames):
         if f % 500 == 0 and f > 0:
             print("  [physics]   frame %d/%d" % (f, num_frames))
         a = anchor_fn(f)
-        for rb, (wp, wr) in a.items():
-            state.set_anchor(rb, wp, wr)
-        seg = simulate_step_cloth(state, gravity_dir, dt, drag_force,
-                                  stiffness_force, lateral,
-                                  gravity_power=gravity_power, iterations=6,
-                                  colliders=colliders_at(f), body_axis=body_axis_at(f),
-                                  radial_rbs=skirt_rbs, margin=collision_margin,
-                                  exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
-                                  allowed_collider_rbi=allowed_collider_rbi,
-                                  hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
-        loc = seg_rot_to_local(state, seg)
+        cols_f = colliders_at(f)
+        body_axis_f = body_axis_at(f)
+
+        n_sub = 1
+        if _substep_enabled:
+            n_sub = _compute_substep_n(
+                prev_anchor_full, a,
+                _collider_centers(prev_colliders_full, _substep_allowed_rbi),
+                _collider_centers(cols_f, _substep_allowed_rbi))
+            if n_sub > 1:
+                print("  [physics]   substep N=%d at frame %d" % (n_sub, f))
+
+        # 髪等(state_other)は常にN=1・無改造
+        _set_anchors(state_other, a)
+        seg_other = simulate_step_cloth(state_other, gravity_dir, dt, drag_force,
+                                        stiffness_force, [],
+                                        gravity_power=gravity_power, iterations=6,
+                                        colliders=cols_f, body_axis=body_axis_f,
+                                        radial_rbs=skirt_rbs, margin=collision_margin,
+                                        exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                                        allowed_collider_rbi=allowed_collider_rbi,
+                                        hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+
+        if n_sub <= 1:
+            # 不発動フレーム: これまでと完全に同じ1回呼び出し(ビット単位で一致)。
+            _set_anchors(state_cloth, a)
+            seg_cloth = simulate_step_cloth(state_cloth, gravity_dir, dt, drag_force,
+                                            stiffness_force, lateral,
+                                            gravity_power=gravity_power, iterations=6,
+                                            colliders=cols_f, body_axis=body_axis_f,
+                                            radial_rbs=skirt_rbs, margin=collision_margin,
+                                            exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                                            allowed_collider_rbi=allowed_collider_rbi,
+                                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+            if _midpoint_enabled:
+                # N=1(実質1サブステップ)のフレームでは、通常呼び出し直後に1回だけ補正。
+                _apply_midpoint_correction(a, cols_f)
+        else:
+            # 発動フレーム: アンカー・コライダーをN分割補間しつつN回呼ぶ。
+            # gravity_power は 1/N、drag_force は N乗根でスケーリングし、
+            # N回分の積み重ねが1回分と釣り合うようにする(dtは変更しない)。
+            grav_sub = gravity_power / n_sub
+            drag_sub = drag_force ** (1.0 / n_sub)
+            for si in range(1, n_sub + 1):
+                t = si / n_sub
+                a_sub = _lerp_anchor(prev_anchor_full, a, t)
+                cols_sub = _lerp_colliders(prev_colliders_full, cols_f, t)
+                _set_anchors(state_cloth, a_sub)
+                seg_cloth = simulate_step_cloth(state_cloth, gravity_dir, dt, drag_sub,
+                                                stiffness_force, lateral,
+                                                gravity_power=grav_sub, iterations=6,
+                                                colliders=cols_sub, body_axis=body_axis_f,
+                                                radial_rbs=skirt_rbs, margin=collision_margin,
+                                                exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                                                allowed_collider_rbi=allowed_collider_rbi,
+                                                hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+                if _midpoint_enabled:
+                    # 「逆順」= サブステップ1回ごとに毎回補正をかける。フレーム
+                    # 終わりに1回だけ補正するより、検証の結果わずかに有利
+                    # (貫入面積・貫入フレーム数の両方でごくわずかに改善)だった。
+                    _apply_midpoint_correction(a_sub, cols_sub)
+
+        loc = {}
+        loc.update(seg_rot_to_local(state_other, seg_other))
+        loc.update(seg_rot_to_local(state_cloth, seg_cloth))
         for bone in skirt_bone_set:
             if bone in loc:
                 loc[bone] = (0.0, 0.0, 0.0, 1.0)
@@ -751,19 +1128,24 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 pw = trs_to_mat((apx, apy, apz), aq)
             else:
                 pw = mat_ident()
+            st = state_cloth if id(ch) in _cloth_chain_ids else state_other
             for k in range(1, len(plist)):
                 c = plist[k]
                 lq = loc.get(c.bone, (0.0, 0.0, 0.0, 1.0))
                 if c.rb in skirt_rbs:
-                    lt = _apply(_inv_rigid(pw), state.pos[c.rb])
+                    lt = _apply(_inv_rigid(pw), st.pos[c.rb])
                     if c.bone not in t_written:
                         tkeys.setdefault(c.bone, []).append((f, lt))
                         t_written.add(c.bone)
                     pw = mat_mul(pw, trs_to_mat(lt, lq))
                 else:
-                    rdir = state.rest_dir.get(c.rb, (0.0, 0.0, 0.0))
+                    rdir = st.rest_dir.get(c.rb, (0.0, 0.0, 0.0))
                     rl = c.rest_len
                     pw = mat_mul(pw, trs_to_mat((rdir[0]*rl, rdir[1]*rl, rdir[2]*rl), lq))
+
+        prev_anchor_full = a
+        prev_colliders_full = cols_f
+
     out = {}
     for bone, ks in keys.items():
         ks.sort(key=lambda x: x[0])
@@ -1327,3 +1709,255 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                 t = 0.0
             P = _add(P, _scale(n, t))
         pos[rb] = P
+
+
+# ======================================================================
+# フェーズA: 適応サブステップ導入のための「トンネリング」検知・計測
+# ======================================================================
+# 目的: 布(スカート等)がコライダーを素通りする恐れのあるフレームを、
+# simulate_step_cloth / resolve_collisions 等の物理計算コードには一切触れずに
+# 検出する。フレーム間のキネマティックFK移動距離（アンカー・コライダーとも
+# baked から直接計算できる）だけを見て、「1フレームでどれだけ相対移動したか」
+# を無次元（コライダー半径比）で報告する。このコードはベイク出力に一切影響
+# しない（読み取り専用の計測パス）。
+#
+# 相対移動量の定義: 「布アンカーの変位」と「コライダーの変位」を別々に求め、
+# 三角不等式による安全側（上限）の見積もりとして両者を単純に加算する
+# （実際の粒子位置は物理シミュレーションを回さないと分からないため、
+# 空間的に厳密な最近傍ペアリングはフェーズAでは行わない。閾値探索の
+# 目的には安全側の上限で十分）。
+ADAPTIVE_SUBSTEP_MEASURE_VERSION = "2026-07-17a (phase A: detection/measurement only, no physics changes)"
+
+
+def measure_tunneling(gltf_json, baked, num_frames, physics_gltf, scale,
+                      fps=30.0, only_names=None, collision_margin=0.0,
+                      log_every=500, min_collider_radius=0.0,
+                      collider_name_filter=None):
+    """min_collider_radius: この半径未満のコライダー(捻り補助等、視覚的な
+    衝突体としての意味が薄い極小剛体)は評価対象から除外する。デフォルト0.0
+    は除外なし(全コライダーを見る)。
+    collider_name_filter: 剛体名の集合(set)。指定すると、この名前に一致する
+    コライダーだけを評価対象にする(例: 脚だけに絞って腕・肩の動きを無視する)。
+    デフォルトNoneなら全mode0コライダーを対象にする(既存挙動)。"""
+    """フェーズA計測本体。物理シミュレーションは一切呼び出さない。
+
+    戻り値: {
+        "frames": [ {frame, max_anchor_disp, max_collider_disp, rel_disp,
+                     ratio_radius, ratio_margin, anchor_name, collider_name,
+                     collider_radius}, ... ]  （f=1..num_frames-1）
+        "n_anchors": int, "n_colliders": int,
+    }
+    呼び出し側で集計（ヒストグラム・閾値探索）を行う想定。
+    """
+    nodes = gltf_json["nodes"]
+    node_names = [nd.get("name", "?") for nd in nodes]
+    print("  [measure] adaptive-substep measurement version: %s"
+          % ADAPTIVE_SUBSTEP_MEASURE_VERSION)
+    bwm = compute_bone_world_matrices(gltf_json)
+    chains, parts, excluded, lateral = extract_chains_bfs(
+        physics_gltf, bwm, only_names=only_names)
+
+    parent = [-1] * len(nodes)
+    for i, nd in enumerate(nodes):
+        for c in nd.get("children", []):
+            parent[c] = i
+
+    def local_mat_at(bi, f):
+        d = baked.get(bi)
+        if d and d.get("r"):
+            q = _cquat(d["r"][f])
+        else:
+            q = nodes[bi].get("rotation", [0.0, 0.0, 0.0, 1.0])
+        if d and d.get("t"):
+            t = _cpos(d["t"][f], scale)
+        else:
+            t = nodes[bi].get("translation", [0.0, 0.0, 0.0])
+        return trs_to_mat(t, q)
+
+    def bone_path(bi):
+        path = []
+        bb = bi
+        while bb != -1:
+            path.append(bb); bb = parent[bb]
+        path.reverse()
+        return path
+
+    _path_cache = {}
+    def cached_path(bi):
+        p = _path_cache.get(bi)
+        if p is None:
+            p = bone_path(bi)
+            _path_cache[bi] = p
+        return p
+
+    def world_at(path, f):
+        M = mat_ident()
+        for bi in path:
+            M = mat_mul(M, local_mat_at(bi, f))
+        return M
+
+    def bone_world_pos(bi, f):
+        M = world_at(cached_path(bi), f)
+        return (M[0][3], M[1][3], M[2][3])
+
+    # アンカー（kinematic）ボーンごとに root→bone のFKチェーンを用意
+    # （bake_hair_into_gltf と同一ロジック。物理は一切呼ばない）。
+    anchors = {}   # rb -> (bone_index, path)
+    for ch in chains:
+        p0 = ch.particles[0]
+        if p0.kinematic:
+            anchors[p0.rb] = (p0.bone, cached_path(p0.bone))
+
+    def anchor_pos_fn(f):
+        out = {}
+        for rb, (b, path) in anchors.items():
+            M = world_at(path, f)
+            out[rb] = (M[0][3], M[1][3], M[2][3])
+        return out
+
+    _node_names = node_names
+    _waist = -1
+    for _nm in ("下半身", "腰", "センター", "Center"):
+        if _nm in _node_names:
+            _waist = _node_names.index(_nm); break
+
+    # 「布」判定: bake_hair_into_gltf と同じ「アンカーが腰以下」基準
+    cloth_anchor_rbs = set()
+    if _waist >= 0:
+        _wy = bone_world_pos(_waist, 0)[1]
+        for rb, (b, path) in anchors.items():
+            if bone_world_pos(b, 0)[1] <= _wy + 0.05:
+                cloth_anchor_rbs.add(rb)
+    else:
+        cloth_anchor_rbs = set(anchors.keys())
+
+    # コライダー収集（bake_hair_into_gltf と同一ロジック）
+    rbs_pg = physics_gltf["rigidBodies"]
+    colliders_def = []   # (shape, path, size, lpos, lrot, rb_index, name)
+    for _rbi, rb in enumerate(rbs_pg):
+        if rb.get("mode") == 0 and rb.get("shape") in (0, 2):
+            bi = rb.get("bone", -1)
+            if not (0 <= bi < len(nodes)):
+                continue
+            colliders_def.append((rb["shape"], cached_path(bi), rb["size"],
+                                  rb["position"], rb["rotation"],
+                                  _rbi, rb.get("name", "?")))
+    if collider_name_filter is not None:
+        colliders_def = [c for c in colliders_def if c[-1] in collider_name_filter]
+
+    def colliders_at(f):
+        cols = []
+        for shape, path, size, lpos, lrot, rbi, name in colliders_def:
+            W = world_at(path, f)
+            M = mat_mul(W, trs_to_mat(lpos, lrot))
+            c = (M[0][3], M[1][3], M[2][3])
+            if shape == 0:               # 球
+                cols.append((rbi, name, c, size[0]))
+            else:                        # カプセル（中心=両端の中点、半径のみ使用）
+                _, wq = mat_to_trs(M)
+                ay = q_rotate_vec(wq, (0.0, 1.0, 0.0))
+                half = size[1] * 0.5
+                p0 = (c[0]-ay[0]*half, c[1]-ay[1]*half, c[2]-ay[2]*half)
+                p1 = (c[0]+ay[0]*half, c[1]+ay[1]*half, c[2]+ay[2]*half)
+                center = ((p0[0]+p1[0])*0.5, (p0[1]+p1[1])*0.5, (p0[2]+p1[2])*0.5)
+                cols.append((rbi, name, center, size[0]))
+        return cols
+
+    # 各布チェーンの「到達距離」(アンカーからどこまで揺れが届きうるか)。
+    # スカート等はアンカー(腰側の1粒子目)から下に連なるセグメントの
+    # rest_len の合計で近似する。これを使って「そもそも触れうる距離に
+    # あるコライダー」だけに絞り込む(でないと、体のどこか別の場所
+    # (例: 肘)が速く動いただけで無関係な最大値を拾ってしまう)。
+    chain_reach = {}   # anchor_rb -> reach (float)
+    for ch in chains:
+        p0 = ch.particles[0]
+        if p0.kinematic and p0.rb in cloth_anchor_rbs:
+            reach = sum(p.rest_len for p in ch.particles[1:])
+            chain_reach[p0.rb] = max(chain_reach.get(p0.rb, 0.0), reach)
+
+    _proximity_slack = 0.3 + max(collision_margin, 0.0)  # 保守的な余裕(glTF単位)
+
+    print("  [measure] %d cloth anchor(s) / %d anchor(s) total, %d collider(s), "
+          "%d frame(s)" % (len(cloth_anchor_rbs), len(anchors),
+                            len(colliders_def), num_frames))
+
+    prev_anchor = {rb: p for rb, p in anchor_pos_fn(0).items()
+                   if rb in cloth_anchor_rbs}
+    prev_collider = {c[0]: c for c in colliders_at(0)}
+
+    frame_records = []
+    for f in range(1, num_frames):
+        if f % log_every == 0:
+            print("  [measure]   frame %d/%d" % (f, num_frames))
+        cur_anchor = {rb: p for rb, p in anchor_pos_fn(f).items()
+                      if rb in cloth_anchor_rbs}
+        cur_collider = {c[0]: c for c in colliders_at(f)}
+        collider_disp = {}   # rbi -> (disp, name, rad, cur_pos)
+        for rbi, (rbi2, name, c, rad) in cur_collider.items():
+            prev = prev_collider.get(rbi)
+            pc = prev[2] if prev else c
+            collider_disp[rbi] = (_len(_sub(c, pc)), name, rad, c)
+
+        # フレーム全体のワースト値(全アンカー中の最大)を求める。
+        best_rel = 0.0
+        best_anchor_disp = 0.0
+        best_anchor_name = "?"
+        best_collider_disp = 0.0
+        best_collider_name = "?"
+        best_collider_radius = 0.0
+
+        for rb, p in cur_anchor.items():
+            pp = prev_anchor.get(rb, p)
+            a_disp = _len(_sub(p, pp))
+            b = anchors[rb][0]
+            a_name = node_names[b] if 0 <= b < len(node_names) else "?"
+            reach = chain_reach.get(rb, 0.0)
+
+            # このアンカー(チェーン)から到達しうる距離+余裕の範囲にある
+            # コライダーだけに絞って、その中で最も速く動いたものを探す。
+            local_max_disp = 0.0
+            local_name = "?"
+            local_rad = 0.0
+            for rbi, (c_disp, c_name, c_rad, c_pos) in collider_disp.items():
+                if c_rad < min_collider_radius:
+                    continue
+                dist = _len(_sub(p, c_pos))
+                if dist > reach + c_rad + _proximity_slack:
+                    continue
+                if c_disp > local_max_disp:
+                    local_max_disp = c_disp
+                    local_name = c_name
+                    local_rad = c_rad
+
+            rel = a_disp + local_max_disp   # 三角不等式による上限見積もり
+            if rel > best_rel:
+                best_rel = rel
+                best_anchor_disp = a_disp
+                best_anchor_name = a_name
+                best_collider_disp = local_max_disp
+                best_collider_name = local_name
+                best_collider_radius = local_rad
+
+        ratio_radius = (best_rel / best_collider_radius) if best_collider_radius > 1e-6 else 0.0
+        ratio_margin = (best_rel / collision_margin) if collision_margin > 1e-6 else 0.0
+
+        frame_records.append({
+            "frame": f,
+            "max_anchor_disp": best_anchor_disp,
+            "anchor_name": best_anchor_name,
+            "max_collider_disp": best_collider_disp,
+            "collider_name": best_collider_name,
+            "collider_radius": best_collider_radius,
+            "rel_disp": best_rel,
+            "ratio_radius": ratio_radius,
+            "ratio_margin": ratio_margin,
+        })
+        prev_anchor = cur_anchor
+        prev_collider = cur_collider
+
+    return {
+        "frames": frame_records,
+        "n_anchors": len(cloth_anchor_rbs),
+        "n_colliders": len(colliders_def),
+        "num_frames": num_frames,
+    }

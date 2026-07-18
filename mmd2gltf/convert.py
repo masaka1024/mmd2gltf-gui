@@ -227,7 +227,13 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             hair_drag=0.85, hair_stiffness=1.5, hair_gravity=0.02,
             collision_margin=0.01,
             force_no_collision_names=None, allowed_collider_names=None,
-            hem_extra_margin=0.0):
+            hem_extra_margin=0.0,
+            adaptive_substep_threshold=None, adaptive_substep_max_n=4,
+            adaptive_substep_collider_names=None,
+            midpoint_correction=False, midpoint_correction_iters=2,
+            midpoint_correction_margin=0.0,
+            midpoint_correction_collider_names=None,
+            midpoint_correction_samples=1):
     """`scale` converts MMD units to glTF units (meters). PMX models are
     conventionally authored at roughly 1 MMD unit = 8cm (a ~160cm-tall
     character is about 20 units tall), but glTF assumes 1 unit = 1 meter, so
@@ -631,7 +637,15 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         collision_margin=collision_margin,
                         force_no_collision_names=force_no_collision_names,
                         allowed_collider_names=allowed_collider_names,
-                        hem_extra_margin=hem_extra_margin)
+                        hem_extra_margin=hem_extra_margin,
+                        adaptive_substep_threshold=adaptive_substep_threshold,
+                        adaptive_substep_max_n=adaptive_substep_max_n,
+                        adaptive_substep_collider_names=adaptive_substep_collider_names,
+                        midpoint_correction=midpoint_correction,
+                        midpoint_correction_iters=midpoint_correction_iters,
+                        midpoint_correction_margin=midpoint_correction_margin,
+                        midpoint_correction_collider_names=midpoint_correction_collider_names,
+                        midpoint_correction_samples=midpoint_correction_samples)
                     log("  physics baked: %d bone(s) (%s)"
                         % (len(hair_keys),
                            "hair only" if bake_target == "hair" else "all"))

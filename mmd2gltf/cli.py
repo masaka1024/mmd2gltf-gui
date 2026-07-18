@@ -91,6 +91,55 @@ def main(argv=None):
                     "chain (default 0.0 = off). Unlike raising --collision-margin "
                     "globally, this does not push waist-side segments outward "
                     "(verified: waist angle stays fixed while raising this)")
+    ap.add_argument("--adaptive-substep-threshold", type=float, default=None,
+                    metavar="F",
+                    help="enable adaptive substepping for cloth (skirts etc.) "
+                    "to reduce bone-level tunneling through colliders during "
+                    "fast motion. A frame is subdivided when the estimated "
+                    "anchor+collider relative movement exceeds this fraction "
+                    "of the nearest collider's radius (e.g. 0.5). Default "
+                    "None = disabled (bit-identical to not having this "
+                    "feature). Typical values from measurement: 0.5-0.75")
+    ap.add_argument("--adaptive-substep-max-n", type=int, default=4, metavar="N",
+                    help="cap on how many substeps a single frame can be "
+                    "split into (default 4)")
+    ap.add_argument("--adaptive-substep-collider", action="append",
+                    metavar="NAME",
+                    help="rigid body name to consider when deciding whether "
+                    "to trigger adaptive substepping (repeatable; e.g. pass "
+                    "leg/knee/thigh collider names to ignore fast arm motion). "
+                    "Default: consider all colliders used for collision")
+    ap.add_argument("--midpoint-correction", action="store_true",
+                    help="enable an extra pass that nudges real bone "
+                    "positions apart when the midpoint of the mesh segment "
+                    "between two adjacent skirt bones is found inside a "
+                    "collider (mitigates visible mesh-through-leg crossing "
+                    "that bone-level collision alone cannot detect). "
+                    "Measured to cut penetration depth/area by roughly "
+                    "60-75%%, but does not eliminate it entirely")
+    ap.add_argument("--midpoint-correction-iters", type=int, default=2,
+                    metavar="N",
+                    help="relaxation iterations for --midpoint-correction "
+                    "(default 2; cost overhead is small even at 6)")
+    ap.add_argument("--midpoint-correction-margin", type=float, default=0.0,
+                    metavar="F",
+                    help="clearance used by --midpoint-correction (default 0.0)")
+    ap.add_argument("--midpoint-correction-collider", action="append",
+                    metavar="NAME",
+                    help="rigid body name to consider for --midpoint-correction "
+                    "(repeatable). Default: consider all colliders used for "
+                    "collision; typically pass the same names as "
+                    "--adaptive-substep-collider")
+    ap.add_argument("--midpoint-correction-samples", type=int, default=1,
+                    metavar="N",
+                    help="number of sample points checked along each cloth "
+                    "segment for --midpoint-correction (default 1 = the "
+                    "midpoint only). Values above 1 check N interior points "
+                    "(e.g. 2 checks the 1/3 and 2/3 points) and distribute "
+                    "the push to the two real bones proportionally; cost "
+                    "scales roughly linearly with N. The push direction is "
+                    "always horizontal (perpendicular to gravity), never "
+                    "up/down, regardless of this setting")
     a = ap.parse_args(argv)
 
     out = a.output or os.path.splitext(a.pmx)[0] + ".glb"
@@ -109,7 +158,15 @@ def main(argv=None):
                 collision_margin=a.collision_margin,
                 force_no_collision_names=a.force_no_collision,
                 allowed_collider_names=a.allowed_collider,
-                hem_extra_margin=a.hem_extra_margin)
+                hem_extra_margin=a.hem_extra_margin,
+                adaptive_substep_threshold=a.adaptive_substep_threshold,
+                adaptive_substep_max_n=a.adaptive_substep_max_n,
+                adaptive_substep_collider_names=a.adaptive_substep_collider,
+                midpoint_correction=a.midpoint_correction,
+                midpoint_correction_iters=a.midpoint_correction_iters,
+                midpoint_correction_margin=a.midpoint_correction_margin,
+                midpoint_correction_collider_names=a.midpoint_correction_collider,
+                midpoint_correction_samples=a.midpoint_correction_samples)
     except Exception as e:
         print("error:", e, file=sys.stderr)
         return 1
