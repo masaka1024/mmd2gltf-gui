@@ -134,6 +134,18 @@ def _alpha_class(img):
     # rendering them as BLEND disables depth writes in most viewers and
     # makes them look nearly transparent / wrongly sorted.
     semi_low = sum(hist[5:128]) / total
+    # High-alpha translucency (128-249): "see-through hair" textures are
+    # often painted almost entirely at alpha ~0.8-0.9 (e.g. IA's bangs:
+    # 16% of texels at mean alpha 224).  Those texels never fall below
+    # 128, so the semi_low test alone classifies the texture as 'mask'
+    # and _prebake_mask_alpha() then flattens them to fully opaque --
+    # destroying the translucency (bangs stop showing the eyebrows/eyes
+    # through, unlike MMD which alpha-blends them).  A modest fraction of
+    # this band is enough evidence of intentional translucency, so use a
+    # lower threshold (0.10) than semi_low's 0.25.  Measured reference
+    # points (IA model): bangs 0.162 -> blend, face skin 0.036 -> mask
+    # (keeps the eyebrow prebake fix), mouth 0.014 -> mask.
+    semi_high = sum(hist[128:250]) / total
     below_count = sum(hist[:250])
     mean_below = (
         sum(v * cnt for v, cnt in enumerate(hist[:250])) / below_count
@@ -142,9 +154,10 @@ def _alpha_class(img):
     stats = {
         "below_frac": below,
         "semi_low_frac": semi_low,
+        "semi_high_frac": semi_high,
         "mean_alpha_of_below_0_255": mean_below,
     }
-    cls = "blend" if semi_low > 0.25 else "mask"
+    cls = "blend" if (semi_low > 0.25 or semi_high > 0.10) else "mask"
     return cls, stats
 
 
@@ -248,20 +261,43 @@ def load_texture(path):
         with open(path, "rb") as f:
             data = f.read()
         mime = "image/png" if ext == ".png" else "image/jpeg"
-        return data, mime, "opaque", None, None
+        return data, mime, "opaque", "opaque", None, None, None
     if ext == ".png" and HAS_PIL:
         # re-encode to strip ICC/gamma chunks the glTF validator flags
         try:
             img = Image.open(path)
             aclass, alpha_stats = _alpha_class(img)
             avg = _average_color(img)
-            if aclass == "mask":
+            # standard_cls: what the *standard* glTF pipeline uses for
+            # alphaMode/prebake.  Naive viewers alpha-blend without depth
+            # writes, so BLEND on large overlapping meshes (hair) makes
+            # them look inside-out.  Textures that are 'blend' only due to
+            # high-alpha translucency (semi_high) therefore fall back to
+            # 'mask' here -- the untouched original is still embedded and
+            # advertised via extras.mmd (alphaClass/origTexture) so a
+            # capable importer (Unity companion) restores real blending.
+            standard_cls = aclass
+            if (aclass == "blend" and alpha_stats is not None
+                    and alpha_stats["semi_low_frac"] <= 0.25):
+                standard_cls = "mask"
+            orig_data = None
+            if standard_cls == "mask":
+                # Keep an untouched copy of the pre-prebake texture so a
+                # faithful importer (e.g. the Unity companion) can restore
+                # real alpha blending -- the prebaked/flattened version
+                # stays as the standard baseColorTexture for plain glTF
+                # viewers ("close-enough" fallback look).
+                orig = img if img.mode in ("RGB", "RGBA") else img.convert("RGBA")
+                ob = io.BytesIO()
+                orig.save(ob, "PNG", icc_profile=None)
+                orig_data = ob.getvalue()
                 img = _prebake_mask_alpha(img)
             if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGB" if aclass == "opaque" else "RGBA")
+                img = img.convert("RGB" if standard_cls == "opaque" else "RGBA")
             buf = io.BytesIO()
             img.save(buf, "PNG", icc_profile=None)
-            return buf.getvalue(), "image/png", aclass, avg, alpha_stats
+            return (buf.getvalue(), "image/png", standard_cls, aclass,
+                    avg, alpha_stats, orig_data)
         except Exception as e:
             log("WARNING: failed to load texture %s (%s)" % (path, e))
             return None
@@ -272,13 +308,23 @@ def load_texture(path):
         img = Image.open(path)
         aclass, alpha_stats = _alpha_class(img)
         avg = _average_color(img)
-        if aclass == "mask":
+        standard_cls = aclass
+        if (aclass == "blend" and alpha_stats is not None
+                and alpha_stats["semi_low_frac"] <= 0.25):
+            standard_cls = "mask"
+        orig_data = None
+        if standard_cls == "mask":
+            orig = img if img.mode in ("RGB", "RGBA") else img.convert("RGBA")
+            ob = io.BytesIO()
+            orig.save(ob, "PNG")
+            orig_data = ob.getvalue()
             img = _prebake_mask_alpha(img)
         if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB" if aclass == "opaque" else "RGBA")
+            img = img.convert("RGB" if standard_cls == "opaque" else "RGBA")
         buf = io.BytesIO()
         img.save(buf, "PNG")
-        return buf.getvalue(), "image/png", aclass, avg, alpha_stats
+        return (buf.getvalue(), "image/png", standard_cls, aclass,
+                avg, alpha_stats, orig_data)
     except Exception as e:
         log("WARNING: failed to load texture %s (%s)" % (path, e))
         return None
@@ -520,7 +566,9 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
 
     # ---------------- textures -------------------------------------------
     tex_map = {}   # pmx texture index -> gltf texture index
+    orig_tex_map = {}  # pmx texture index -> gltf texture index (pre-prebake original)
     tex_alpha = {}
+    tex_alpha_true = {}  # 真のα分類 (標準がビューア安全のためmaskへ落ちても真値を保持)
     tex_avg_color = {}
     tex_alpha_stats = {}
     if model["textures"]:
@@ -535,14 +583,25 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
         res = load_texture(p)
         if res is None:
             continue
-        data, mime, aclass, avg, alpha_stats = res
+        data, mime, aclass, true_aclass, avg, alpha_stats, orig_data = res
         img = g.add_image(data, mime, name=os.path.basename(rel))
         g.j["textures"].append({"sampler": 0, "source": img,
                                 "name": os.path.basename(rel)})
         tex_map[ti] = len(g.j["textures"]) - 1
-        tex_alpha[ti] = aclass
+        tex_alpha[ti] = aclass          # standard (alphaMode/prebake用)
+        tex_alpha_true[ti] = true_aclass  # 真の分類 (extras用)
         tex_alpha_stats[ti] = alpha_stats
         tex_avg_color[ti] = avg
+        # Untouched pre-prebake original (mask textures only): embedded as
+        # an extra texture that no standard material references.  Faithful
+        # importers find it via extras.mmd.origTexture and can restore
+        # MMD-style real alpha blending (soft eyebrows / eye linework).
+        if orig_data is not None:
+            oimg = g.add_image(orig_data, "image/png",
+                               name="orig_" + os.path.basename(rel))
+            g.j["textures"].append({"sampler": 0, "source": oimg,
+                                    "name": "orig_" + os.path.basename(rel)})
+            orig_tex_map[ti] = len(g.j["textures"]) - 1
 
     # ---------------- materials -------------------------------------------
     g.j["materials"] = []
@@ -567,14 +626,16 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             st = tex_alpha_stats.get(ti)
             if st is not None:
                 log(
-                    "MATERIAL '%s': texture=%s alphaClass=%s "
-                    "below0.5=%.3f semiLow(5-128)=%.3f meanAlphaOfBelow(0-255)=%s"
+                    "MATERIAL '%s': texture=%s alphaClass=%s(std) "
+                    "below0.5=%.3f semiLow(5-128)=%.3f semiHigh(128-250)=%.3f "
+                    "meanAlphaOfBelow(0-255)=%s"
                     % (
                         m["name"] or m["name_en"],
                         model["textures"][ti] if ti < len(model["textures"]) else "?",
                         aclass,
                         st["below_frac"],
                         st["semi_low_frac"],
+                        st.get("semi_high_frac", 0.0),
                         ("%.1f" % st["mean_alpha_of_below_0_255"])
                         if st["mean_alpha_of_below_0_255"] is not None else "N/A",
                     )
@@ -636,6 +697,14 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                 "toonTexture": tex_map.get(m["toon_texture"], -1),
                 "toonShared": m["toon_shared"],
                 "memo": m["memo"],
+                # alphaClass: how the base texture's alpha was classified
+                # ("opaque"/"mask"/"blend").  origTexture: glTF texture
+                # index of the untouched pre-prebake original (-1 if the
+                # standard texture is already unmodified).  Importers that
+                # can alpha-blend properly should use origTexture with
+                # real blending to match MMD's soft translucency.
+                "alphaClass": tex_alpha_true.get(ti, aclass),
+                "origTexture": orig_tex_map.get(ti, -1),
             }}
         g.j["materials"].append(mat)
     if unlit:
