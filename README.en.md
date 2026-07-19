@@ -24,8 +24,33 @@ The real goal of this tool is not just viewer-oriented conversion, but **carryin
   <img src="docs/screenshot.png" alt="mmd2gltf GUI" width="640">
 </p>
 
+## Screenshots
+
+Conversion example: Tda-style Hatsune Miku Append / Miku V4X (models by Tda), imported into Unity via the [Unity importer](https://github.com/masaka1024/mmd2gltf-unity-physics-importer). Converted with the latest state of the Python version (as of 2026/07/19 18:00 JST).
+
+<p align="center">
+  <img src="docs/screenshot_tda_unity.png" alt="Tda-style Miku Append and V4X displayed in Unity" width="640">
+</p>
+
+> The model data itself is NOT included in this repository. Used under the [Piapro Character License](https://piapro.jp/license/pcl/summary) and each model's terms of use.
+> © Crypton Future Media, INC. www.piapro.net
+
+> ⚠️ **Physics (hair/skirt dynamics) reproduction is still a work in progress.** We keep tuning to bridge the engine gap between MMD (Bullet-style) and Unity (PhysX), but the motion is not yet on par with the original. Please be gentle 🙏 (ideas and PRs are very welcome!)
+
+## Verified models
+
+Conversion and display have been verified with the following models (obtain the model data from each distribution page):
+
+| Model | Author | Main verification points |
+|---|---|---|
+| Tda-style Hatsune Miku Append Ver1.10 | Tda | Material colors & sphere maps, semi-transparent overlays (forehead hair shadow / cheek), physics & lilToon reconstruction in Unity |
+| Tda-style Hatsune Miku V4X Ver1.00 | Tda | Alpha classification of shared textures, render order of translucent materials (glasses / lenses) |
+| IA (PMX model) | Omiya ([bowlroll](https://bowlroll.net/file/81272)) | Blend restoration of translucent hair (high-alpha), soft eyebrow / eye-lining translucency, physics baking |
+
 ## Table of contents
 
+- [Screenshots](#screenshots)
+- [Verified models](#verified-models)
 - [Goal of this tool](#goal-of-this-tool)
 - [Features](#features)
 - [Requirements](#requirements)
