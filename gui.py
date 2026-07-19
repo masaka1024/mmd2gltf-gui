@@ -67,6 +67,10 @@ STRINGS = {
         "opt_unlit": "unlit(MMDのトゥーン見た目に近づける)",
         "opt_doubleside": "全材質を両面描画(髪・スカートの裏面が消える場合に)",
         "opt_morph_mode": "モーフ格納方式",
+        "opt_morph_hint": "\u2731 他ソフト(Unity/UniGLTF等)へ持ち込む・忠実な変換が目的なら"
+                          "「dense」を選択してください(sparseは非対応のインポータで"
+                          "表情が壊れることがあります)。容量を抑えたい場合のみ"
+                          "「sparse」(既定)でOKです。",
         "opt_alpha_mode": "アルファモード",
         "opt_scale": "スケール(MMD単位→m。既定0.08。等倍にしたい場合は1.0)",
         "adv_toggle_closed": "詳細設定 ▸",
@@ -177,6 +181,10 @@ STRINGS = {
         "opt_unlit": "Unlit (closer to MMD's toon look)",
         "opt_doubleside": "Force all materials double-sided (fixes disappearing hair/skirt backfaces)",
         "opt_morph_mode": "Morph storage mode",
+        "opt_morph_hint": "\u2731 If you're importing into another tool (Unity/UniGLTF, etc.) "
+                          "or need a faithful conversion, choose \"dense\" (some importers "
+                          "don't support sparse accessors and facial morphs can break). "
+                          "\"sparse\" (default) is fine if you just want a smaller file.",
         "opt_alpha_mode": "Alpha mode",
         "opt_scale": "Scale (MMD units -> m. Default 0.08. Use 1.0 for no scaling)",
         "adv_toggle_closed": "Advanced \u25b8",
@@ -416,16 +424,23 @@ class App(_BaseTk):
         ttk.Combobox(opts, textvariable=self.morph_var, state="readonly",
                      values=["sparse", "dense", "none"], width=10).grid(row=2, column=1, sticky="w", **pad)
 
+        lbl_morph_hint = ttk.Label(opts, text="", foreground="#666666",
+                                    font=("TkDefaultFont", 8), justify="left",
+                                    wraplength=460)
+        lbl_morph_hint.grid(row=3, column=0, columnspan=2, sticky="w",
+                             padx=8, pady=(0, 4))
+        self._i18n_widgets.append((lbl_morph_hint, "opt_morph_hint"))
+
         lbl_alpha = ttk.Label(opts, text="")
-        lbl_alpha.grid(row=3, column=0, sticky="w", **pad)
+        lbl_alpha.grid(row=4, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_alpha, "opt_alpha_mode"))
         ttk.Combobox(opts, textvariable=self.alpha_var, state="readonly",
-                     values=["auto", "opaque", "mask", "blend"], width=10).grid(row=3, column=1, sticky="w", **pad)
+                     values=["auto", "opaque", "mask", "blend"], width=10).grid(row=4, column=1, sticky="w", **pad)
 
         lbl_scale = ttk.Label(opts, text="")
-        lbl_scale.grid(row=4, column=0, sticky="w", **pad)
+        lbl_scale.grid(row=5, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_scale, "opt_scale"))
-        ttk.Entry(opts, textvariable=self.scale_var, width=10).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Entry(opts, textvariable=self.scale_var, width=10).grid(row=5, column=1, sticky="w", **pad)
 
         # 詳細設定(折りたたみ) / advanced (collapsible)。タブ(Notebook)で
         # 「基本」「物理ベイク」「サブステップ／中間パーティクル」に分割し、
