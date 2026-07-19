@@ -271,6 +271,7 @@ def _material_uv_alpha_stats(img, model, mat_index):
     a_sum = 0.0
     a_max = 0.0
     below = 0
+    semi = 0
     n = 0
     for vi in vids:
         u, v = verts[vi]["uv"]
@@ -282,9 +283,26 @@ def _material_uv_alpha_stats(img, model, mat_index):
             a_max = a
         if a < 0.5:
             below += 1
+        if 0.02 < a < 0.98:
+            semi += 1
         n += 1
     return {"mean": a_sum / n, "max": a_max,
-            "frac_below_half": below / n, "n": n}
+            "frac_below_half": below / n, "frac_semi": semi / n, "n": n}
+
+
+def _is_translucent_material(stats):
+    """Per-material "translucent" detection for shared mask textures.
+
+    Unlike an overlay (no opaque texel at all), a translucent material's UV
+    region *has* opaque pixels but is dominated by intermediate alpha --
+    e.g. eyeglass lenses (Tda Miku V4X 'lens': mean a=0.76, 77% of texels
+    semi-transparent vs the frame 'megane' at 46%).  The standard GLB keeps
+    MASK+prebake for viewer safety, but extras.mmd.alphaClass is set to
+    "blend" so capable importers render it with real alpha blending in the
+    transparent queue, preserving MMD's material-order compositing.
+    """
+    return (stats is not None and stats["n"] >= 3
+            and stats.get("frac_semi", 0.0) > 0.5)
 
 
 def _is_overlay_material(stats):
@@ -743,8 +761,22 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
         # max=0.47, 不透明ピクセル0%)。使用UV領域を実サンプリングして
         # オーバーレイと判定できた場合はBLEND+無加工オリジナルに切り替える。
         overlay = False
+        translucent = False
         if aclass == "mask" and ti in tex_orig_img and ti in orig_tex_map:
             uvstats = _material_uv_alpha_stats(tex_orig_img[ti], model, m_idx)
+            if not _is_overlay_material(uvstats) and \
+                    _is_translucent_material(uvstats):
+                # 【半透明主体マテリアル】不透明ピクセルも持つが使用UV領域の
+                # 過半が中間αのもの(メガネのレンズ等)。標準GLBはビューア安全の
+                # ためMASK+prebakeのまま維持し、extras.mmd.alphaClassだけを
+                # "blend"にして、対応インポーターに実アルファブレンド＋
+                # 透明キューでの描画(MMDの材質順合成の再現)を指示する。
+                translucent = True
+                log("INFO: '%s' is dominated by semi-transparent texels "
+                    "(semi=%.0f%%, mean a=%.2f) -> extras alphaClass=blend "
+                    "(GLB stays MASK+prebake for viewer safety)"
+                    % (m["name"] or m["name_en"],
+                       uvstats["frac_semi"] * 100, uvstats["mean"]))
             if _is_overlay_material(uvstats):
                 overlay = True
                 mat["pbrMetallicRoughness"]["baseColorTexture"] = {
@@ -800,7 +832,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                 # standard texture is already unmodified).  Importers that
                 # can alpha-blend properly should use origTexture with
                 # real blending to match MMD's soft translucency.
-                "alphaClass": "blend" if overlay else tex_alpha_true.get(ti, aclass),
+                "alphaClass": "blend" if (overlay or translucent) else tex_alpha_true.get(ti, aclass),
                 "origTexture": orig_tex_map.get(ti, -1),
             }}
         g.j["materials"].append(mat)
