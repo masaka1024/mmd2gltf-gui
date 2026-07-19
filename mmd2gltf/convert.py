@@ -231,6 +231,76 @@ def _prebake_mask_alpha(img, cutoff_0_255=25):
     return Image.fromarray(out, mode="RGBA")
 
 
+
+def _material_uv_alpha_stats(img, model, mat_index):
+    """Sample the *original* texture's alpha only inside the UV region a
+    single material actually uses, and return per-material stats.
+
+    Why: alpha classification/prebake is per-texture, but MMD models often
+    share one texture between an opaque region (face skin) and a purely
+    semi-transparent overlay region (forehead hair-shadow, cheek blush).
+    The whole-texture histogram then says "mask", and _prebake_mask_alpha()
+    flattens the overlay's ~20-45% alpha ink to fully opaque -- the
+    forehead shadow shows up as a hard opaque reddish patch (very visible
+    in unlit GLBs).  Measured on Tda Miku Append: material 'hairshadow'
+    samples mean alpha 0.217 / max 0.47 (no opaque texel at all), while
+    the shared face texture as a whole classifies 'mask'.
+
+    Returns dict(mean, max, frac_below_half, n) or None.
+    """
+    try:
+        rgba = numpy_array_rgba(img)
+    except Exception:
+        return None
+    if rgba is None:
+        return None
+    h, w = rgba.shape[0], rgba.shape[1]
+    idx = model["indices"]
+    off = 0
+    for mi, mm in enumerate(model["materials"]):
+        cnt = mm["index_count"]
+        if mi == mat_index:
+            vids = set(idx[off:off + cnt])
+            break
+        off += cnt
+    else:
+        return None
+    if not vids:
+        return None
+    verts = model["vertices"]
+    a_sum = 0.0
+    a_max = 0.0
+    below = 0
+    n = 0
+    for vi in vids:
+        u, v = verts[vi]["uv"]
+        x = int((u % 1.0) * (w - 1))
+        y = int((v % 1.0) * (h - 1))
+        a = rgba[y, x, 3] / 255.0
+        a_sum += a
+        if a > a_max:
+            a_max = a
+        if a < 0.5:
+            below += 1
+        n += 1
+    return {"mean": a_sum / n, "max": a_max,
+            "frac_below_half": below / n, "n": n}
+
+
+def _is_overlay_material(stats):
+    """A material whose used UV region contains essentially no opaque
+    texels is an intentional semi-transparent overlay (hair shadow on the
+    forehead, cheek blush).  It must be rendered with real BLEND and the
+    untouched original texture -- MASK/prebake turns it into an opaque
+    patch, and cutout restoration in importers shows the raw ink color
+    (red-black).  Overlay meshes are small and float just above the face,
+    so the depth-sorting concerns that justify MASK elsewhere don't apply.
+    """
+    return (stats is not None and stats["n"] >= 3
+            and stats["frac_below_half"] >= 0.95
+            and stats["max"] < 0.6)
+
+
 def numpy_array_rgba(img):
     import numpy as np
     if img.mode != "RGBA":
@@ -571,6 +641,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
     tex_alpha_true = {}  # 真のα分類 (標準がビューア安全のためmaskへ落ちても真値を保持)
     tex_avg_color = {}
     tex_alpha_stats = {}
+    tex_orig_img = {}   # pmx tex idx -> decoded pre-prebake PIL image (mask textures)
     if model["textures"]:
         g.j["samplers"] = [{"magFilter": 9729, "minFilter": 9987,
                             "wrapS": 10497, "wrapT": 10497}]
@@ -602,10 +673,14 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             g.j["textures"].append({"sampler": 0, "source": oimg,
                                     "name": "orig_" + os.path.basename(rel)})
             orig_tex_map[ti] = len(g.j["textures"]) - 1
+            try:
+                tex_orig_img[ti] = Image.open(io.BytesIO(orig_data)).convert("RGBA")
+            except Exception:
+                pass
 
     # ---------------- materials -------------------------------------------
     g.j["materials"] = []
-    for m in model["materials"]:
+    for m_idx, m in enumerate(model["materials"]):
         mat = {
             "name": m["name"] or m["name_en"],
             "pbrMetallicRoughness": {
@@ -660,8 +735,30 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         "diffuse/ambient; using sphere map average color "
                         "as a static baseColorFactor fallback"
                         % (m["name"] or m["name_en"]))
+        # 【共有テクスチャの半透明オーバーレイ検出】額の髪影・チーク等は
+        # 顔テクスチャの一角(全ピクセルが半透明)だけを使う専用マテリアル。
+        # テクスチャ全体のヒストグラム分類は顔の不透明領域に引きずられて
+        # "mask"になり、prebakeで影インクが不透明化 → UNLITで額にくっきり
+        # 表示される不具合(Tda式ミクで実測: hairshadow領域 mean α=0.217,
+        # max=0.47, 不透明ピクセル0%)。使用UV領域を実サンプリングして
+        # オーバーレイと判定できた場合はBLEND+無加工オリジナルに切り替える。
+        overlay = False
+        if aclass == "mask" and ti in tex_orig_img and ti in orig_tex_map:
+            uvstats = _material_uv_alpha_stats(tex_orig_img[ti], model, m_idx)
+            if _is_overlay_material(uvstats):
+                overlay = True
+                mat["pbrMetallicRoughness"]["baseColorTexture"] = {
+                    "index": orig_tex_map[ti]}
+                log("INFO: '%s' uses only a semi-transparent region of a "
+                    "shared texture (mean a=%.2f max=%.2f, n=%d) -> "
+                    "overlay: alphaMode=BLEND with untouched original "
+                    "texture" % (m["name"] or m["name_en"],
+                                 uvstats["mean"], uvstats["max"],
+                                 uvstats["n"]))
         if alpha_mode != "auto":
             mode = alpha_mode.upper()
+        elif overlay:
+            mode = "BLEND"
         elif m["diffuse"][3] < 1.0 or aclass == "blend":
             mode = "BLEND"
         elif aclass == "mask":
@@ -703,7 +800,7 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                 # standard texture is already unmodified).  Importers that
                 # can alpha-blend properly should use origTexture with
                 # real blending to match MMD's soft translucency.
-                "alphaClass": tex_alpha_true.get(ti, aclass),
+                "alphaClass": "blend" if overlay else tex_alpha_true.get(ti, aclass),
                 "origTexture": orig_tex_map.get(ti, -1),
             }}
         g.j["materials"].append(mat)
