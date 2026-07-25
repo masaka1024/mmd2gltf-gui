@@ -8,11 +8,11 @@
 """
 import io
 import locale
+import multiprocessing
 import os
 import queue
 import re
 import sys
-import threading
 import traceback
 import contextlib
 import tkinter as tk
@@ -88,11 +88,44 @@ STRINGS = {
         "adv_bake_target": "対象",
         "adv_target_hair": "髪のみ",
         "adv_target_all": "全部(髪・スカート・ネクタイ等)",
+        "adv_gravity_label": "重力の強さ",
+        "adv_gravity_hint": "値を大きくするほど揺れ物が重く垂れ下がります。0で重力なし(元の形状を維持)。",
+        "adv_stiffness_label": "バネの反発力(元の形へ戻る強さ)",
+        "adv_stiffness_hint": "値を大きくするほど揺れが速く収まり、髪型が崩れにくくなります。",
+        "adv_bounce_label": "衝突時の弾み",
+        "adv_bounce_hint": "体や脚に当たった瞬間の弾みを追加します。0で現状の動き(変化なし)。"
+                           "値を上げるほど跳ねるように見えます。",
+        "adv_lateral_slack_label": "横リングの遊び",
+        "adv_lateral_slack_hint": "スカートの横方向(隣接パネル間)のつながりに遊びを持たせ、\n"
+                                   "折り紙のような硬さを和らげます。0で無効(変化なし)。モデルの\n"
+                                   "ジョイントが実際に持つ移動範囲を読み取って使うので、まずは\n"
+                                   "1.0前後から試し、硬さの残り具合に合わせて調整してください。",
+        "adv_vertical_spread_label": "押し出しの縦方向への分配",
+        "adv_vertical_spread_hint": "脚などに当たって1段だけ押し出された動きを、上下の隣の段にも\n"
+                                     "分けて伝えます。0で無効(変化なし)。片足を上げるポーズなどで\n"
+                                     "スカートが輪切りのように段になる場合、まず1.0前後から試して\n"
+                                     "ください。",
+        "adv_segment_aware_label": "衝突判定を「区間」単位で行う",
+        "adv_segment_aware_hint": "従来は各段(パーティクル)を個別の点として衝突判定していました\n"
+                                   "が、これを有効にすると親子の「区間」を線分として判定し、衝突\n"
+                                   "位置に応じて押し出しを転写します。片足を上げるポーズでの段差\n"
+                                   "(階段形状)の根本対策。既定オン(推奨)。",
+        "adv_skirt_twist_label": "スカートボーンの傾き(ツイスト)を反映する",
+        "adv_skirt_twist_hint": "従来はスカートボーンの向きを常に親と同じ(恒等)に固定していま\n"
+                                 "したが、これを有効にすると実際の傾きをメッシュに反映します。\n"
+                                 "区間の途中で横に押し出されたような段(電灯の笠のような形状)の\n"
+                                 "対策。位置には影響しません。既定オン(推奨)。",
         "adv_margin_label": "衝突クリアランス",
         "adv_hem_margin_label": "裾だけ追加クリアランス",
         "adv_hem_margin_hint": "スカートの末端(裾)だけに、上のクリアランスを上乗せします。"
                                 "腰側には影響しません。太もも等への見た目の食い込みが\n"
                                 "気になる場合、0.01前後から試してください。",
+        "adv_rb_size_margin_label": "剛体サイズ由来の追加クリアランス",
+        "adv_rb_size_margin_hint": "スカートの剛体(箱)自身の厚みサイズを読み取り、その分だけ\n"
+                                    "クリアランスに上乗せします。0で無効(変化なし)。モデルの\n"
+                                    "剛体が実際に持っている厚みを利用するので、パラメータを\n"
+                                    "手探りで太くするより自然な密着感が期待できます。まずは\n"
+                                    "1.0前後から試し、見た目に合わせて上下してください。",
         "adv_collision_mode_label": "衝突モード",
         "adv_collision_mode_normal": "通常（リストの剛体だけ衝突させない）",
         "adv_collision_mode_allow": "限定（リストの剛体だけ衝突させる）",
@@ -108,6 +141,7 @@ STRINGS = {
         "vrm_compat_applied": "%d 個の剛体を「限定」モードに設定しました。",
         "adv_tab_general": "基本",
         "adv_tab_physics": "物理ベイク",
+        "adv_tab_clearance": "衝突・クリアランス",
         "adv_tab_substep": "サブステップ／中間パーティクル",
         "adv_substep_enable": "適応サブステップを有効にする",
         "adv_substep_hint": "動きが速いフレームだけ物理ステップを分割し、スカート等が"
@@ -202,11 +236,52 @@ STRINGS = {
         "adv_bake_target": "Target",
         "adv_target_hair": "Hair only",
         "adv_target_all": "All (hair, skirt, tie, etc.)",
+        "adv_gravity_label": "Gravity strength",
+        "adv_gravity_hint": "Higher values make dynamics hang heavier. 0 disables gravity "
+                            "(keeps rest shape).",
+        "adv_stiffness_label": "Spring stiffness (rest-shape pull)",
+        "adv_stiffness_hint": "Higher values settle faster and hold the hairstyle's shape "
+                              "more.",
+        "adv_bounce_label": "Bounce on contact",
+        "adv_bounce_hint": "Adds extra bounce the instant something hits the body or legs. "
+                           "0 keeps current behavior unchanged; higher looks springier.",
+        "adv_lateral_slack_label": "Lateral ring slack",
+        "adv_lateral_slack_hint": "Allows slack in the skirt's lateral (ring) connections to "
+                                  "soften an origami-like stiffness. 0 disables this (unchanged). "
+                                  "Reads the actual joint travel from the model, so start around "
+                                  "1.0 and adjust to how much stiffness remains.",
+        "adv_vertical_spread_label": "Vertical push spread",
+        "adv_vertical_spread_hint": "Leaks a pushed-out ring's collision displacement to the "
+                                    "rings just above and below it. 0 disables this (unchanged). "
+                                    "If a bent-leg pose makes the skirt look like a sliced tube, "
+                                    "start around 1.0.",
+        "adv_segment_aware_label": "Resolve collisions per segment (not per particle)",
+        "adv_segment_aware_hint": "Previously each ring (particle) was tested against colliders "
+                                   "as an independent point. Enabling this tests the parent-child "
+                                   "segment as a line instead, and transfers the push-out based "
+                                   "on where along the segment the collision actually falls. "
+                                   "Targets the 'staircase' look (a lifted leg making the skirt "
+                                   "look sliced into rings) at its root cause. On by default "
+                                   "(recommended).",
+        "adv_skirt_twist_label": "Keep skirt bone twist (tilt)",
+        "adv_skirt_twist_hint": "Previously each skirt bone's rotation was always forced to "
+                                 "identity (same orientation as its parent). Enabling this keeps "
+                                 "the segment's real tilt in the mesh instead. Targets a bulge "
+                                 "partway along a segment (a lampshade-like silhouette) rather "
+                                 "than at the bone itself. Doesn't affect position. On by "
+                                 "default (recommended).",
         "adv_margin_label": "Collision clearance",
         "adv_hem_margin_label": "Extra clearance (hem only)",
         "adv_hem_margin_hint": "Adds extra clearance on top of the setting above, but only "
                                 "at the skirt's hem (tip). The waist side is unaffected. "
                                 "Try around 0.01 if the legs visually poke through the hem.",
+        "adv_rb_size_margin_label": "Extra clearance from rigid body size",
+        "adv_rb_size_margin_hint": "Reads each skirt rigid body's own box thickness from the "
+                                    "model and adds that much clearance on top. 0 disables "
+                                    "this (unchanged). Since it uses the thickness the model "
+                                    "already has, it tends to look more natural than hand-"
+                                    "tuning a flat margin. Start around 1.0 and adjust to "
+                                    "taste.",
         "adv_collision_mode_label": "Collision mode",
         "adv_collision_mode_normal": "Normal (exclude only the listed bodies)",
         "adv_collision_mode_allow": "Restricted (only the listed bodies collide)",
@@ -224,6 +299,7 @@ STRINGS = {
         "vrm_compat_applied": "Set %d rigid body name(s) to Restricted mode.",
         "adv_tab_general": "General",
         "adv_tab_physics": "Physics baking",
+        "adv_tab_clearance": "Collision & clearance",
         "adv_tab_substep": "Substep / midpoint correction",
         "adv_substep_enable": "Enable adaptive substepping",
         "adv_substep_hint": "Splits the physics step only on fast-motion frames, "
@@ -303,12 +379,34 @@ class QueueWriter(io.TextIOBase):
         return len(s)
 
 
+def _convert_worker(q, pmx, out, kwargs):
+    """変換処理の本体。multiprocessing.Process の target として、GUIプロセスとは
+    別プロセスで実行される(トップレベル関数である必要がある: spawn方式で子プロセス
+    が再インポートして見つけられるように)。
+
+    以前は threading.Thread で実行していたが、bake_hair.py の物理ベイクは純粋な
+    Python(numpy不使用)による重いループのため、CPUを長時間占有し続けてGIL
+    (Global Interpreter Lock)を手放す機会が乏しく、tkinterのメインループ
+    (ウィンドウ操作・再描画)が長時間止まって見える(実際にはハングしていないが
+    無応答に見える)問題があった。別プロセスに切り出すことでGILの奪い合い自体が
+    無くなり、GUIは変換の重さに関係なく常に応答する。
+    """
+    w = QueueWriter(q)
+    try:
+        with contextlib.redirect_stdout(w), contextlib.redirect_stderr(w):
+            convert(pmx, out, **kwargs)
+        q.put(("done", out))
+    except Exception:
+        q.put(("error", traceback.format_exc()))
+
+
 class App(_BaseTk):
     def __init__(self):
         super().__init__()
         self.lang = _detect_default_lang()
-        self.minsize(560, 520)
-        self.q = queue.Queue()
+        self.minsize(560, 480)
+        self.geometry("680x900")
+        self.q = multiprocessing.Queue()
         self.worker = None
         self._out_edited = False
         self._i18n_widgets = []   # (widget, key) simple .config(text=...) targets
@@ -323,6 +421,42 @@ class App(_BaseTk):
     # ---------- i18n ----------
     def t(self, key):
         return STRINGS[self.lang][key]
+
+    def _make_scroll_tab(self, notebook, height=300):
+        """Notebookのタブ1枚分を、縦にスクロール可能なフレームとして作る。
+        戻り値は(outer, inner)で、outerをnotebook.add()に渡し、以降の
+        .grid()呼び出しは全てinnerに対して行う(呼び出し側の既存コードは
+        変更不要、tab_xxx変数がinnerを指すようにするだけでよい)。
+        タブ内の項目が増えてウィンドウが縦に伸び続けボタンが画面外に
+        出てしまう問題(実機フィードバックで発覚、縦1024ピクセル以内の
+        画面で変換ボタンが押せなかった)への対策。
+        """
+        outer = ttk.Frame(notebook)
+        canvas = tk.Canvas(outer, highlightthickness=0, height=height)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+
+        def _on_canvas_resize(event):
+            canvas.itemconfig(win_id, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        def _on_mousewheel(event):
+            delta = event.delta
+            if delta == 0:
+                return
+            canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        # タブ切り替え時にだけホイールを有効化(他タブ表示中に誤って
+        # スクロールしないよう、Enter/Leaveで bind/unbind する)
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        return outer, inner
 
     def _on_lang_change(self, event=None):
         self.lang = "ja" if self.lang_var.get() == "日本語" else "en"
@@ -453,18 +587,22 @@ class App(_BaseTk):
         self.nb = ttk.Notebook(self.adv)
         self.nb.pack(fill="both", expand=True, padx=4, pady=4)
 
-        tab_general = ttk.Frame(self.nb)
-        tab_physics = ttk.Frame(self.nb)
-        tab_substep = ttk.Frame(self.nb)
+        tab_general_outer, tab_general = self._make_scroll_tab(self.nb)
+        tab_physics_outer, tab_physics = self._make_scroll_tab(self.nb)
+        tab_clearance_outer, tab_clearance = self._make_scroll_tab(self.nb)
+        tab_substep_outer, tab_substep = self._make_scroll_tab(self.nb)
         tab_general.columnconfigure(1, weight=1)
         tab_physics.columnconfigure(1, weight=1)
+        tab_clearance.columnconfigure(1, weight=1)
         tab_substep.columnconfigure(1, weight=1)
-        self.nb.add(tab_general, text="")
-        self.nb.add(tab_physics, text="")
-        self.nb.add(tab_substep, text="")
-        self._nb_tabs = [(tab_general, "adv_tab_general"),
-                         (tab_physics, "adv_tab_physics"),
-                         (tab_substep, "adv_tab_substep")]
+        self.nb.add(tab_general_outer, text="")
+        self.nb.add(tab_physics_outer, text="")
+        self.nb.add(tab_clearance_outer, text="")
+        self.nb.add(tab_substep_outer, text="")
+        self._nb_tabs = [(tab_general_outer, "adv_tab_general"),
+                         (tab_physics_outer, "adv_tab_physics"),
+                         (tab_clearance_outer, "adv_tab_clearance"),
+                         (tab_substep_outer, "adv_tab_substep")]
 
         self.noik_var = tk.BooleanVar(value=False)
         self.igvmdik_var = tk.BooleanVar(value=False)
@@ -475,8 +613,16 @@ class App(_BaseTk):
         self.anim_var = tk.StringVar()
         self.bakehair_var = tk.BooleanVar(value=False)
         self.baketarget_var = tk.StringVar(value="hair")
+        self.gravity_var = tk.StringVar(value="0.02")
+        self.stiffness_var = tk.StringVar(value="1.5")
+        self.bounce_var = tk.StringVar(value="0.0")
+        self.lateralslack_var = tk.StringVar(value="6.0")
+        self.verticalspread_var = tk.StringVar(value="1.5")
         self.margin_var = tk.StringVar(value="0.01")
         self.hemmargin_var = tk.StringVar(value="0.0")
+        self.rbsizemargin_var = tk.StringVar(value="1.0")
+        self.segmentaware_var = tk.BooleanVar(value=True)
+        self.skirttwist_var = tk.BooleanVar(value=True)
         self.collmode_var = tk.StringVar(value="normal")
         self.collnames_var = tk.StringVar()
         self.substep_enable_var = tk.BooleanVar(value=False)
@@ -539,26 +685,104 @@ class App(_BaseTk):
         rb_all.pack(side="left", padx=8)
         self._i18n_widgets.append((rb_all, "adv_target_all"))
 
-        lbl_mg = ttk.Label(p, text="")
-        lbl_mg.grid(row=2, column=0, sticky="w", **pad)
-        self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
-        ttk.Entry(p, textvariable=self.margin_var, width=8).grid(
+        lbl_grav = ttk.Label(p, text="")
+        lbl_grav.grid(row=2, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_grav, "adv_gravity_label"))
+        ttk.Entry(p, textvariable=self.gravity_var, width=8).grid(
             row=2, column=1, sticky="w", **pad)
+        self.lbl_grav_hint = ttk.Label(p, text="", foreground="#666666",
+                                       wraplength=380, justify="left")
+        self.lbl_grav_hint.grid(row=3, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_grav_hint, "adv_gravity_hint"))
 
-        lbl_hmg = ttk.Label(p, text="")
-        lbl_hmg.grid(row=3, column=0, sticky="w", **pad)
+        lbl_stiff = ttk.Label(p, text="")
+        lbl_stiff.grid(row=4, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_stiff, "adv_stiffness_label"))
+        ttk.Entry(p, textvariable=self.stiffness_var, width=8).grid(
+            row=4, column=1, sticky="w", **pad)
+        self.lbl_stiff_hint = ttk.Label(p, text="", foreground="#666666",
+                                        wraplength=380, justify="left")
+        self.lbl_stiff_hint.grid(row=5, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_stiff_hint, "adv_stiffness_hint"))
+
+        lbl_bounce = ttk.Label(p, text="")
+        lbl_bounce.grid(row=6, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_bounce, "adv_bounce_label"))
+        ttk.Entry(p, textvariable=self.bounce_var, width=8).grid(
+            row=6, column=1, sticky="w", **pad)
+        self.lbl_bounce_hint = ttk.Label(p, text="", foreground="#666666",
+                                         wraplength=380, justify="left")
+        self.lbl_bounce_hint.grid(row=7, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_bounce_hint, "adv_bounce_hint"))
+
+        lbl_lslack = ttk.Label(p, text="")
+        lbl_lslack.grid(row=8, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_lslack, "adv_lateral_slack_label"))
+        ttk.Entry(p, textvariable=self.lateralslack_var, width=8).grid(
+            row=8, column=1, sticky="w", **pad)
+        self.lbl_lslack_hint = ttk.Label(p, text="", foreground="#666666",
+                                         wraplength=380, justify="left")
+        self.lbl_lslack_hint.grid(row=9, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_lslack_hint, "adv_lateral_slack_hint"))
+
+        lbl_vspread = ttk.Label(p, text="")
+        lbl_vspread.grid(row=10, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_vspread, "adv_vertical_spread_label"))
+        ttk.Entry(p, textvariable=self.verticalspread_var, width=8).grid(
+            row=10, column=1, sticky="w", **pad)
+        self.lbl_vspread_hint = ttk.Label(p, text="", foreground="#666666",
+                                          wraplength=380, justify="left")
+        self.lbl_vspread_hint.grid(row=11, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_vspread_hint, "adv_vertical_spread_hint"))
+
+        cb_segaware = ttk.Checkbutton(p, variable=self.segmentaware_var)
+        cb_segaware.grid(row=12, column=0, columnspan=2, sticky="w", **pad)
+        self._i18n_widgets.append((cb_segaware, "adv_segment_aware_label"))
+        self.lbl_segaware_hint = ttk.Label(p, text="", foreground="#666666",
+                                           wraplength=380, justify="left")
+        self.lbl_segaware_hint.grid(row=13, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_segaware_hint, "adv_segment_aware_hint"))
+
+        cb_skirttwist = ttk.Checkbutton(p, variable=self.skirttwist_var)
+        cb_skirttwist.grid(row=14, column=0, columnspan=2, sticky="w", **pad)
+        self._i18n_widgets.append((cb_skirttwist, "adv_skirt_twist_label"))
+        self.lbl_skirttwist_hint = ttk.Label(p, text="", foreground="#666666",
+                                             wraplength=380, justify="left")
+        self.lbl_skirttwist_hint.grid(row=15, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_skirttwist_hint, "adv_skirt_twist_hint"))
+
+        # ---- タブ3: 衝突・クリアランス ----
+        c = tab_clearance
+        lbl_mg = ttk.Label(c, text="")
+        lbl_mg.grid(row=0, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
+        ttk.Entry(c, textvariable=self.margin_var, width=8).grid(
+            row=0, column=1, sticky="w", **pad)
+
+        lbl_hmg = ttk.Label(c, text="")
+        lbl_hmg.grid(row=1, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_hmg, "adv_hem_margin_label"))
-        ttk.Entry(p, textvariable=self.hemmargin_var, width=8).grid(
-            row=3, column=1, sticky="w", **pad)
-        self.lbl_hmg_hint = ttk.Label(p, text="", foreground="#666666",
+        ttk.Entry(c, textvariable=self.hemmargin_var, width=8).grid(
+            row=1, column=1, sticky="w", **pad)
+        self.lbl_hmg_hint = ttk.Label(c, text="", foreground="#666666",
                                       wraplength=380, justify="left")
-        self.lbl_hmg_hint.grid(row=4, column=1, sticky="w", **pad)
+        self.lbl_hmg_hint.grid(row=2, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_hmg_hint, "adv_hem_margin_hint"))
 
-        lbl_cm = ttk.Label(p, text="")
+        lbl_rsm = ttk.Label(c, text="")
+        lbl_rsm.grid(row=3, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_rsm, "adv_rb_size_margin_label"))
+        ttk.Entry(c, textvariable=self.rbsizemargin_var, width=8).grid(
+            row=3, column=1, sticky="w", **pad)
+        self.lbl_rsm_hint = ttk.Label(c, text="", foreground="#666666",
+                                      wraplength=380, justify="left")
+        self.lbl_rsm_hint.grid(row=4, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_rsm_hint, "adv_rb_size_margin_hint"))
+
+        lbl_cm = ttk.Label(c, text="")
         lbl_cm.grid(row=5, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_cm, "adv_collision_mode_label"))
-        cm_frame = ttk.Frame(p)
+        cm_frame = ttk.Frame(c)
         cm_frame.grid(row=5, column=1, sticky="w", **pad)
         rb_normal = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
                                     value="normal")
@@ -569,10 +793,10 @@ class App(_BaseTk):
         rb_allow.pack(anchor="w")
         self._i18n_widgets.append((rb_allow, "adv_collision_mode_allow"))
 
-        lbl_cn = ttk.Label(p, text="")
+        lbl_cn = ttk.Label(c, text="")
         lbl_cn.grid(row=6, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_cn, "adv_collision_names_label"))
-        cn_frame = ttk.Frame(p)
+        cn_frame = ttk.Frame(c)
         cn_frame.grid(row=6, column=1, sticky="ew", **pad)
         ttk.Entry(cn_frame, textvariable=self.collnames_var).pack(
             side="left", fill="x", expand=True)
@@ -580,22 +804,22 @@ class App(_BaseTk):
         self.browse_rb_btn.pack(side="left", padx=(6, 0))
         self._i18n_widgets.append((self.browse_rb_btn, "adv_show_rigidbodies_btn"))
 
-        self.lbl_cn_hint = ttk.Label(p, text="", foreground="#666666",
+        self.lbl_cn_hint = ttk.Label(c, text="", foreground="#666666",
                                      wraplength=380, justify="left")
         self.lbl_cn_hint.grid(row=7, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_cn_hint, "adv_collision_names_hint"))
 
-        vrm_frame = ttk.Frame(p)
+        vrm_frame = ttk.Frame(c)
         vrm_frame.grid(row=8, column=1, sticky="w", **pad)
         self.vrm_compat_btn = ttk.Button(vrm_frame, command=self._apply_vrm_compat_mode)
         self.vrm_compat_btn.pack(side="left")
         self._i18n_widgets.append((self.vrm_compat_btn, "adv_vrm_compat_btn"))
-        self.lbl_vrm_hint = ttk.Label(p, text="", foreground="#666666",
+        self.lbl_vrm_hint = ttk.Label(c, text="", foreground="#666666",
                                       wraplength=380, justify="left")
         self.lbl_vrm_hint.grid(row=9, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_vrm_hint, "adv_vrm_compat_hint"))
 
-        # ---- タブ3: サブステップ／中間パーティクル ----
+        # ---- タブ4: サブステップ／中間パーティクル ----
         s = tab_substep
         cb_sub = ttk.Checkbutton(s, variable=self.substep_enable_var)
         cb_sub.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
@@ -849,9 +1073,33 @@ class App(_BaseTk):
         except Exception:
             margin = 0.01
         try:
+            gravity = float(self.gravity_var.get())
+        except Exception:
+            gravity = 0.02
+        try:
+            stiffness = float(self.stiffness_var.get())
+        except Exception:
+            stiffness = 1.5
+        try:
+            bounce = float(self.bounce_var.get())
+        except Exception:
+            bounce = 0.0
+        try:
+            lateral_slack_scale = float(self.lateralslack_var.get())
+        except Exception:
+            lateral_slack_scale = 0.0
+        try:
+            vertical_spread_scale = float(self.verticalspread_var.get())
+        except Exception:
+            vertical_spread_scale = 0.0
+        try:
             hem_margin = float(self.hemmargin_var.get())
         except Exception:
             hem_margin = 0.0
+        try:
+            rb_size_margin_scale = float(self.rbsizemargin_var.get())
+        except Exception:
+            rb_size_margin_scale = 0.0
         _coll_names = [s.strip() for s in self.collnames_var.get().split(",") if s.strip()] or None
         force_no_collision = _coll_names if self.collmode_var.get() == "normal" else None
         allowed_collider = _coll_names if self.collmode_var.get() == "allow" else None
@@ -901,6 +1149,9 @@ class App(_BaseTk):
             scale=scale,
             bake_physics=self.bakehair_var.get(),
             bake_target=self.baketarget_var.get(),
+            hair_gravity=gravity,
+            hair_stiffness=stiffness,
+            collision_bounce=bounce,
             collision_margin=margin,
             force_no_collision_names=force_no_collision,
             allowed_collider_names=allowed_collider,
@@ -913,53 +1164,85 @@ class App(_BaseTk):
             midpoint_correction_margin=midpoint_margin,
             midpoint_correction_collider_names=midpoint_names,
             midpoint_correction_samples=midpoint_samples,
+            rb_size_margin_scale=rb_size_margin_scale,
+            lateral_slack_scale=lateral_slack_scale,
+            vertical_spread_scale=vertical_spread_scale,
+            segment_aware_collision=self.segmentaware_var.get(),
+            skirt_bone_twist=self.skirttwist_var.get(),
         )
         self.run_btn.configure(state="disabled")
         self.prog.start(12)
         self._log(self.t("log_converting") % os.path.basename(pmx))
-        self.worker = threading.Thread(
-            target=self._convert_thread, args=(pmx, out, kwargs), daemon=True)
+        self.worker = multiprocessing.Process(
+            target=_convert_worker, args=(self.q, pmx, out, kwargs), daemon=True)
         self.worker.start()
 
-    def _convert_thread(self, pmx, out, kwargs):
-        w = QueueWriter(self.q)
-        try:
-            with contextlib.redirect_stdout(w), contextlib.redirect_stderr(w):
-                convert(pmx, out, **kwargs)
-            self.q.put(("done", out))
-        except Exception:
-            self.q.put(("error", traceback.format_exc()))
+    # 1回の_poll呼び出しで処理するキューの上限。適応サブステップ有効時など、
+    # 変換処理が数千行のログを短時間に出す場面があり(例: 1回のベイクでサブ
+    # ステップが数千フレーム発動)、上限を設けず全部を一度に捌こうとすると
+    # そのぶんメインループが長時間ブロックされてGUIが固まって見える。
+    _MAX_QUEUE_ITEMS_PER_POLL = 500
 
     def _poll(self):
+        log_chunks = []
+        n = 0
         try:
-            while True:
+            while n < self._MAX_QUEUE_ITEMS_PER_POLL:
                 kind, payload = self.q.get_nowait()
+                n += 1
                 if kind == "log":
-                    self._log(payload)
+                    log_chunks.append(payload)
                 elif kind == "done":
+                    if log_chunks:
+                        self._log_batch(log_chunks)
+                        log_chunks = []
                     self._finish()
                     size = os.path.getsize(payload) / (1024.0 * 1024.0)
-                    self._log(self.t("log_done") % (payload, size))
+                    self._log_batch([self.t("log_done") % (payload, size)])
                     messagebox.showinfo(self.t("info_done_title"), self.t("info_done_msg") + payload)
                 elif kind == "error":
+                    if log_chunks:
+                        self._log_batch(log_chunks)
+                        log_chunks = []
                     self._finish()
-                    self._log(payload)
+                    self._log_batch([payload])
                     last = payload.strip().splitlines()[-1]
                     messagebox.showerror(self.t("error_title"), self.t("error_msg") + last)
         except queue.Empty:
             pass
+        if log_chunks:
+            self._log_batch(log_chunks)
+        # 上限に達してキューにまだ残りがある場合も、次の呼び出し(100ms後)で
+        # 続きを処理する。この短い間隔を挟むことでメインループに制御を返し、
+        # ウィンドウ操作・再描画への応答性を保つ。
         self.after(100, self._poll)
 
     def _finish(self):
         self.prog.stop()
         self.run_btn.configure(state="normal")
+        if self.worker is not None:
+            self.worker.join(timeout=1.0)
+            self.worker = None
 
-    def _log(self, s):
+    def _log_batch(self, chunks):
+        """複数行のログ文字列をまとめて1回のinsert/seeで挿入する。1行ずつ
+        insert+seeを繰り返すと(特にsee呼び出しのたびに発生するスクロール・
+        再レイアウトのコストが)行数に比例して重くなり、ログが大量に出る場面
+        (適応サブステップのフレームごとのメッセージ等)でGUIが固まって見える
+        原因になっていた。
+        """
         self.log.configure(state="normal")
-        self.log.insert("end", s)
+        self.log.insert("end", "".join(chunks))
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _log(self, s):
+        self._log_batch([s])
+
 
 if __name__ == "__main__":
+    # PyInstallerで固めたWindows実行ファイルでmultiprocessing.Processを使うには
+    # 必須。無いと、凍結exeの子プロセスがGUI全体を再起動してしまい、プロセスが
+    # 際限なく増殖する。開発環境(python gui.py)では実質何もしないため、常に呼ぶ。
+    multiprocessing.freeze_support()
     App().mainloop()
