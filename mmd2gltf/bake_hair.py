@@ -7,23 +7,23 @@
 """
 import math
 # 本体(パッケージ)では from .physics import に変更すること
-from .physics import (q_mul, q_rotate_vec, q_conj,
+from .physics import (q_mul, q_rotate_vec, q_conj, q_normalize,
                      compute_bone_world_matrices, trs_to_mat, mat_mul,
-                     mat_ident, mat_to_trs)
+                     mat_ident, mat_to_trs, euler_to_quat, MMD_EULER_ORDER)
 
 # このファイルが実際にどのビルドかをログで確認するためのバージョン識別子。
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-18a (midpoint correction: hem_extra_margin now also applies to lateral-edge clearance, root 0 -> hem full)"
+BAKE_HAIR_VERSION = "2026-07-25f (rigid_chain: inertia now tracks world-space orientation instead of parent-relative deviation, so centrifugal swing-out under fast parent rotation works; fixes 'never flares out when spinning' reported by user viewer feedback)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
 
 class Particle:
     __slots__ = ("rb", "bone", "mass", "inv_mass", "parent", "rest_len",
-                 "rest_dir_local", "ang_min", "ang_max", "rest_pos", "kinematic",
-                 "group", "no_collision_mask")
+                 "rest_dir_local", "ang_min", "ang_max", "joint_rot", "rest_pos",
+                 "kinematic", "group", "no_collision_mask")
     def __init__(self, rb, bone, mass, kinematic, group=0, no_collision_mask=0):
         self.rb = rb              # physicsGltf.rigidBodies のindex
         self.bone = bone          # node index
@@ -34,6 +34,9 @@ class Particle:
         self.rest_len = 0.0       # 親との静止距離
         self.ang_min = None       # jointの角度制限（ラジアン, x,y,z）
         self.ang_max = None
+        self.joint_rot = None     # jointの姿勢(子ボーンのbindローカル基準、quat)。
+                                   # ang_min/maxのX/Y/Z軸はこの姿勢で定義されている。
+                                   # simulate_step_rigid_chainの軸別クランプでのみ使用。
         self.rest_pos = None      # rest世界座標(glTF)
         self.group = group                      # MMDの非衝突グループ番号(0-15)
         self.no_collision_mask = no_collision_mask  # このグループとは衝突しない、というビットマスク
@@ -86,6 +89,7 @@ def extract_chains(physics_gltf, bone_world_matrices, only_names=None):
         pa_rb, j = link
         p.ang_min = j["angularLimitMin"]
         p.ang_max = j["angularLimitMax"]
+        p.joint_rot = j.get("rotation")
         if pa_rb in parts:
             p.parent = pa_rb
             if p.rest_pos and parts[pa_rb].rest_pos:
@@ -445,7 +449,26 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         midpoint_correction=False, midpoint_correction_iters=2,
                         midpoint_correction_margin=0.0,
                         midpoint_correction_collider_names=None,
-                        midpoint_correction_samples=1):
+                        midpoint_correction_samples=1,
+                        collision_bounce=0.0,
+                        rb_size_margin_scale=0.0,
+                        lateral_slack_scale=0.0,
+                        vertical_spread_scale=0.0,
+                        cloth_algorithm="points",
+                        rigid_chain_gravity_power=20.0,
+                        rigid_chain_stiffness_force=1.0,
+                        rigid_body_gravity=9.8,
+                        rigid_body_linear_damping=1.0,
+                        rigid_body_angular_damping=1.0,
+                        rigid_body_warmup_seconds=20.0/30.0,
+                        rigid_body_iterations=4,
+                        rigid_body_prime_full_motion=False,
+                        rigid_body_self_collision_scale=1.0,
+                        rigid_body_max_linear_speed=20.0,
+                        rigid_body_max_angular_speed=30.0,
+                        rigid_body_substeps=2,
+                        segment_aware_collision=False,
+                        skirt_bone_twist=False):
     """体アニメ baked を駆動源に、髪ボーンのローカル回転キーを生成する。
 
     gltf_json    : 組み上がった g.j（nodes 必須）
@@ -472,6 +495,227 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         判定基準になる)。モデル制作者が非衝突グループの設定を誤った/MMD側が
         正しく反映していない可能性がある場合に、脚・腰など本当に必要な
         コライダーだけを明示して安全に運用するための代替モード。
+    collision_bounce : コライダーに押し出された時、そのフレーム中に実際に押し
+        出された量の合計に比例して、コライダーからより弾かれた位置へ余分に
+        押し出す係数(値を上げるほど、体や脚に当たった瞬間に大きく弾むように
+        見える)。デフォルト0.0は既存挙動と完全に同じ(prev/posの計算に一切
+        影響しない)。1フレームの中で反復拘束解決のために複数回押し出しが
+        行われるが、都度オーバーシュートを適用すると呼び出し回数分複利的に
+        積み重なり値を大きくすると破綻するため、1フレーム分の押し出し量を
+        いったん合計してから、フレームの最後に一度だけ適用する設計。
+        gravity_power(重力)・stiffness_force(rest位置へ戻ろうとするバネの
+        強さ)とは独立したパラメータで、髪・スカート双方の物理(state_other/
+        state_cloth)に同じ値が適用される。詳細はsimulate_step_cloth()内の
+        _bounce_accum、resolve_collisions() の accum 引数を参照。
+    rb_size_margin_scale : スカート等パネル剛体自身の実サイズ(PMXの形状=箱の
+        場合のサイズ_x/y/z のうち最小成分＝厚み方向)を、この倍率で
+        collision_margin/hem_extra_margin に上乗せする追加クリアランス。
+        デフォルト0.0で無効(既存挙動と完全に同じ)。
+        狙い: 現状の押し出しはパーティクル(=ボーン位置)を大きさゼロの点として
+        扱っているが、PMX側のスカート剛体は実際には薄い箱として配置されて
+        おり、ボーン位置から実メッシュ表面まで箱の厚み分の距離がある。本家
+        MMD(Bullet)はこの体積込みで衝突を解くため「表面に密着するのに
+        貫通もしない」見た目になる一方、本ツールは一律の固定クリアランス
+        だけで近似していたため、値を小さくすると食い込み、大きくすると
+        ボーンごと浮いて膨らんで見える、というトレードオフになっていた。
+        IAモデルのPMXを実測すると、スカート剛体(形状=箱)の厚み方向サイズは
+        腰側で約0.083〜0.085、裾側で約0.122(PMX原単位。scale=0.08の既定
+        変換だとglTF単位では約0.0067〜0.0098)と、裾に近いほど厚い傾向が
+        確認できた。この値は既存のcollision_margin(既定0.01)・
+        hem_extra_margin(実機設定0.03)と同程度の桁であり、突飛に大きい値
+        ではない。これは既存のhem_extra_margin(裾だけ追加クリアランス)の
+        設計と方向性が一致しており、モデル制作者が同種の配慮を剛体サイズ
+        という形で既に作品に織り込んでいた可能性がある。
+        本パラメータは、その実サイズをclearanceの参考値としてモデルごとに
+        自動的に取り込むための入力で、ボーン本体の押し出し(resolve_collisions)
+        と横リングの中間パーティクル補正(_apply_midpoint_correction)の
+        両方に、hem_extra_margin と同じく一貫して適用される。
+        リング(段)ごとに剛体の厚みが不連続に変わるモデルでは、各パネル
+        自身の生の値をそのまま使うとリングの境目に見た目の段差が出ること
+        が実機フィードバックで判明したため、各チェーンの根元(生値)→裾
+        (生値)を hem_weight と同じ比率で線形補間し、リング間を滑らかに
+        繋ぐ(hem_extra_marginの「根元から裾へ連続的に変化」という設計を
+        踏襲)。そのため、途中のリングでは実際の剛体サイズそのものではなく
+        根元・裾を結ぶ直線上の値が使われる(布らしい滑らかさを優先し、
+        個々のリングの厳密な実測値は近似する設計判断)。
+        対象は形状=箱(shape=1)のスカート等下半身系(skirt_rbs)剛体のみ。
+        カプセル/球で表現された揺れ物には適用しない(該当ケースが少なく、
+        「厚み」の解釈がそのままでは成り立たないため安全側で見送り)。
+        注意: PMXのサイズ値が半径相当(half-extent)か全体寸法(full-extent)
+        かは規格上の解釈がツール依存になりうるため、本パラメータは
+        「剛体の最小サイズ成分 × この倍率」という素直な計算に留め、
+        1.0を基準にモデル・実機の見た目で上下に調整することを想定する
+        (collision_margin/hem_extra_margin と同様、値の妥当性は実測ではなく
+        目視で追い込む前提)。
+    lateral_slack_scale : スカートの横リング(隣接パネル間、lateral)の距離拘束に
+        「遊び」を持たせる倍率。デフォルト0.0で無効(既存の常にrest_lenぴったり
+        へ戻すハード等式拘束のまま、既存挙動と完全に同じ)。
+        狙い: PMXの実ジョイントデータを調べたところ、このモデルの横リング
+        ジョイントはバネ定数が完全に0で、移動制限(linearLimitMin/Max)が
+        ±0.017前後(リングにより異なり裾側リングほど大きい傾向)、回転制限
+        ±30°という「範囲内は完全フリー、限界で硬く止まる」設計だった。
+        一方、本ソルバーはこれを常に厳密なrest_len等式拘束として扱っており、
+        伸縮が一切許されないため、フレアスカートが折り紙のように硬く見える
+        一因になっていた(実機フィードバックで確認)。
+        本パラメータを1.0にすると、各横エッジについてextract_chains_bfsが
+        該当ジョイントのlinearLimitMin/Maxから概算した「遊び」量(joint_slack、
+        軸ごとの制限値の絶対値平均)をそのまま使い、距離が
+        [rest_len-遊び, rest_len+遊び] の範囲内なら一切補正しない(本家の
+        バネ定数0ジョイントと同じ「範囲内フリー」を模す)。範囲外に出た
+        フレームだけ、範囲の境界へ押し戻す(rest_lenそのものへは戻さない)。
+        joint_slackが0(縦チェーンなど元々遊びが無いジョイント)の辺は
+        rb_size_margin_scale同様、常にtarget=rest_lenとなり無効化と同じ。
+        1.0を基準に、硬さの残り具合を見ながら調整することを想定する
+        (値の妥当性は実測ではなく目視で追い込む前提、他パラメータと同様)。
+    vertical_spread_scale : コライダーに当たって押し出された1パーティクルの
+        変位を、同じチェーン内で縦方向に隣接する1つ上・1つ下のパーティクル
+        (kinematicアンカーは対象外)へもこの倍率だけ分配する。デフォルト0.0
+        で無効(既存挙動と完全に同じ)。
+        狙い: 本ソルバーは「点」の集まりで、コライダーに当たった段だけが
+        その場で平行移動して押し出されるため、隣の段との間に不連続な段差
+        (輪切り)が出る。実機フィードバックで、片足を上げるなど脚が
+        大きく傾くポーズでスカートに輪切りの段が目立つ一方、本家MMDでは
+        腰元から裾まで滑らかな曲線を描くと報告された。本家は縦ジョイントの
+        移動が完全固定な代わりに回転が非常に自由(実測X軸±80°)で、パネルが
+        平行移動でなく脚の角度に追従して傾くため連続的に見える。本パラメータ
+        は、剛体+回転ジョイントへの全面的な書き換えを行わずに、この「1段
+        だけ飛び出る」効果を緩和する近似策として、押し出し変位を隣接パー
+        ティクルへも滲み出させる(ラプラシアン平滑化に近い後処理)。
+        実装上は、そのフレーム中にresolve_collisionsが実際に押し出した
+        変位の合計(collision_bounceと同じaccum機構を共用)を使い、フレーム
+        につき一度だけ・1ホップ先の隣接パーティクルにのみ適用する(多段階の
+        伝播はしない)。適用は縦方向の長さ拘束の再クランプ(修正3)より前に
+        行うため、分配した後の位置は再クランプでrest_lenへ戻され、伸縮では
+        なく「向き(傾き)」の変化として隣接パーティクルに伝わる。
+        1.0を基準に、輪切りの残り具合を見ながら調整することを想定する
+        (他の実験的パラメータと同様、値の妥当性は目視で追い込む前提)。
+    cloth_algorithm : スカート(skirt_rbs)の解法を選ぶ。デフォルト"points"は
+        既存の点ベース方式(simulate_step_cloth、本ファイルの主力実装、
+        collision_margin/hem_extra_margin/rb_size_margin_scale/
+        lateral_slack_scale/vertical_spread_scale が全て効く)。
+        "rigid_chain"は実験的な板(剛体チェーン)方式で、各段の「姿勢」を
+        独立した物理状態として持ち、慣性・重力トルク・stiffness緩和・
+        本家ジョイント実測の軸別角度制限(X/Y/Z、joint_rot基準)で駆動する
+        (simulate_step_rigid_chain参照)。横リングは"points"と同じ
+        _apply_lateral_constraint(lateral_slack_scale込み)を共有。
+        現時点ではコライダー衝突・適応サブステップ・中間パーティクル補正は
+        rigid_chainに未対応(縦の回転駆動＋横リングのみ)。"points"の
+        gravity_power/stiffness_forceとは数値の意味が違う(位置ベースの
+        線形変位ではなく回転角[ラジアン]で効く)ため、rigid_chain選択時は
+        rigid_chain_gravity_power/rigid_chain_stiffness_force の方を使う。
+    rigid_chain_gravity_power : cloth_algorithm="rigid_chain"専用の重力の
+        強さ(1フレームあたりの回転角[ラジアン]の目安、内部でdt倍される)。
+        既定20.0は実データでの単体検証(裾の偏差角が本家ジョイントのX軸
+        制限=リングにより20〜80°で頭打ちになる)から得た目安値。
+    rigid_chain_stiffness_force : cloth_algorithm="rigid_chain"専用の
+        stiffness(1フレームで偏差をrestへ戻す割合、内部でdt倍後0〜1に
+        クランプ)。既定1.0。値の妥当性は目視で追い込む前提。
+    cloth_algorithm="rigid_body" (Stage 3、実験的): "rigid_chain"(姿勢のみ)
+        では回転しても遠心力で広がらないという実機フィードバックを受け、
+        Bullet(本家)の設計(m_linearVelocity/m_angularVelocityを両方
+        独立に積分)を参考に、並進速度・角速度を両方持つ本物の剛体
+        チェーンとして作り直したもの(RigidBodyXPBD・_rb_step参照)。
+        質量・慣性テンソルはPMX剛体の実サイズ・実質量から計算し、
+        本家ジョイント実測の軸別角度制限も使う。横リングは既存の
+        lateral_slack_scaleと同じ「遊び」概念を剛体の距離拘束として流用。
+        コライダー衝突は重心のみを対象にした簡易版(剛体の厚みは考慮せず
+        並進のみで押し出す、回転は変えない)を実装済み。適応サブステップ・
+        中間パーティクル補正は現時点で未対応。
+    rigid_body_gravity : cloth_algorithm="rigid_body"専用の重力加速度の
+        大きさ(gravity_dir方向、m/s^2相当。既存のgravity_powerとは単位が
+        違う実数値の物理量)。既定9.8(地球の重力加速度)。
+    rigid_body_linear_damping, rigid_body_angular_damping : PMXの各スカート
+        剛体が実際に持つ移動減衰・回転減衰の値に掛ける倍率(既定1.0=モデルの
+        実測値をそのまま使う)。本家のbtRigidBody::applyDamping(1秒あたりの
+        除去割合damping[0..1]に対し (1-damping)^dt で減衰させる指数関数式)
+        と同じ式を使う。これが無いと(摩擦の無い振り子のように)いつまでも
+        大きく揺れ続ける。実測では本モデルのスカートは0.9/0.9(以前この
+        関数の既定値としていた固定0.1/0.3は、モデルによらず全剛体に一律で
+        当てはめていた誤りで、減衰不足の原因になっていた。実機フィード
+        バックで発覚し修正)。
+        【重要な過去のバグ】(1-damping*dt*30)という線形近似の式を一時期
+        使っていたが、damping=0.9のような大きい値では正しい残存率92.6%/
+        フレームに対し誤って10%/フレームまで減衰させてしまい、剛体が
+        実質静止した状態に固まる不具合があった(実機フィードバック
+        「スカートの大半が初期ポーズ位置に残った状態」で発覚、指数関数式
+        へ修正済み)。
+    rigid_body_warmup_seconds : cloth_algorithm="rigid_body"専用の助走時間
+        (秒、frame0の姿勢を保持したまま静かに重力で落ち着かせる時間)。
+        既定20/30秒(既存のwarmup=20フレームと同じ、後方互換)。bind pose
+        から自然に垂れるまでの遷移が急に見える場合、大きくすると効果が
+        ある(実機フィードバックで確認)。"points"/"rigid_chain"のwarmup
+        (既存の変数warmup、20フレーム固定)には影響しない。
+    rigid_body_iterations : cloth_algorithm="rigid_body"専用の反復拘束解決
+        (Gauss-Seidel)の回数。既定4。PMXの実測減衰値(このIAモデルのスカート
+        は0.9/0.9)をそのまま使うと、既定4回では反復が収束しきらずリングが
+        崩れる不具合が実機フィードバックで発覚(減衰を弱めれば見た目は良く
+        なるが、それはモデルの実測値を無視した当て推量になってしまうため
+        避けるべきと判断)。反復回数を増やして収束精度を上げる方向で対応する。
+    rigid_body_prime_full_motion : cloth_algorithm="rigid_body"専用。Trueに
+        すると、本番の記録を始める前に全モーション(num_frames分)を一度
+        通しで動かし(出力は記録しない)、その「落ち着いた」物理状態から
+        frame0の記録をやり直す2パス方式になる。本家VMDビューアの実機
+        フィードバックで判明した仕様(初回再生はframe0の物理がぐちゃぐちゃ
+        だが、一度最後まで再生してframe0に戻ると、体のボーンはキーフレーム
+        通りに戻る一方スカート・髪は最後に落ち着いた状態を引き継ぐため
+        2回目から狙った動きになる)を模したもの。既定Falseで無効(既存挙動
+        と同じ、1パスのみ)。有効にすると変換時間が概ね倍になる。
+    rigid_body_self_collision_scale : スカート自己衝突(_rb_solve_min_
+        separation)の最小距離を、両剛体のhalf_w(サイズのX成分)の合計の
+        何倍にするかの係数。既定1.0(=half_wの合計そのまま)。
+        当初は「bind poseの時点で既に隣接パネルの大半が衝突判定される
+        (実測: IAモデルでは横リング36本全てが違反、最も厳しいペアで距離が
+        しきい値の39.5%)ことが、スカートが初期ポーズ位置に固まって動けなく
+        なる不具合の原因」と誤って判断し0.3まで下げたが、実際の原因は
+        _rb_integrate_predictの減衰式バグ(下記参照)だった。バグ修正後は
+        1.0の方が明らかに良い結果(方位角の隙間が全体を通して健全な範囲に
+        近づく)になることを実機フィードバックで確認済み。0.3等に下げる
+        必要は無いが、他モデルでは調整が必要な場合がある。
+    rigid_body_max_linear_speed, rigid_body_max_angular_speed : 各剛体の
+        並進速度(単位/秒)・角速度(ラジアン/秒)の上限クランプ。既定20.0/30.0。
+        本家Bullet(btRigidBody::integrateVelocities)にも角速度の上限
+        (MAX_ANGVEL=π/2、1ステップでの過大な回転を防ぐ安全装置)があり、
+        この実装には無かったため追加した。アンカーが1フレームで大きく
+        飛ぶ場面(モーション冒頭、rigid_body_prime_full_motion使用時の
+        priming pass→本番パス切り替わり等)で生じる過大な暗黙速度が
+        後続フレームに伝播し続け不安定化する事例(MMD本家にも、モーション
+        読み込み時の急変を物理エンジンが「衝撃」と捉え一部モデルが
+        自己持続的に崩れたまま戻らないという既知の未解決問題があるとの
+        文献調査結果と一致)への対策。
+    rigid_body_substeps : cloth_algorithm="rigid_body"専用。1フレーム
+        (1/fps秒)を何回のサブステップに分けて解くか。既定2。ユーザー情報
+        「本家VMDビューアは60FPSで動いている」(このツールの既定30FPSの
+        2倍の時間解像度)を受けて追加。反復拘束解決(rigid_body_iterations)
+        の回数を増やすのではなく、1ステップあたりの時間刻みそのものを
+        小さくすることで、同じ反復回数でも収束しやすくする狙い。アンカー
+        (前フレームとの間)は位置線形補間・姿勢球面補間(既存の適応サブ
+        ステップ機能が使う_lerp_anchorを共有)で滑らかに繋ぐ。1にすると
+        従来通り1フレーム=1ステップ。
+    segment_aware_collision : cloth_algorithm="points"専用(スカートの
+        state_clothにのみ適用、髪等のstate_otherには影響しない)。既定
+        False。Trueにすると、コライダー衝突の押し出しをパーティクル単体
+        でなく「親→子の区間」に対して判定する(resolve_collisions_segments、
+        resolve_collisionsの代わりに使われる)。従来はある1点だけが衝突
+        検出されるとその点だけが飛び出し、上下の段には何も伝わらないため
+        「階段形状」(片足を上げるポーズでの輪切り感)の一因になっていた
+        (実機フィードバック「本来ならぶつかった点のベクトルがスカート側の
+        点に転写されるべき」を受けて実装)。衝突点が区間の途中(親端・子端
+        ちょうどでない)にあるときは、その位置に応じて押し出しを親・子へ
+        自然に按分する。t=0/1(端点そのもの)のときは既存のresolve_
+        collisionsと完全に同じ結果になる退化ケースとして一致する。
+        vertical_spread_scale(結果を後から一律の割合で隣に配る仕組み)とは
+        独立で併用も可能だが、本機能は衝突の実位置に応じた按分のため、
+        vertical_spread_scaleを弱める・0にしても階段対策の効果が期待できる。
+    skirt_bone_twist : cloth_algorithm="points"専用(スカートのみ、髪には
+        影響しない)。既定False(既存挙動と同じ、スカートボーンの回転出力を
+        常に恒等=親と同じ向きに固定)。Trueにすると、simulate_step_cloth
+        が既に安全クランプ(q_slerp_toward、前フレームから最大60度までしか
+        許容しない)を適用した本物の回転値をそのまま使う。位置(translation)
+        は元々厳密に一致させているので影響を受けず、回転(メッシュのツイスト
+        表現)だけが変わる。実機フィードバック(「区間の中点あたりに横方向へ
+        押し出されたような段ができる、ボーン自体の傾きではない」)を受けて
+        追加: 恒等固定だと区間がどれだけ傾いているかの情報が全部失われ、
+        スキニングの補間が実際の傾きと食い違って段になっていたと判断。
     hem_extra_margin : 各スカートチェーンの根元(腰側)から裾にかけて、0→この値まで
         滑らかに線形補間しながら collision_margin へ上乗せする追加クリアランス
         (根元=0、裾=hem_extra_margin全量)。デフォルト0.0で無効(既存挙動と
@@ -687,6 +931,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # hem_extra_margin は margin へ hem_weight[rb] 倍だけ上乗せする(裾ほど強く、
     # 根元では0=無効)。ON/OFFの段差ではなく、根元から裾へ滑らかに繋げるため。
     hem_weight = {}
+    # 縦方向の隣接パーティクル(1ホップのみ、kinematicアンカーは含めない)。
+    # コライダーに当たって押し出された1段だけが飛び出て輪切りのように
+    # 見える(実機フィードバック: 片足を上げたポーズで顕著)問題への対策
+    # vertical_spread_scale で使う。同じチェーン内で前後1つずつを保持。
+    vertical_neighbors = {}
     for ch in chains:
         dyn = [p for p in ch.particles if p.rb in skirt_rbs and not p.kinematic]
         k = len(dyn)
@@ -694,6 +943,57 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             continue
         for i, p in enumerate(dyn):
             hem_weight[p.rb] = 1.0 if k == 1 else i / (k - 1)
+            nbs = []
+            if i > 0:
+                nbs.append(dyn[i - 1].rb)
+            if i < k - 1:
+                nbs.append(dyn[i + 1].rb)
+            vertical_neighbors[p.rb] = nbs
+
+    # 剛体自身の実サイズ(箱の厚み)を追加クリアランスとして取り込む。
+    # rb_size_margin_scale=0.0(デフォルト)なら空辞書のままで既存挙動と完全に同じ。
+    # 対象は skirt_rbs のうち形状=箱(shape=1)のもののみ。サイズ_x/y/z の
+    # うち最小成分を「厚み方向」とみなし(パネルの回転で押し出し軸がどの
+    # ローカル軸に来るかはモデル依存のため、向きに依らない安全な近似として
+    # 最小成分を使う)、この倍率を掛けた値を rb ごとに保持する。
+    # 各パネル自身の生の値をそのまま使うと、リング(段)ごとに箱の厚みが
+    # 不連続に変わるモデルでは、リングの境目に見た目の「段差」が出てしまう
+    # (実機フィードバックで確認: スカートが布らしくない段差状になる)。
+    # hem_extra_margin と同じ考え方で、チェーンの根元(生値)→裾(生値)を
+    # hem_weight で線形補間し、リング間を滑らかに繋ぐ。
+    rb_size_extra = {}
+    if rb_size_margin_scale > 0.0:
+        _raw_size = {}
+        for _rbi in skirt_rbs:
+            if not (0 <= _rbi < len(rbs_names_all)):
+                continue
+            _rbdef = rbs_names_all[_rbi]
+            if _rbdef.get("shape") != 1:   # 1=箱 以外は対象外
+                continue
+            _sz = [s for s in _rbdef.get("size", ()) if s > 0]
+            if not _sz:
+                continue
+            _raw_size[_rbi] = min(_sz) * rb_size_margin_scale
+        for ch in chains:
+            dyn = [p for p in ch.particles if p.rb in skirt_rbs and not p.kinematic]
+            _dyn_raw = [(p, _raw_size[p.rb]) for p in dyn if p.rb in _raw_size]
+            if not _dyn_raw:
+                continue
+            _root_v = _dyn_raw[0][1]
+            _hem_v = _dyn_raw[-1][1]
+            for p in dyn:
+                if p.rb not in _raw_size:
+                    continue
+                _w = hem_weight.get(p.rb, 0.0)
+                rb_size_extra[p.rb] = _root_v + (_hem_v - _root_v) * _w
+        if rb_size_extra:
+            _vals = list(rb_size_extra.values())
+            print("  [physics] rb_size_margin_scale=%.3f: %d skirt rigid "
+                  "body box(es) contributing extra margin (min=%.4f, max=%.4f, "
+                  "mean=%.4f; smoothed root->hem per chain to avoid ring-to-ring "
+                  "steps)"
+                  % (rb_size_margin_scale, len(rb_size_extra),
+                     min(_vals), max(_vals), sum(_vals) / len(_vals)))
 
     # 横拘束(lateral)はスカートのリング(2次元クロス)専用。髪・ネクタイ・胸などの
     # チェーン型揺れ物は、モデルにストランド間ジョイントがあると非ツリー辺として
@@ -701,12 +1001,20 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # (実測: IAの髪FLB2が頭姿勢に無関係に67°固着。lateral除去で静止1.4°/動的に解放)。
     # lateral は両端がスカート剛体のものだけ残す(髪等のチェーンは lateral=[] が本来の設計)。
     _lat_before = len(lateral)
-    lateral = [(a, b, rl) for (a, b, rl) in lateral
+    lateral = [(a, b, rl, sl, amin, amax, jrot) for (a, b, rl, sl, amin, amax, jrot) in lateral
                if a in skirt_rbs and b in skirt_rbs]
     if _lat_before != len(lateral):
         print("  [physics] dropped %d non-skirt lateral constraint(s) "
               "(hair/necktie/etc. are chains, not cloth)"
               % (_lat_before - len(lateral)))
+    if lateral_slack_scale > 0.0 and lateral:
+        _slacks = [sl * lateral_slack_scale for (_, _, _, sl, _amin, _amax, _jrot) in lateral]
+        _nonzero = [s for s in _slacks if s > 0.0]
+        if _nonzero:
+            print("  [physics] lateral_slack_scale=%.3f: %d/%d lateral edge(s) "
+                  "have nonzero play (min=%.4f, max=%.4f, mean=%.4f)"
+                  % (lateral_slack_scale, len(_nonzero), len(lateral),
+                     min(_nonzero), max(_nonzero), sum(_nonzero) / len(_nonzero)))
 
     init_pos = {}
     for ch in chains:
@@ -729,13 +1037,20 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 if not p.kinematic:
                     exclude_rb.setdefault(p.rb, set()).update(excl)
 
-    # スカート(translation焼き対象)ボーンの回転出力を恒等(親と同じ向き)に固定する。
+    # スカート(translation焼き対象)ボーンの回転出力は、既定では恒等(親と同じ
+    # 向き)に固定する(skirt_bone_twist=False、既存挙動)。
     # 理由: これらのボーンは position(translation) で世界位置を厳密一致させている
     # ため、回転(向き)の値そのものはメッシュのツイスト表現以外に意味を持たない。
     # 一方で回転計算(q_from_to による rest 基準の目標方向)は、乱れたツリー構造
     # (リング横断等)を持つ揺れ物では目標方向と実方向がほぼ正反対になる瞬間があり、
     # 特異点で軸の選び方が不連続になって1フレームで大きく跳ねることがある(実測109°)。
-    # 位置はtranslationで担保済みなので、この跳ねを恒等固定で完全に無効化する。
+    # ただしこの跳ねは simulate_step_cloth 内の q_slerp_toward(前フレームから
+    # 最大MAX_ROT_DEG=60度までしか許容しない安全クランプ)で既に無効化された値が
+    # seg_cloth/seg_otherに入っているため、skirt_bone_twist=Trueにすれば、その
+    # 安全な回転値をそのままメッシュのツイスト表現に使える。実機フィードバック
+    # (「区間の中点あたりに横方向へ押し出されたような段ができる」)は、回転
+    # 情報を丸ごと捨てていたことでメッシュのツイストが表現できず、スキニングの
+    # 補間が実際の傾きと食い違って起きていたと判断し追加。
     skirt_bone_set = set(p.bone for ch in chains for p in ch.particles if p.rb in skirt_rbs)
 
     # ======================================================================
@@ -764,14 +1079,323 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     state_other = SpringState(chains_other)
     dt = 1.0 / fps
 
+    # cloth_algorithm="rigid_chain"用の永続状態(各パーティクルの世界姿勢と
+    # その前フレーム値。慣性はこの世界姿勢の差分で計算する。世界姿勢基準の
+    # 理由はsimulate_step_rigid_chainのdocstring参照)。
+    # フレームをまたいで保持する必要があるため、ここでstate_clothに載せておく
+    # (SpringStateの通常の属性ではないが、Pythonのオブジェクトなので自由に追加できる)。
+    # "points"(既定)では一切参照されない。
+    if cloth_algorithm == "rigid_chain":
+        state_cloth.world_q = {}
+        state_cloth.prev_world_q = {}
+
+    # cloth_algorithm="rigid_body"用のセットアップ(Stage 3: 並進+角速度を
+    # 持つ本物の剛体チェーン)。ここで一度だけ剛体・拘束ペアを構築し、
+    # 本ループでは毎フレームこれらを反復拘束解決するだけにする。
+    if cloth_algorithm == "rigid_body":
+        def _rb_basis_quat(y_axis, x_ref):
+            """y_axis(単位ベクトル)をローカル+Yに、x_ref方向をできるだけ
+            ローカル+Xに近づけた正規直交基底からクォータニオンを作る
+            (グラム・シュミット直交化)。q_from_toだけだと軸まわりの捻り
+            (ロール)が不定になり、横リングの接続点が実際の隣接パネル方向を
+            向かずリングが崩れて1箇所に寄る不具合が実機フィードバックで
+            見つかったため、横方向も明示的に固定する。
+            """
+            y = _norm(y_axis)
+            x = _sub(x_ref, _scale(y, _dot(x_ref, y)))
+            xl = _len(x)
+            if xl < 1e-6:
+                arbitrary = (1.0, 0.0, 0.0) if abs(y[0]) < 0.9 else (0.0, 0.0, 1.0)
+                x = _sub(arbitrary, _scale(y, _dot(arbitrary, y)))
+                xl = _len(x)
+            x = _scale(x, 1.0 / xl) if xl > 1e-9 else (1.0, 0.0, 0.0)
+            z = _cross(x, y)
+            m = [[x[0], y[0], z[0], 0.0],
+                 [x[1], y[1], z[1], 0.0],
+                 [x[2], y[2], z[2], 0.0],
+                 [0.0, 0.0, 0.0, 1.0]]
+            _, q = mat_to_trs(m)
+            return q
+
+        # 各スカート剛体について、横リングでつながる隣接剛体を1つ探し、
+        # bind pose での実際の方向をローカル+Xの参照として使う。
+        _rb_lateral_ref = {}
+        for (a_rb, b_rb, _rl, _sl, _amin, _amax, _jrot) in lateral:
+            if a_rb in skirt_rbs and b_rb in skirt_rbs:
+                _rb_lateral_ref.setdefault(a_rb, b_rb)
+                _rb_lateral_ref.setdefault(b_rb, a_rb)
+
+        rb_bodies = {}          # rb_index(動的パーティクル) -> RigidBodyXPBD
+        rb_anchor_bodies = {}   # rb_index(kinematicアンカー) -> RigidBodyXPBD
+        rb_vert_pairs = []      # (親body, 子body, 親がアンカーか)
+        for ch in chains_cloth:
+            plist = ch.particles
+            anchor_p = plist[0]
+            if anchor_p.rb not in rb_anchor_bodies:
+                rb_anchor_bodies[anchor_p.rb] = RigidBodyXPBD(
+                    anchor_p.rb, pos=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0, 1.0),
+                    mass=1.0, half_extents=(0.05, 0.05, 0.05), half_len=0.01,
+                    kinematic=True)
+            prev_body = rb_anchor_bodies[anchor_p.rb]
+            prev_is_anchor = True
+            for k in range(1, len(plist)):
+                c = plist[k]; pa = plist[k-1]
+                if c.rb in rb_bodies:
+                    prev_body = rb_bodies[c.rb]; prev_is_anchor = False
+                    continue
+                rb_def = rbs_names_all[c.rb] if 0 <= c.rb < len(rbs_names_all) else {}
+                mass = rb_def.get("mass", 1.0) or 1.0
+                size = rb_def.get("size", (0.05, 0.05, 0.05))
+                half_extents = tuple(max(s, 1e-4) for s in size) if size else (0.05, 0.05, 0.05)
+                half_len = max(c.rest_len * 0.5, 1e-4)
+                mid = tuple((x + y) * 0.5 for x, y in zip(pa.rest_pos, c.rest_pos)) \
+                    if (pa.rest_pos and c.rest_pos) else (0.0, 0.0, 0.0)
+                rest_dir_local = state_cloth.rest_dir.get(c.rb, (0.0, -1.0, 0.0))
+                parent_dir = tuple(-x for x in rest_dir_local)
+                nb_rb = _rb_lateral_ref.get(c.rb)
+                nb_particle = parts.get(nb_rb) if nb_rb is not None else None
+                if nb_particle is not None and nb_particle.rest_pos and c.rest_pos:
+                    x_ref = _sub(nb_particle.rest_pos, c.rest_pos)
+                else:
+                    x_ref = (1.0, 0.0, 0.0)
+                init_rot = _rb_basis_quat(parent_dir, x_ref)
+                # PMXの実データが持つ移動減衰・回転減衰をそのまま使う(実測:
+                # IAモデルのスカートは0.9/0.9。取得できない場合のみ0.1/0.3を保険で使う)。
+                _lin_d = rb_def.get("linearDamping", 0.1)
+                _ang_d = rb_def.get("angularDamping", 0.3)
+                body = RigidBodyXPBD(c.rb, pos=mid, rot=init_rot, mass=mass,
+                                     half_extents=half_extents, half_len=half_len,
+                                     kinematic=False, ang_min=c.ang_min, ang_max=c.ang_max,
+                                     joint_rot=c.joint_rot,
+                                     lin_damping=_lin_d, ang_damping=_ang_d)
+                rb_bodies[c.rb] = body
+                rb_vert_pairs.append((prev_body, body, prev_is_anchor))
+                prev_body = body; prev_is_anchor = False
+        rb_lateral_pairs = [(a, b, rl, sl, amin, amax, jrot)
+                           for (a, b, rl, sl, amin, amax, jrot) in lateral
+                           if a in rb_bodies and b in rb_bodies]
+        # 本家PMXの実データを確認したところ、スカート剛体は全て同じグループ
+        # (group=2)で、非衝突マスクの自グループビットが0(=衝突する)になって
+        # いた。つまり本家は「横リングで繋がった隣接パネルだけ」でなく、
+        # 「全スカート剛体同士」が物理的に衝突するよう作者が意図的に設定して
+        # いたと判明(実機フィードバックで発覚した、リングが崩れる問題の根本
+        # 原因)。それに合わせ全ペアの自己衝突を行うが、36枚(630組)は純
+        # Pythonには重いため、bind pose時点で十分離れている組は事前に除外
+        # する(激しい動きでも触れ得るのは元々近いパネル同士が主、という
+        # 前提の近似。既存の「今風にもっともらしく揺れればOK」という設計
+        # 方針とも整合)。
+        _rb_body_list = list(rb_bodies.values())
+        _rb_bind_pos = {b.rb: b.pos for b in _rb_body_list}
+        _rb_self_coll_max_dist = 0.0
+        for b in _rb_body_list:
+            _rb_self_coll_max_dist = max(_rb_self_coll_max_dist, b.half_w)
+        _rb_self_coll_threshold = _rb_self_coll_max_dist * 6.0
+        rb_self_collision_pairs = []
+        for i in range(len(_rb_body_list)):
+            for j in range(i + 1, len(_rb_body_list)):
+                A, B = _rb_body_list[i], _rb_body_list[j]
+                if _len(_sub(A.pos, B.pos)) <= _rb_self_coll_threshold:
+                    rb_self_collision_pairs.append((A, B))
+        rb_lin_damping = rigid_body_linear_damping
+        rb_ang_damping = rigid_body_angular_damping
+        rb_gravity_vec = _scale(_norm(gravity_dir), rigid_body_gravity)
+        print("  [physics] cloth_algorithm=rigid_body: %d body(ies), %d vertical "
+              "constraint(s), %d lateral constraint(s), %d self-collision pair(s) "
+              "(of %d possible, bind-distance filtered)"
+              % (len(rb_bodies), len(rb_vert_pairs), len(rb_lateral_pairs),
+                 len(rb_self_collision_pairs),
+                 len(_rb_body_list) * (len(_rb_body_list) - 1) // 2))
+
+        def _rb_step(anchor_frame, colliders_frame=None, step_dt=None):
+            """1フレーム(またはサブステップ)分の剛体チェーン解決。
+            anchor_frame: {rb: (pos, rot)}。colliders_frame: そのフレームの
+            コライダーリスト(resolve_collisionsと同じ形式)。Noneなら衝突判定
+            なし(Stage 3序盤の挙動と同じ)。step_dt: このステップの時間刻み
+            (省略時は1/fps。rigid_body_substeps>1のときは1/fpsをさらに割った
+            値を渡す)。state_cloth.pos と戻り値のseg_rot(bone単位)を、既存の
+            出力パイプライン(seg_rot_to_local・位置ベイク)がそのまま使える
+            形で更新する。
+            """
+            sdt = step_dt if step_dt is not None else dt
+            pred = {}
+            for rb, ab in rb_anchor_bodies.items():
+                a_pos, a_rot = anchor_frame.get(rb, (ab.pos, ab.rot))
+                ab.pos, ab.rot = a_pos, a_rot
+                pred[id(ab)] = (a_pos, a_rot)
+            for b in rb_bodies.values():
+                pred[id(b)] = _rb_integrate_predict(b, rb_gravity_vec, sdt,
+                                                    rb_lin_damping, rb_ang_damping)
+
+            for _ in range(rigid_body_iterations):
+                for (A, B, A_is_anchor) in rb_vert_pairs:
+                    pA, rA = pred[id(A)]; pB, rB = pred[id(B)]
+                    pA, rA, pB, rB = _rb_solve_point_constraint(
+                        pA, rA, A.inv_mass, A.inv_inertia_body, A.kinematic,
+                        (0.0, 0.0, 0.0) if A_is_anchor else A.attach_child_local,
+                        pB, rB, B.inv_mass, B.inv_inertia_body, B.kinematic,
+                        B.attach_parent_local)
+                    if B.ang_max is not None:
+                        rA, rB = _rb_solve_angle_limit(
+                            rA, rB, A.inv_inertia_body, B.inv_inertia_body,
+                            A.kinematic, B.kinematic, B.ang_min, B.ang_max, B.joint_rot)
+                    pred[id(A)] = (pA, rA); pred[id(B)] = (pB, rB)
+                for (a_rb, b_rb, rl, sl, amin, amax, jrot) in rb_lateral_pairs:
+                    A = rb_bodies[a_rb]; B = rb_bodies[b_rb]
+                    pA, rA = pred[id(A)]; pB, rB = pred[id(B)]
+                    pA, rA, pB, rB = _rb_solve_distance_constraint(
+                        pA, rA, A.inv_mass, A.inv_inertia_body, A.kinematic, (A.half_w, 0.0, 0.0),
+                        pB, rB, B.inv_mass, B.inv_inertia_body, B.kinematic, (-B.half_w, 0.0, 0.0),
+                        rl, sl * lateral_slack_scale)
+                    if amin is not None:
+                        rA, rB = _rb_solve_angle_limit(
+                            rA, rB, A.inv_inertia_body, B.inv_inertia_body,
+                            A.kinematic, B.kinematic, amin, amax, jrot)
+                    pred[id(A)] = (pA, rA); pred[id(B)] = (pB, rB)
+                # 本家のPMXグループ設定(スカート同士は自グループ衝突が有効)を
+                # 再現する全ペア自己衝突。PMXの実測減衰値(例: 0.9/0.9)を使う
+                # 場合、反復の外で1回だけだと収束不足でリングが崩れると実機
+                # フィードバックで発覚したため、精度を優先し反復の中に戻した
+                # (速度は犠牲になるが、モデルの実測値を歪めるよりはこちらを
+                # 優先すべきとの判断)。
+                for (A, B) in rb_self_collision_pairs:
+                    pA, rA = pred[id(A)]; pB, rB = pred[id(B)]
+                    pA, pB = _rb_solve_min_separation(
+                        pA, A.inv_mass, A.kinematic, pB, B.inv_mass, B.kinematic,
+                        (A.half_w + B.half_w) * rigid_body_self_collision_scale)
+                    pred[id(A)] = (pA, rA); pred[id(B)] = (pB, rB)
+                if colliders_frame:
+                    for rb, b in rb_bodies.items():
+                        pB, rB = pred[id(b)]
+                        pB = _rb_solve_collision_pos(pB, colliders_frame, collision_margin)
+                        pred[id(b)] = (pB, rB)
+
+            for b in rb_bodies.values():
+                pos_new, rot_new = pred[id(b)]
+                new_vel = _scale(_sub(pos_new, b.pos), 1.0 / sdt)
+                dq = q_mul(rot_new, q_conj(b.rot))
+                if dq[3] < 0:
+                    dq = tuple(-c for c in dq)
+                al = _len(dq[:3])
+                new_omega = _scale(dq[:3], 2.0 / sdt) if al > 1e-9 else (0.0, 0.0, 0.0)
+                # 本家Bullet(btRigidBody::integrateVelocities)にも角速度の上限
+                # クランプ(MAX_ANGVEL=π/2)があり、1ステップでの過大な暗黙速度
+                # による不安定化を防いでいる。この実装には無かったため追加。
+                # 特にモーション冒頭やpriming pass直後のように、アンカーが
+                # 1フレームで大きく飛ぶ場面で、そこから生じる過大な速度が
+                # 次フレーム以降も伝播し続けて「一度崩れると戻らない」不安定化
+                # を招く一因と考えられる(実機/文献調査で判明: MMD本家にも
+                # モーション読み込み時の急変を物理エンジンが「衝撃」と捉え、
+                # 一部モデルは自己持続的に崩れたまま戻らないという既知の未解決
+                # 問題があり、他エンジンの変更履歴にも「生成直後にポーズが
+                # 急変した場合はジャンプさせない」という同種の対策が見られる)。
+                vlen = _len(new_vel)
+                if vlen > rigid_body_max_linear_speed:
+                    new_vel = _scale(new_vel, rigid_body_max_linear_speed / vlen)
+                olen = _len(new_omega)
+                if olen > rigid_body_max_angular_speed:
+                    new_omega = _scale(new_omega, rigid_body_max_angular_speed / olen)
+                b.vel = new_vel
+                b.omega = new_omega
+                b.pos, b.rot = pos_new, rot_new
+
+            seg = {}
+            for rb, body in rb_bodies.items():
+                child_world = _add(body.pos, q_rotate_vec(body.rot, (0.0, -body.half_len, 0.0)))
+                state_cloth.pos[rb] = child_world
+                rdir = state_cloth.rest_dir.get(rb)
+                if rdir is not None:
+                    parent_world = _add(body.pos, q_rotate_vec(body.rot, (0.0, body.half_len, 0.0)))
+                    cur_dir = _norm(_sub(child_world, parent_world))
+                    seg[rb] = q_from_to(rdir, cur_dir)
+            return seg
+
+        def _rb_step_substeps(anchor_prev, anchor_cur, colliders_frame, n_sub):
+            """1フレームをn_sub個のサブステップに分割し、アンカーの位置・姿勢を
+            区間内で補間しながら_rb_stepを複数回呼ぶ。VMDViewerが60FPS(=この
+            ツールの既定30FPSの倍の時間解像度)で動いているとの実機情報を受け、
+            1ステップあたりの誤差を小さくして反復拘束解決の収束を助ける狙い。
+            anchor_prev: 前フレームのアンカー({rb:(pos,rot)}、フレーム0では
+            anchor_curと同じものを渡せば補間なしで従来と同じ挙動になる)。
+            戻り値: 最後のサブステップのseg(出力用、中間は使わない)。
+            """
+            if n_sub <= 1:
+                return _rb_step(anchor_cur, colliders_frame, step_dt=dt)
+            seg = None
+            sdt = dt / n_sub
+            for i in range(1, n_sub + 1):
+                t = i / n_sub
+                a_interp = _lerp_anchor(anchor_prev, anchor_cur, t)
+                seg = _rb_step(a_interp, colliders_frame, step_dt=sdt)
+            return seg
+
+    def _lerp(a, b, t):
+        return _add(a, _scale(_sub(b, a), t))
+
+    def _slerp_q(a, b, t):
+        d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
+        if d < 0.0:
+            b = (-b[0], -b[1], -b[2], -b[3]); d = -d
+        d = max(-1.0, min(1.0, d))
+        theta0 = math.acos(d)
+        if theta0 < 1e-9:
+            return a
+        theta = theta0 * t
+        s0 = math.sin(theta0 - theta) / math.sin(theta0)
+        s1 = math.sin(theta) / math.sin(theta0)
+        return (a[0]*s0+b[0]*s1, a[1]*s0+b[1]*s1,
+               a[2]*s0+b[2]*s1, a[3]*s0+b[3]*s1)
+
+    def _lerp_anchor(a_prev, a_cur, t):
+        out = {}
+        for rb, (p, q) in a_cur.items():
+            pp, pq = a_prev.get(rb, (p, q))
+            out[rb] = (_lerp(pp, p, t), _slerp_q(pq, q, t))
+        return out
+
     def _set_anchors(state, a):
         for rb, (wp, wr) in a.items():
             if rb in state.part:
                 state.set_anchor(rb, wp, wr)
 
+    def _resync_rigid_chain_after_lateral(seg_cloth_dict):
+        """横リング拘束(_apply_lateral_constraint)がstate_cloth.posを直接
+        書き換えた後、cloth_algorithm="rigid_chain"のworld_q/seg_rotを
+        「実際に置かれた位置」に合わせて再計算する。これをしないと、次
+        フレームの慣性(world_qの差分)が横方向の補正を反映せず、姿勢と
+        位置が食い違ったまま蓄積してしまう。simulate_step_rigid_chain
+        と同じトップダウン連鎖規則(q_par)で、全スカートパーティクルを
+        位置から素直に再計算するだけ(角度制限などの再適用はしない、
+        横方向の補正量は通常小さいため次フレームの積分で自然に収束する)。
+        warmupループ・本ループの両方から使うため、ここ(warmupより前)で定義する。
+        """
+        pos = state_cloth.pos
+        for ch in state_cloth.chains:
+            plist = ch.particles
+            q_par = state_cloth._anchor_rot.get(plist[0].rb, (0.0, 0.0, 0.0, 1.0)) \
+                if plist[0].kinematic else (0.0, 0.0, 0.0, 1.0)
+            for k in range(1, len(plist)):
+                c = plist[k]; pa = plist[k-1]
+                rdir = state_cloth.rest_dir.get(c.rb)
+                if rdir is None:
+                    q_par = seg_cloth_dict.get(c.rb, q_par)
+                    continue
+                tgt_dir = q_rotate_vec(q_par, rdir)
+                cur_dir = _norm(_sub(pos[c.rb], pos[pa.rb]))
+                new_wq = q_mul(q_from_to(tgt_dir, cur_dir), q_par)
+                if c.inv_mass > 0:
+                    state_cloth.world_q[c.rb] = new_wq
+                seg_cloth_dict[c.rb] = new_wq
+                q_par = seg_cloth_dict[c.rb]
+
     warmup = 20   # 修正1のinit_posシードで十分。warmup増は髪の揺れを損なうため20維持
+    # cloth_algorithm="rigid_body"は、上のwarmupとは独立したフレーム数を使う。
+    # bind poseから重力で自然に垂れるまでの「助走」がここに20フレーム
+    # (0.67秒)しか無いと、遷移が急に見えるという実機フィードバックを受けて
+    # 分離した(点ベース/rigid_chainのwarmupは既存のまま変更しない)。
+    warmup_rigid_body = max(warmup, int(round(rigid_body_warmup_seconds * fps)))
     a0 = anchor_fn(0)
-    for _ in range(warmup):
+    _warmup_this_algo = warmup_rigid_body if cloth_algorithm == "rigid_body" else warmup
+    for _ in range(_warmup_this_algo):
         _set_anchors(state_other, a0)
         _set_anchors(state_cloth, a0)
         simulate_step_cloth(state_other, gravity_dir, dt, drag_force, stiffness_force,
@@ -780,14 +1404,57 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                             radial_rbs=skirt_rbs, margin=collision_margin,
                             exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                             allowed_collider_rbi=allowed_collider_rbi,
-                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
-        simulate_step_cloth(state_cloth, gravity_dir, dt, drag_force, stiffness_force,
-                            lateral, gravity_power=gravity_power, iterations=6,
-                            colliders=colliders_at(0), body_axis=body_axis_at(0),
-                            radial_rbs=skirt_rbs, margin=collision_margin,
-                            exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
-                            allowed_collider_rbi=allowed_collider_rbi,
-                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                            collision_bounce=collision_bounce,
+                            extra_margin_by_rb=rb_size_extra,
+                            lateral_slack_scale=lateral_slack_scale,
+                            vertical_spread_scale=vertical_spread_scale,
+                            vertical_neighbors=vertical_neighbors)
+        if cloth_algorithm == "rigid_chain":
+            _warmup_seg = simulate_step_rigid_chain(
+                state_cloth.chains, state_cloth.rest_dir, {}, state_cloth.part,
+                state_cloth.pos, state_cloth._anchor_rot,
+                state_cloth.world_q, state_cloth.prev_world_q,
+                gravity_dir, dt, drag_force, rigid_chain_stiffness_force,
+                gravity_power=rigid_chain_gravity_power)
+            _apply_lateral_constraint(state_cloth.pos, state_cloth.part,
+                                      lateral, lateral_slack_scale)
+            _resync_rigid_chain_after_lateral(_warmup_seg)
+        elif cloth_algorithm == "rigid_body":
+            _rb_step_substeps(a0, a0, colliders_at(0), rigid_body_substeps)
+        else:
+            simulate_step_cloth(state_cloth, gravity_dir, dt, drag_force, stiffness_force,
+                                lateral, gravity_power=gravity_power, iterations=6,
+                                colliders=colliders_at(0), body_axis=body_axis_at(0),
+                                radial_rbs=skirt_rbs, margin=collision_margin,
+                                exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
+                                allowed_collider_rbi=allowed_collider_rbi,
+                                hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                collision_bounce=collision_bounce,
+                                extra_margin_by_rb=rb_size_extra,
+                                lateral_slack_scale=lateral_slack_scale,
+                                vertical_spread_scale=vertical_spread_scale,
+                                vertical_neighbors=vertical_neighbors,
+                                segment_aware_collision=segment_aware_collision)
+
+    # cloth_algorithm="rigid_body"専用: 全モーションを通しで一度「助走」させて
+    # から、frame0から本番の記録をやり直す2パス方式。実機フィードバックで
+    # 判明した本家VMDビューアの仕様(初回再生はフレーム0の物理がぐちゃぐちゃ
+    # だが、一度最後まで再生してフレーム0に戻ると、体のボーンはframe0の
+    # キーフレームに戻る一方、物理(スカート・髪)は最後に落ち着いた状態を
+    # 引き継ぐため2回目から狙った動きになる)を模す。1パス目は出力を記録
+    # しない(体の姿勢だけ動かし、rb_bodiesの状態を実際の全モーション分
+    # 動かしておく)。
+    if cloth_algorithm == "rigid_body" and rigid_body_prime_full_motion:
+        print("  [physics] rigid_body: priming pass over the full motion "
+              "(%d frames) before the recorded pass, matching the real "
+              "MMD viewer's 'first playthrough settles physics' behavior"
+              % num_frames)
+        prev_a_prime = anchor_fn(0)
+        for f in range(num_frames):
+            a_prime = anchor_fn(f)
+            _rb_step_substeps(prev_a_prime, a_prime, colliders_at(f), rigid_body_substeps)
+            prev_a_prime = a_prime
 
     # ------------------------------------------------------------------
     # 適応サブステップ(布のみ対象): フレーム間の「布アンカー変位＋近傍コライダー
@@ -858,30 +1525,6 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             return 1
         n = math.ceil(best_ratio / adaptive_substep_threshold)
         return max(1, min(adaptive_substep_max_n, n))
-
-    def _lerp(a, b, t):
-        return _add(a, _scale(_sub(b, a), t))
-
-    def _slerp_q(a, b, t):
-        d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
-        if d < 0.0:
-            b = (-b[0], -b[1], -b[2], -b[3]); d = -d
-        d = max(-1.0, min(1.0, d))
-        theta0 = math.acos(d)
-        if theta0 < 1e-9:
-            return a
-        theta = theta0 * t
-        s0 = math.sin(theta0 - theta) / math.sin(theta0)
-        s1 = math.sin(theta) / math.sin(theta0)
-        return (a[0]*s0+b[0]*s1, a[1]*s0+b[1]*s1,
-               a[2]*s0+b[2]*s1, a[3]*s0+b[3]*s1)
-
-    def _lerp_anchor(a_prev, a_cur, t):
-        out = {}
-        for rb, (p, q) in a_cur.items():
-            pp, pq = a_prev.get(rb, (p, q))
-            out[rb] = (_lerp(pp, p, t), _slerp_q(pq, q, t))
-        return out
 
     def _lerp_colliders(cols_prev, cols_cur, t):
         prev_by_rbi = {c[-1]: c for c in cols_prev}
@@ -963,7 +1606,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         n_samples = max(1, midpoint_correction_samples)
         ts = [si / (n_samples + 1) for si in range(1, n_samples + 1)]
         for _ in range(midpoint_correction_iters):
-            for rb_a, rb_b, rest_len in lateral:
+            for rb_a, rb_b, rest_len, _lat_slack, _amin, _amax, _jrot in lateral:
                 pa = state_cloth.part.get(rb_a)
                 pb = state_cloth.part.get(rb_b)
                 if pa is None or pb is None:
@@ -973,7 +1616,10 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 # エッジの深さは両端パーティクルの hem_weight の平均。
                 # hem_extra_margin=0 なら加算0で従来挙動と完全に同じ。
                 _hw = (hem_weight.get(rb_a, 0.0) + hem_weight.get(rb_b, 0.0)) * 0.5
-                _edge_extra = hem_extra_margin * _hw
+                # rb_size_extra(剛体実サイズ由来)も同様に両端の平均をボーン本体と
+                # 一貫適用する。rb_size_margin_scale=0.0(既定)なら常に空辞書で加算0。
+                _rse = (rb_size_extra.get(rb_a, 0.0) + rb_size_extra.get(rb_b, 0.0)) * 0.5
+                _edge_extra = hem_extra_margin * _hw + _rse
                 for t in ts:
                     if pa.kinematic:
                         if rb_a not in a_full:
@@ -1039,10 +1685,21 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
 
     prev_anchor_full = a0            # frame -1相当 = warmupの最終姿勢(frame0と同じ)
     prev_colliders_full = colliders_at(0)
+    # 適応サブステップの発動回数を集計するカウンタ。以前はn_sub>1のフレームで
+    # 毎回1行printしていたが、発動率が高いモーションでは数千行に達し
+    # (実測: ぽんぷで7000フレーム中2820フレーム)、ログの可読性を落とすだけで
+    # なくGUI側のテキスト挿入負荷にもなっていた。実際に発動したかどうかの
+    # 情報自体はベイク結果に一切影響しない診断用の出力なので、定期的な進捗
+    # 表示にまとめて件数だけ載せる形に変更(この変更はログ出力のみで、物理
+    # 計算・ベイク結果には無関係)。
+    _substep_fire_total = 0
+    _substep_fire_since_checkpoint = 0
 
     for f in range(num_frames):
         if f % 500 == 0 and f > 0:
-            print("  [physics]   frame %d/%d" % (f, num_frames))
+            print("  [physics]   frame %d/%d (substep fired %d since last)"
+                  % (f, num_frames, _substep_fire_since_checkpoint))
+            _substep_fire_since_checkpoint = 0
         a = anchor_fn(f)
         cols_f = colliders_at(f)
         body_axis_f = body_axis_at(f)
@@ -1054,7 +1711,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 _collider_centers(prev_colliders_full, _substep_allowed_rbi),
                 _collider_centers(cols_f, _substep_allowed_rbi))
             if n_sub > 1:
-                print("  [physics]   substep N=%d at frame %d" % (n_sub, f))
+                _substep_fire_total += 1
+                _substep_fire_since_checkpoint += 1
 
         # 髪等(state_other)は常にN=1・無改造
         _set_anchors(state_other, a)
@@ -1065,9 +1723,37 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                         radial_rbs=skirt_rbs, margin=collision_margin,
                                         exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                                         allowed_collider_rbi=allowed_collider_rbi,
-                                        hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+                                        hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                        collision_bounce=collision_bounce,
+                                        extra_margin_by_rb=rb_size_extra,
+                                        lateral_slack_scale=lateral_slack_scale,
+                                        vertical_spread_scale=vertical_spread_scale,
+                                        vertical_neighbors=vertical_neighbors)
 
-        if n_sub <= 1:
+        if cloth_algorithm == "rigid_chain":
+            # 【実験的】板(剛体チェーン)方式。適応サブステップ・中間パーティクル
+            # 補正・コライダー衝突は現時点で未対応(縦の回転駆動＋横リングのみ、
+            # Stage 1/2のスコープ)。n_subは"points"専用の機構なので参照しない。
+            _set_anchors(state_cloth, a)
+            seg_cloth = simulate_step_rigid_chain(
+                state_cloth.chains, state_cloth.rest_dir, {}, state_cloth.part,
+                state_cloth.pos, state_cloth._anchor_rot,
+                state_cloth.world_q, state_cloth.prev_world_q,
+                gravity_dir, dt, drag_force, rigid_chain_stiffness_force,
+                gravity_power=rigid_chain_gravity_power)
+            _apply_lateral_constraint(state_cloth.pos, state_cloth.part,
+                                      lateral, lateral_slack_scale)
+            _resync_rigid_chain_after_lateral(seg_cloth)
+        elif cloth_algorithm == "rigid_body":
+            # 【実験的 Stage 3】並進+角速度を持つ本物の剛体チェーン。適応
+            # サブステップ・中間パーティクル補正は現時点で未対応(縦の点拘束+
+            # 角度制限＋横リング距離拘束＋簡易衝突押し出しのみ)。
+            # _set_anchorsはseg_rot_to_local用にstate_cloth._anchor_rotを
+            # 更新するために必要(剛体自体のアンカー位置はrb_anchor_bodies側で
+            # 個別に管理している)。
+            _set_anchors(state_cloth, a)
+            seg_cloth = _rb_step_substeps(prev_anchor_full, a, cols_f, rigid_body_substeps)
+        elif n_sub <= 1:
             # 不発動フレーム: これまでと完全に同じ1回呼び出し(ビット単位で一致)。
             _set_anchors(state_cloth, a)
             seg_cloth = simulate_step_cloth(state_cloth, gravity_dir, dt, drag_force,
@@ -1077,7 +1763,13 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                             radial_rbs=skirt_rbs, margin=collision_margin,
                                             exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                                             allowed_collider_rbi=allowed_collider_rbi,
-                                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+                                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                            collision_bounce=collision_bounce,
+                                            extra_margin_by_rb=rb_size_extra,
+                                            lateral_slack_scale=lateral_slack_scale,
+                                            vertical_spread_scale=vertical_spread_scale,
+                                            vertical_neighbors=vertical_neighbors,
+                                            segment_aware_collision=segment_aware_collision)
             if _midpoint_enabled:
                 # N=1(実質1サブステップ)のフレームでは、通常呼び出し直後に1回だけ補正。
                 _apply_midpoint_correction(a, cols_f)
@@ -1099,7 +1791,13 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                                 radial_rbs=skirt_rbs, margin=collision_margin,
                                                 exclude_rb=exclude_rb, skip_angle_clamp_rbs=skirt_rbs,
                                                 allowed_collider_rbi=allowed_collider_rbi,
-                                                hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+                                                hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                                collision_bounce=collision_bounce,
+                                                extra_margin_by_rb=rb_size_extra,
+                                                lateral_slack_scale=lateral_slack_scale,
+                                                vertical_spread_scale=vertical_spread_scale,
+                                                vertical_neighbors=vertical_neighbors,
+                                                segment_aware_collision=segment_aware_collision)
                 if _midpoint_enabled:
                     # 「逆順」= サブステップ1回ごとに毎回補正をかける。フレーム
                     # 終わりに1回だけ補正するより、検証の結果わずかに有利
@@ -1109,9 +1807,10 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         loc = {}
         loc.update(seg_rot_to_local(state_other, seg_other))
         loc.update(seg_rot_to_local(state_cloth, seg_cloth))
-        for bone in skirt_bone_set:
-            if bone in loc:
-                loc[bone] = (0.0, 0.0, 0.0, 1.0)
+        if not skirt_bone_twist:
+            for bone in skirt_bone_set:
+                if bone in loc:
+                    loc[bone] = (0.0, 0.0, 0.0, 1.0)
         for bone, q in loc.items():
             keys.setdefault(bone, []).append((f, q))
         # スカート(skirt_rbs)は位置も焼く: 回転のみだとボーン長が rest 固定で、
@@ -1146,6 +1845,10 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         prev_anchor_full = a
         prev_colliders_full = cols_f
 
+    if _substep_enabled:
+        print("  [physics] adaptive substep total: fired on %d/%d frames"
+              % (_substep_fire_total, num_frames))
+
     out = {}
     for bone, ks in keys.items():
         ks.sort(key=lambda x: x[0])
@@ -1160,12 +1863,53 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
 # ======================================================================
 # クロス対応: BFSベースのチェーン抽出（リング構造を正しく分解）
 # ======================================================================
+def _joint_lateral_slack(j):
+    """joint の linearLimitMin/Max(既にglTFスケール済み)から、横距離拘束用の
+    「遊び」量をスカラーで概算する。本家の6DOFジョイントは軸ごとの箱形制限
+    だが、この簡易ソルバーは1本のスカラー距離拘束しか持たないため、各軸の
+    絶対値の平均を代表値として使う(このモデルでは等方的な値が入っている
+    ことを実測確認済み)。linearLimitMin/Maxが無い/取得できない場合は0。
+    """
+    mn = j.get("linearLimitMin")
+    mx = j.get("linearLimitMax")
+    if not mn or not mx:
+        return 0.0
+    vals = [abs(v) for v in list(mn) + list(mx)]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _joint_lateral_angle_info(j):
+    """joint の angularLimitMin/Max/rotation(YXZオイラー角、既にglTFスケール
+    済み)をそのまま(ang_min, ang_max, joint_rot)として返す。cloth_algorithm=
+    "rigid_body"の横リング角度制限(_rb_solve_angle_limit)で、縦の関節と
+    全く同じ仕組みで使う。距離拘束(_joint_lateral_slack)しか実装していな
+    かった旧版は、横方向の「向き」を拘束しておらず各パネルの局所X軸が
+    バラバラにずれてリングが崩れる不具合の原因になっていた(実機フィード
+    バックで発覚)。角度制限データが取得できない場合はNoneを返す。
+    """
+    amin = j.get("angularLimitMin")
+    amax = j.get("angularLimitMax")
+    jrot = j.get("rotation")
+    if not amin or not amax:
+        return None, None, None
+    return tuple(amin), tuple(amax), (tuple(jrot) if jrot else (0.0, 0.0, 0.0, 1.0))
+
+
 def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
     """アンカー(mode0剛体)からのBFSで親を決め、縦チェーン＋横距離拘束に分解。
     髪(単純チェーン)もスカート(リング)も統一的に扱える。
 
     戻り値: (chains, parts, excluded, lateral)
-      lateral = [(rb_i, rb_j, rest_len), ...]  非ツリー辺（横リング）の距離拘束
+      lateral = [(rb_i, rb_j, rest_len, joint_slack, ang_min, ang_max, joint_rot), ...]
+        非ツリー辺（横リング）の距離拘束。joint_slack は元のPMXジョイントの
+        linearLimitMin/Maxから概算した「遊び」量(glTFスケール済み、常に0.0
+        以上)。lateral_slack_scale=0.0の既定では使用側で無視されるため、
+        この値自体が挙動に影響することはない。ang_min/ang_max/joint_rotは
+        同じジョイントのangularLimitMin/Max/rotation(縦の関節のPartcle.
+        ang_min/max/joint_rotと同じ形式)。cloth_algorithm="rigid_body"の
+        横リング角度制限でのみ使用し、点ベース方式(_apply_lateral_constraint)
+        はこれらを無視する(距離拘束のみで従来通り)。取得できない場合は
+        (None, None, None)。
     """
     rbs = physics_gltf["rigidBodies"]
     jts = physics_gltf["joints"]
@@ -1255,7 +1999,11 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
                         seen_pairs.add(key)
                         rp_a, rp_b = parts[old_parent].rest_pos, parts[nb].rest_pos
                         if rp_a and rp_b:
-                            lateral.append((old_parent, nb, _len(_sub(rp_a, rp_b))))
+                            _old_j = tree_joint.get(nb)
+                            _amin, _amax, _jrot = _joint_lateral_angle_info(_old_j) if _old_j else (None, None, None)
+                            lateral.append((old_parent, nb, _len(_sub(rp_a, rp_b)),
+                                            _joint_lateral_slack(_old_j) if _old_j else 0.0,
+                                            _amin, _amax, _jrot))
                 depth[nb] = nd
                 parts[nb].parent = cur
                 tree_joint[nb] = j
@@ -1270,7 +2018,10 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
                         if parts[nb].parent != cur and parts[cur].parent != nb:
                             rp_a, rp_b = parts[cur].rest_pos, parts[nb].rest_pos
                             if rp_a and rp_b:
-                                lateral.append((cur, nb, _len(_sub(rp_a, rp_b))))
+                                _amin, _amax, _jrot = _joint_lateral_angle_info(j)
+                                lateral.append((cur, nb, _len(_sub(rp_a, rp_b)),
+                                                _joint_lateral_slack(j),
+                                                _amin, _amax, _jrot))
 
     # rest_len / 角度制限 を tree_joint から埋める
     for c_rb, p in parts.items():
@@ -1280,6 +2031,7 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
         if j:
             p.ang_min = j["angularLimitMin"]
             p.ang_max = j["angularLimitMax"]
+            p.joint_rot = j.get("rotation")
         pa = parts[p.parent]
         if p.rest_pos and pa.rest_pos:
             p.rest_len = _len(_sub(p.rest_pos, pa.rest_pos))
@@ -1345,7 +2097,7 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
     for i in dyn:
         if i not in excluded:
             uf_union(i, true_anchor(i))
-    for a, b, _rl in lateral:
+    for a, b, _rl, _sl, _amin, _amax, _jrot in lateral:
         uf_union(a, b)
 
     comp_anchors = {}
@@ -1381,13 +2133,56 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
 # ======================================================================
 # クロス対応ソルバ: 積分 → 縦横拘束を反復 → 回転出力（髪も包含）
 # ======================================================================
+def _apply_lateral_constraint(pos, part, lateral, lateral_slack_scale):
+    """横リング(隣接パネル間)の距離拘束。simulate_step_cloth・
+    simulate_step_rigid_chain の両方から共有される(単一の実装)。
+
+    lateral_slack_scale>0のとき、元のPMXジョイントが持つ「遊び」
+    (joint_slack、linearLimitMin/Maxから概算)×この倍率の範囲内では
+    無補正にする。本家は該当ジョイントのバネ定数が0(=遊びの範囲内は
+    完全フリー、限界で硬く止まる)であり、この簡易ソルバーの従来実装
+    (常にrlぴったりへ戻すハード等式拘束)が持つ「伸縮ゼロの硬い網」の
+    感触を緩和するために追加。デフォルト0.0では常にtarget=rlとなり、
+    既存の等式拘束と完全に同じ(回帰安全)。posを直接書き換える。
+    """
+    for a, b, rl, joint_slack, _amin, _amax, _jrot in lateral:
+        pa_, pb_ = part.get(a), part.get(b)
+        if not pa_ or not pb_:
+            continue
+        d = _sub(pos[b], pos[a]); dist = _len(d)
+        if dist < 1e-9:
+            continue
+        wa, wb = pa_.inv_mass, pb_.inv_mass
+        ws = wa + wb
+        if ws <= 0:
+            continue
+        slack = joint_slack * lateral_slack_scale
+        if slack > 0.0:
+            lo, hi = rl - slack, rl + slack
+            if lo <= dist <= hi:
+                continue   # 遊びの範囲内: 本家同様に無補正
+            target = lo if dist < lo else hi
+        else:
+            target = rl
+        corr = _scale(d, (dist - target) / dist)
+        pos[a] = _add(pos[a], _scale(corr, wa / ws))
+        pos[b] = _sub(pos[b], _scale(corr, wb / ws))
+
+
 def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         lateral, gravity_power=0.02, iterations=6,
                         colliders=None, body_axis=None, radial_rbs=None,
                         margin=0.0, exclude_rb=None, skip_angle_clamp_rbs=None,
-                        allowed_collider_rbi=None, hem_weight=None, hem_extra_margin=0.0):
+                        allowed_collider_rbi=None, hem_weight=None, hem_extra_margin=0.0,
+                        collision_bounce=0.0, extra_margin_by_rb=None,
+                        lateral_slack_scale=0.0, vertical_spread_scale=0.0,
+                        vertical_neighbors=None, segment_aware_collision=False):
     """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
-    lateral: [(rb_i, rb_j, rest_len), ...]
+    lateral: [(rb_i, rb_j, rest_len, joint_slack), ...]
+    segment_aware_collision: Trueだと衝突判定をパーティクル単体でなく
+      「親→子の区間」に対して行い(resolve_collisions_segments)、衝突点が
+      区間の途中にあるときは押し出しを親・子へ按分する。既定Falseで
+      既存挙動(resolve_collisions、パーティクル単体判定)と完全に同じ。
     戻り値: seg_rot[rb]
     """
     pos, prev, part, rest_dir = state.pos, state.prev, state.part, state.rest_dir
@@ -1396,6 +2191,15 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
     stiff = stiffness_force * dt
     # 安全弁: このフレーム開始時点の位置を記録（最大変位クランプ用）
     frame_start_pos = dict(pos)
+    # 弾み(collision_bounce)用: このフレーム中にresolve_collisionsが実際に
+    # 押し出した変位を蓄積する。反復の各回・念押しの1回、いずれの押し出しも
+    # ここに積算し、フレームの最後に一度だけその合計へ弾み係数を掛けて適用する
+    # (詳細はresolve_collisionsのaccum引数のdocstring参照)。collision_bounce=0
+    # ならNoneのままにして、その場合は既存挙動と完全に同じにする。
+    # collision_bounce(弾み)とvertical_spread_scale(縦方向への押し出し分配)は
+    # どちらも「そのフレーム中にresolve_collisionsが実際に押し出した変位の
+    # 合計」を必要とするため、同じaccum機構を共用する。
+    _bounce_accum = {} if (collision_bounce or vertical_spread_scale) else None
     grav = _scale(_norm(gravity_dir), gravity_power * dt) if gravity_power else (0.0, 0.0, 0.0)
 
     # --- 1. 積分（慣性＋重力＋rest方向へのstiffness nudge） ---
@@ -1448,38 +2252,80 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                                         cur_dir = _rotate_about(tgt_dir, _norm(ax), amax)
                         pos[c.rb] = _add(pos[pa.rb], _scale(cur_dir, c.rest_len))
                 q_par = q_mul(q_from_to(tgt_dir, _norm(_sub(pos[c.rb], pos[pa.rb]))), q_par)
-        # 横: 距離拘束（両者dynamicなのでinv_mass比で配分）
-        for a, b, rl in lateral:
-            pa_, pb_ = part.get(a), part.get(b)
-            if not pa_ or not pb_:
-                continue
-            d = _sub(pos[b], pos[a]); dist = _len(d)
-            if dist < 1e-9:
-                continue
-            wa, wb = pa_.inv_mass, pb_.inv_mass
-            ws = wa + wb
-            if ws <= 0:
-                continue
-            corr = _scale(d, (dist - rl) / dist)
-            pos[a] = _add(pos[a], _scale(corr, wa / ws))
-            pos[b] = _sub(pos[b], _scale(corr, wb / ws))
+        # 横: 距離拘束（両者dynamicなのでinv_mass比で配分）。詳細は
+        # _apply_lateral_constraint() のdocstring参照。
+        _apply_lateral_constraint(pos, part, lateral, lateral_slack_scale)
         # コライダー衝突（脚カプセル等への push-out）
         if colliders:
-            resolve_collisions(state, colliders, body_axis=body_axis,
-                               radial_rbs=radial_rbs, margin=margin,
-                               exclude_rb=exclude_rb,
-                               allowed_collider_rbi=allowed_collider_rbi,
-                               hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+            # 弾みはここでは直接適用しない(accumへ積算するだけ)。この呼び出しは
+            # 1フレームにつき最大iterations回(既定6回)実行される反復拘束解決
+            # の一部で、都度オーバーシュートを適用すると呼び出し回数分複利的に
+            # 積み重なり値を大きくすると容易に破綻する。実際の適用はフレームの
+            # 最後に一度だけ、accumに集計された合計変位に対して行う。
+            if segment_aware_collision:
+                resolve_collisions_segments(state, state.chains, colliders, body_axis=body_axis,
+                                            radial_rbs=radial_rbs, margin=margin,
+                                            exclude_rb=exclude_rb,
+                                            allowed_collider_rbi=allowed_collider_rbi,
+                                            hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                            accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+            else:
+                resolve_collisions(state, colliders, body_axis=body_axis,
+                                   radial_rbs=radial_rbs, margin=margin,
+                                   exclude_rb=exclude_rb,
+                                   allowed_collider_rbi=allowed_collider_rbi,
+                                   hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                   accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
         # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
 
     # 反復後にもう一度押し出し: 直前の length 拘束が侵入を復活させても、
     # 記録される最終位置は必ずコライダー外になるようにする（修正2）。
     if colliders:
-        resolve_collisions(state, colliders, body_axis=body_axis,
-                           radial_rbs=radial_rbs, margin=margin,
-                           exclude_rb=exclude_rb,
-                           allowed_collider_rbi=allowed_collider_rbi,
-                           hem_weight=hem_weight, hem_extra_margin=hem_extra_margin)
+        if segment_aware_collision:
+            resolve_collisions_segments(state, state.chains, colliders, body_axis=body_axis,
+                                        radial_rbs=radial_rbs, margin=margin,
+                                        exclude_rb=exclude_rb,
+                                        allowed_collider_rbi=allowed_collider_rbi,
+                                        hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                                        accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+        else:
+            resolve_collisions(state, colliders, body_axis=body_axis,
+                               radial_rbs=radial_rbs, margin=margin,
+                               exclude_rb=exclude_rb,
+                               allowed_collider_rbi=allowed_collider_rbi,
+                               hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
+                               accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+
+        # vertical_spread_scale: コライダーに当たって押し出された1パーティクルの
+        # 変位を、縦方向に隣接する1つ上・1つ下のパーティクル(1ホップのみ、
+        # kinematicアンカーは対象外)へも分配する。実機フィードバック(片足を
+        # 上げるポーズでスカートに「輪切り」の段が出る)への対策。フレームに
+        # つき一度だけ、そのフレーム全体の押し出し合計(_bounce_accum)を使う。
+        # 修正3(長さ拘束の再クランプ)より前に置くことで、分配した結果は
+        # 伸縮ではなく「向き(傾き)」の変化として隣接パーティクルへ伝わる。
+        # デフォルト0.0では_bounce_accumがNoneのまま(collision_bounceも無効な
+        # 限り)か、このブロック自体がスキップされ既存挙動と完全に同じ。
+        #
+        # 重要: posだけを動かしprevを動かさないと、Verlet積分の速度項
+        # (pos-prev)にこの分配ぶんがそのまま「速度」として乗ってしまう。
+        # 通常の衝突押し出しは1回限りのイベントなら問題にならないが、
+        # 脚の近くで裾が常時軽く触れているような場面(実測: このモデル・
+        # モーションでは全7001フレーム中7272回、ほぼ毎フレーム発火)では、
+        # 速度注入が減衰し切る前に毎フレーム上書きされ続け、何もない場面
+        # でもスカートが暴れる原因になっていた(実機フィードバックで確認)。
+        # collision_bounce(意図的に速度を注入する機能)とは異なり、この
+        # 分配はあくまで「向きを滑らかにする」だけが目的で速度を足す
+        # 意図が無いため、prevも同じ量だけ動かして(pos-prev)を変えない
+        # ようにし、速度注入を起こさない「その場の位置修正」に変更する。
+        if vertical_spread_scale > 0.0 and _bounce_accum and vertical_neighbors:
+            for rb, disp in list(_bounce_accum.items()):
+                for nb_rb in vertical_neighbors.get(rb, ()):
+                    nb_part = part.get(nb_rb)
+                    if nb_part is None or nb_part.inv_mass <= 0:
+                        continue
+                    d = _scale(disp, vertical_spread_scale)
+                    pos[nb_rb] = _add(pos[nb_rb], d)
+                    prev[nb_rb] = _add(prev[nb_rb], d)
 
         # 修正3: 上の念押し押し出しの後、長さ拘束だけを再適用してrest_lenへ戻す。
         # 押し出しが決めた方向(=衝突を避けた向き)はそのまま維持し、長さだけを
@@ -1505,6 +2351,23 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                     d = _sub(pos[c.rb], pos[pa.rb]); dl = _len(d)
                     if dl > 1e-9:
                         pos[c.rb] = _add(pos[pa.rb], _scale(d, c.rest_len / dl))
+
+    # 弾み(collision_bounce)の適用: このフレーム中にresolve_collisionsが
+    # 実際に押し出した変位の"合計"(_bounce_accum、反復6回+念押し1回の全て)を
+    # 使って、フレームにつき一度だけオーバーシュートを与える。修正3(rest_len
+    # 再クランプ)より後に置くことが重要: 修正3より前に適用すると、スカート等
+    # (radial_rbs)ではrest_len再クランプで方向以外の変化がほぼ消されてしまい、
+    # 弾みが見た目にほとんど効かなくなる。また念押し1回分の変位だけでは反復
+    # 拘束がほぼ収束済みで小さすぎるため、6回の反復+念押し全ての合計を見て
+    # 初めて弾みとして意味のある大きさになる。
+    if _bounce_accum:
+        for rb, disp in _bounce_accum.items():
+            if part[rb].inv_mass <= 0:
+                continue
+            pos[rb] = _add(pos[rb], _scale(disp, collision_bounce))
+            prev[rb] = _sub(prev[rb], _scale(disp, collision_bounce))
+
+
 
     # 安全弁: 1フレームあたりの最大変位クランプ。乱れたツリー構造(複数アンカー・
     # リング横断)を持つ揺れ物は、rest_dir/角度クランプの相互作用で稀に位置が
@@ -1550,6 +2413,446 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
 
 
 # ======================================================================
+# 【実験的・独立実装】板(剛体チェーン)方式 — cloth_algorithm="rigid_chain"
+# ======================================================================
+# 既存の simulate_step_cloth は各段を「位置だけを持つ点」として扱い、回転は
+# 「結果として位置がどちらを向いたか」から逆算するだけ（独立した物理量ではない）。
+# 本家MMD(Bullet)は逆に、縦ジョイントの移動を完全固定する代わりに回転を
+# ジョイント制限の範囲で自由に持たせ、パネルが脚の角度に合わせて傾くことで
+# 滑らかな曲線を作っている(実測: X軸±80°/Y軸±5°/Z軸±10°、バネ定数0＝
+# 範囲内フリー・限界で硬く止まる)。
+## この関数は、既存コードの慣習(rest_dir/tgt_dir/aimの連鎖規則、q_mul(aim,q_par)
+# でのトップダウン合成)をそのまま踏襲しつつ、各パーティクルの「世界姿勢
+# そのもの」(world_q)を、位置から毎フレーム作り直すのではなく、慣性・
+# 重力トルク・stiffness緩和を持つ独立した状態として持続させる。慣性は
+# 世界姿勢の変化量で計算する(親相対の偏差ではない)。これにより、親(腰)
+# が急に速く回転したときに子(裾)が慣性でその場に留まろうとして遅れ、
+# 遠心力で外側へ流れる効果が自然に出る(親相対の偏差だけで慣性を持つと、
+# 親の回転にほぼ無抵抗で追従してしまい遠心力が出ない設計ミスを実機
+# フィードバックで発見・修正した経緯がある)。位置は最後にこの姿勢から
+# 導出する(simulate_step_clothとは主従が逆)。
+#
+# Stage 1のスコープ(ユーザーと合意): 縦方向の回転駆動のみ。衝突・横リング・
+# 適応サブステップ・中間パーティクル等は含めない、既存パイプラインには
+# まだ組み込まない独立関数。まずこれ単体で「重力で自然に垂れ下がり、
+# アンカーの動きに滑らかに追従する」挙動になるかを検証する。
+# 角度制限は本家ジョイントが実際に持つX/Y/Z軸別の値(joint_rotで定義された
+# フレーム、YXZオイラー角)をそのまま使う。既存コードの等方コーン近似
+# (|X|と|Z|の大きい方だけを見る、Y軸±5°等の厳しい軸を無視する簡易版)から
+# 一歩進め、本家の「ピッチは自由・ヨーロールは厳しい」という非対称な
+# 制限をそのまま再現する。
+def _quat_axis_angle(axis, angle):
+    """軸(単位ベクトル)・角度(ラジアン)からクォータニオンを作る。"""
+    s = math.sin(angle * 0.5)
+    return (axis[0]*s, axis[1]*s, axis[2]*s, math.cos(angle * 0.5))
+
+
+def _quat_to_axis_angle(q):
+    """クォータニオンを(軸, 角度[ラジアン])に分解する。角度は0〜2πの実回転角。
+    ほぼ無回転(角度≈0)の場合は軸を(0,0,1)とし、以後の計算で無害にする。
+    """
+    x, y, z, w = q
+    w = max(-1.0, min(1.0, w))
+    angle = 2.0 * math.acos(w)
+    s = math.sqrt(max(0.0, 1.0 - w*w))
+    if s < 1e-9:
+        return (0.0, 0.0, 1.0), 0.0
+    return (x/s, y/s, z/s), angle
+
+
+def _quat_to_euler_yxz(q):
+    """クォータニオンを、physics.pyのeuler_to_quat(order='YXZ')と対になる
+    (rx, ry, rz)[ラジアン]へ分解する(R = Ry(ry)*Rx(rx)*Rz(rz)の意味で対応)。
+    MMDジョイントのangularLimitMin/MaxはこのYXZ順のオイラー角として定義
+    されているため、軸別クランプにはこの順序での分解が必要。
+    定数はthree.js Euler.setFromRotationMatrix(order='YXZ')と同型の
+    標準的な導出式(ジンバルロック近傍のみ特別扱い)。
+    """
+    x, y, z, w = q
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    m11 = 1 - 2*(yy+zz); m12 = 2*(xy-wz); m13 = 2*(xz+wy)
+    m21 = 2*(xy+wz);     m22 = 1 - 2*(xx+zz); m23 = 2*(yz-wx)
+    m31 = 2*(xz-wy);     m32 = 2*(yz+wx);     m33 = 1 - 2*(xx+yy)
+    m23c = max(-1.0, min(1.0, m23))
+    rx = math.asin(-m23c)
+    if abs(m23c) < 0.9999999:
+        ry = math.atan2(m13, m33)
+        rz = math.atan2(m21, m22)
+    else:
+        ry = math.atan2(-m31, m11)
+        rz = 0.0
+    return rx, ry, rz
+
+
+def simulate_step_rigid_chain(chains, rest_dir, rest_len, part, pos, anchor_rot,
+                              world_q, prev_world_q, gravity_dir, dt, drag_force,
+                              stiffness_force, gravity_power=0.02):
+    """板(剛体チェーン)方式の1ステップ。縦方向の回転駆動のみ(Stage 1/2)。
+
+    引数(既存のPBD系関数とは呼び出し形が異なる。独立実装のため):
+      chains    : extract_chains_bfs() が返す ChainInfo のリスト
+      rest_dir  : {rb: 単位ベクトル} 親からのrest方向(world/bind基準、既存と同じ規約)
+      rest_len  : {rb: float} 親からの静止距離(通常 part[rb].rest_len と同じ)
+      part      : {rb: Particle}
+      pos       : {rb: (x,y,z)} アンカー(kinematic)のワールド位置は呼び出し側が
+                  事前にセット済みであること(既存のset_anchor相当)。この関数は
+                  動的パーティクルのposをここに書き込んで返す(戻り値ではなく
+                  このdictを直接更新する)。
+      anchor_rot: {rb: quat} アンカーボーンのワールド回転(既存の_anchor_rotと同じ)
+      world_q, prev_world_q: {rb: quat} 各パーティクルの「世界姿勢そのもの」と
+                  前フレーム値。呼び出し側が辞書を保持し続けること(初回は
+                  空dictを渡せば親の回転で初期化される)。
+                  重要: 慣性はこの世界姿勢の変化量で計算する(親相対の偏差
+                  ではない)。親相対の偏差で慣性を計算すると、親(腰)が
+                  急に速く回転したときに子(裾)がほぼ無抵抗で追従して
+                  しまい、遠心力で外側へ流れる効果が原理的に出ない
+                  (実機フィードバックで発覚したバグの修正)。世界姿勢基準
+                  なら、子は「前フレームまでの世界姿勢を慣性で維持しよう
+                  とする」ため、親の急な回転に対して自然に遅れ、結果として
+                  外側へ流れる(遠心力)効果が出る。
+      戻り値    : seg_rot {rb: quat}（既存のsimulate_step_cloth等と同じ形式、
+                  そのままbake_hair_into_gltfの出力パイプラインに渡せる）
+    """
+    seg_rot = {}
+    stiff = max(0.0, min(1.0, stiffness_force * dt))   # 1フレームで戻す割合(0..1)
+    grav_ang = gravity_power * dt                       # 重力による回転角(rad)
+    damp = max(0.0, min(1.0, 1.0 - drag_force))          # 角速度の残存率
+
+    for ch in chains:
+        plist = ch.particles
+        q_par = anchor_rot.get(plist[0].rb, (0.0, 0.0, 0.0, 1.0)) if plist[0].kinematic \
+            else (0.0, 0.0, 0.0, 1.0)
+        for k in range(1, len(plist)):
+            c = plist[k]; pa = plist[k-1]
+            rdir = rest_dir.get(c.rb)
+            if rdir is None or c.inv_mass <= 0:
+                # kinematicや情報欠落時は既存位置から向きを引くだけ(髪等と同じ扱い)
+                cur_dir = _norm(_sub(pos[c.rb], pos[pa.rb])) if c.rb in pos else (0.0, -1.0, 0.0)
+                aim = q_from_to(q_rotate_vec(q_par, rdir) if rdir else cur_dir, cur_dir)
+                seg_rot[c.rb] = q_mul(aim, q_par)
+                q_par = seg_rot[c.rb]
+                continue
+
+            wq = world_q.get(c.rb)
+            if wq is None:
+                wq = q_par   # 初回シード: 偏差ゼロ(tgt_dirと一致)から開始
+            pwq = prev_world_q.get(c.rb, wq)
+
+            # 1) 慣性: 前フレームの「世界姿勢そのもの」の変化量を damp 倍で
+            #    持ち越す(親相対ではなく世界基準。上のdocstring参照)。
+            delta = q_mul(wq, q_conj(pwq))
+            axis, ang = _quat_to_axis_angle(delta)
+            if ang > math.pi:      # 最短経路(実回転角0〜π)に正規化
+                ang = 2.0 * math.pi - ang
+                axis = tuple(-a for a in axis)
+            inertia_q = _quat_axis_angle(axis, ang * damp) if ang > 1e-9 else (0.0, 0.0, 0.0, 1.0)
+            prev_world_q[c.rb] = wq
+            wq = q_mul(inertia_q, wq)
+
+            # 2) 重力トルク: 世界姿勢を直接、現在の実方向からgravity_dirへ
+            #    わずかに回す。
+            cur_dir = q_rotate_vec(wq, rdir)
+            if grav_ang:
+                axis_g = _cross(cur_dir, gravity_dir)
+                if _len(axis_g) > 1e-9:
+                    axis_g = _norm(axis_g)
+                    wq = q_mul(_quat_axis_angle(axis_g, grav_ang), wq)
+                    cur_dir = q_rotate_vec(wq, rdir)
+
+            # 3) stiffness: 親相対の偏差(dev = wq を q_par 基準に見たもの)を
+            #    rest(恒等)へ向けてstiff割合だけ緩和する。restは「親の現在
+            #    の姿勢に対して」定義されるので、ここだけは親相対で扱う。
+            tgt_dir = q_rotate_vec(q_par, rdir)
+            if stiff > 0.0:
+                dev = q_mul(wq, q_conj(q_par))
+                axis_s, ang_s = _quat_to_axis_angle(dev)
+                if ang_s > math.pi:
+                    ang_s = 2.0 * math.pi - ang_s
+                    axis_s = tuple(-a for a in axis_s)
+                dev = _quat_axis_angle(axis_s, ang_s * (1.0 - stiff)) if ang_s > 1e-9 else (0.0, 0.0, 0.0, 1.0)
+                wq = q_mul(dev, q_par)
+                cur_dir = q_rotate_vec(wq, rdir)
+
+            # 4) 角度制限: 本家ジョイントが実際に持つX/Y/Z軸別の制限を、その
+            #    まま軸別クランプとして使う。親相対の偏差devを、ジョイント
+            #    自身のフレーム(joint_rot、子ボーンのbindローカル基準)へ
+            #    変換してからYXZオイラー角に分解しクランプ、逆変換で戻す。
+            if c.ang_max and c.ang_min:
+                jr = c.joint_rot or (0.0, 0.0, 0.0, 1.0)
+                dev = q_mul(wq, q_conj(q_par))
+                in_joint = q_mul(q_conj(jr), q_mul(dev, jr))
+                rx, ry, rz = _quat_to_euler_yxz(in_joint)
+                rx_c = max(c.ang_min[0], min(c.ang_max[0], rx))
+                ry_c = max(c.ang_min[1], min(c.ang_max[1], ry))
+                rz_c = max(c.ang_min[2], min(c.ang_max[2], rz))
+                if (rx_c, ry_c, rz_c) != (rx, ry, rz):
+                    in_joint_clamped = euler_to_quat(rx_c, ry_c, rz_c)
+                    dev_clamped = q_mul(jr, q_mul(in_joint_clamped, q_conj(jr)))
+                    wq = q_mul(dev_clamped, q_par)
+                    cur_dir = q_rotate_vec(wq, rdir)
+
+            world_q[c.rb] = wq
+            pos[c.rb] = _add(pos[pa.rb], _scale(cur_dir, rest_len.get(c.rb, c.rest_len)))
+            seg_rot[c.rb] = wq
+            q_par = wq
+
+    return seg_rot
+
+
+# ======================================================================
+# 【実験的・独立実装 Stage 3】剛体(位置+姿勢+並進速度+角速度)方式
+# cloth_algorithm="rigid_body"
+# ======================================================================
+# simulate_step_rigid_chain(姿勢のみを状態に持つ)には並進の運動量が無く、
+# 回転しても遠心力で広がらないという実機フィードバックを受けて調査した結果、
+# Bullet(本家)のbtRigidBody::integrateVelocitiesはm_linearVelocity(並進)と
+# m_angularVelocity(角速度)を両方独立に積分していることが判明。真の遠心力
+# には並進の運動量が不可欠なため、XPBD(Position Based Dynamics with
+# orientations、Müller et al. 2020)の考え方で「位置+姿勢+並進速度+角速度」
+# を持つ剛体チェーンとして全面的に作り直したもの。
+#
+# 各スカートパネルを1つの剛体として扱う:
+#   pos: 重心のワールド位置。rot: 重心のワールド姿勢(ローカル+Yが常に
+#   「親方向」を向く規約)。half_len: 親秒側/子側の接続点までのローカル
+#   Y距離。half_extents: 剛体(箱)のサイズ(PMX実測)、質量とあわせて
+#   慣性テンソルを計算する。
+#
+# 拘束は3種類、いずれも反復(Gauss-Seidel)で解く:
+#   1) 縦の点拘束(親の子側接続点=子の親側接続点)
+#   2) 縦の角度制限(本家ジョイント実測のX/Y/Z軸別、joint_rot基準)
+#   3) 横の距離拘束(隣接パネル間、lateral_slack_scaleと同じ「遊び」概念)
+# 拘束を解いた後、位置/姿勢の変化から速度を再計算する(XPBDの要点)。
+def _rb_box_inv_inertia(mass, half_extents):
+    if mass <= 1e-9:
+        return (0.0, 0.0, 0.0)
+    w, h, d = half_extents
+    ix = max((mass/3.0)*(h*h+d*d), 1e-9)
+    iy = max((mass/3.0)*(w*w+d*d), 1e-9)
+    iz = max((mass/3.0)*(w*w+h*h), 1e-9)
+    return (1.0/ix, 1.0/iy, 1.0/iz)
+
+
+class RigidBodyXPBD:
+    __slots__ = ("pos", "rot", "vel", "omega", "kinematic", "inv_mass",
+                 "inv_inertia_body", "half_len", "half_w",
+                 "attach_parent_local", "attach_child_local",
+                 "ang_min", "ang_max", "joint_rot", "rb",
+                 "lin_damping", "ang_damping")
+
+    def __init__(self, rb, pos, rot, mass, half_extents, half_len,
+                kinematic=False, ang_min=None, ang_max=None, joint_rot=None,
+                lin_damping=0.1, ang_damping=0.3):
+        self.rb = rb
+        self.pos = pos; self.rot = rot
+        self.vel = (0.0, 0.0, 0.0); self.omega = (0.0, 0.0, 0.0)
+        self.kinematic = kinematic
+        self.inv_mass = 0.0 if (kinematic or mass <= 1e-9) else 1.0/mass
+        self.inv_inertia_body = (0.0, 0.0, 0.0) if kinematic else _rb_box_inv_inertia(mass, half_extents)
+        self.half_len = half_len
+        self.half_w = half_extents[0] if half_extents else 0.01
+        self.attach_parent_local = (0.0, half_len, 0.0)
+        self.attach_child_local = (0.0, -half_len, 0.0)
+        self.ang_min = ang_min
+        self.ang_max = ang_max
+        self.joint_rot = joint_rot or (0.0, 0.0, 0.0, 1.0)
+        # PMXの各剛体が実際に持つ移動減衰・回転減衰(実測: このIAモデルの
+        # スカートは0.9/0.9、以前の既定値0.1/0.3とは大きく異なっていた)。
+        # rigid_body_linear/angular_dampingパラメータは、この実測値に掛ける
+        # 倍率(既定1.0=モデルの値をそのまま使う)として使う。
+        self.lin_damping = lin_damping
+        self.ang_damping = ang_damping
+
+
+def _rb_integrate_predict(body, gravity, dt, lin_damp_scale, ang_damp_scale):
+    if body.kinematic:
+        return body.pos, body.rot
+    lin_damp = max(0.0, min(1.0, body.lin_damping * lin_damp_scale))
+    ang_damp = max(0.0, min(1.0, body.ang_damping * ang_damp_scale))
+    # 本家Bullet(btRigidBody::applyDamping)と同じ指数関数形式: 1秒あたりの
+    # 除去割合(damping)を、実際のdtに対して (1-damping)^dt で減衰させる。
+    # 以前は「1フレームでdamping分だけ除去」という線形近似(1-damping*dt*30)
+    # を使っており、damping=0.9(このIAモデルの実測値)のような大きい値では
+    # 正しい残存率92.6%/フレームに対し誤って10%/フレームまで減衰させて
+    # しまっていた(実質ほぼ毎フレーム速度が消え、剛体が実質静止した状態に
+    # 固まる不具合の原因。実機フィードバックで発覚)。
+    vel = _add(body.vel, _scale(gravity, dt))
+    vel = _scale(vel, (1.0 - lin_damp) ** dt)
+    pos_pred = _add(body.pos, _scale(vel, dt))
+    om = _scale(body.omega, (1.0 - ang_damp) ** dt)
+    dq = q_mul((om[0]*dt*0.5, om[1]*dt*0.5, om[2]*dt*0.5, 0.0), body.rot)
+    rot_pred = q_normalize(_add4(body.rot, dq))
+    return pos_pred, rot_pred
+
+
+def _add4(a, b):
+    return (a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3])
+
+
+def _rb_solve_point_constraint(pA, rA, invmA, invIA, kinA, ptA_local,
+                               pB, rB, invmB, invIB, kinB, ptB_local):
+    wA = _add(pA, q_rotate_vec(rA, ptA_local))
+    wB = _add(pB, q_rotate_vec(rB, ptB_local))
+    C = _sub(wB, wA)
+    Cl = _len(C)
+    if Cl < 1e-12:
+        return pA, rA, pB, rB
+    n = _scale(C, 1.0/Cl)
+    rA_ = q_rotate_vec(rA, ptA_local)
+    rB_ = q_rotate_vec(rB, ptB_local)
+    rAxn = _cross(rA_, n); rBxn = _cross(rB_, n)
+    angA = sum(rAxn[i]**2*invIA[i] for i in range(3)) if not kinA else 0.0
+    angB = sum(rBxn[i]**2*invIB[i] for i in range(3)) if not kinB else 0.0
+    w_sum = invmA + invmB + angA + angB
+    if w_sum <= 0:
+        return pA, rA, pB, rB
+    lam = -Cl / w_sum
+    p = _scale(n, lam)
+    if not kinA:
+        pA = _sub(pA, _scale(p, invmA))
+        rxp = _cross(rA_, p)
+        dq = tuple(-0.5*invIA[i]*rxp[i] for i in range(3)) + (0.0,)
+        rA = q_normalize(_add4(rA, q_mul(dq, rA)))
+    if not kinB:
+        pB = _add(pB, _scale(p, invmB))
+        rxp = _cross(rB_, p)
+        dq = tuple(0.5*invIB[i]*rxp[i] for i in range(3)) + (0.0,)
+        rB = q_normalize(_add4(rB, q_mul(dq, rB)))
+    return pA, rA, pB, rB
+
+
+def _rb_slerp(a, b, t):
+    d = _dot(a, b)
+    if d < 0:
+        b = tuple(-c for c in b); d = -d
+    if d > 0.9995:
+        return q_normalize(tuple(a[i] + (b[i]-a[i])*t for i in range(4)))
+    theta0 = math.acos(max(-1.0, min(1.0, d)))
+    theta = theta0 * t
+    b2 = q_normalize(tuple(b[i] - a[i]*d for i in range(4)))
+    return tuple(a[i]*math.cos(theta) + b2[i]*math.sin(theta) for i in range(4))
+
+
+def _rb_solve_angle_limit(rA, rB, invIA, invIB, kinA, kinB, ang_min, ang_max, joint_rot):
+    if ang_min is None or ang_max is None:
+        return rA, rB
+    rel = q_mul(rB, q_conj(rA))
+    in_joint = q_mul(q_conj(joint_rot), q_mul(rel, joint_rot))
+    rx, ry, rz = _quat_to_euler_yxz(in_joint)
+    rx_c = max(ang_min[0], min(ang_max[0], rx))
+    ry_c = max(ang_min[1], min(ang_max[1], ry))
+    rz_c = max(ang_min[2], min(ang_max[2], rz))
+    if (rx_c, ry_c, rz_c) == (rx, ry, rz):
+        return rA, rB
+    in_joint_c = euler_to_quat(rx_c, ry_c, rz_c)
+    rel_c = q_mul(joint_rot, q_mul(in_joint_c, q_conj(joint_rot)))
+    wA = 0.0 if kinA else sum(invIA)
+    wB = 0.0 if kinB else sum(invIB)
+    wsum = wA + wB
+    if wsum <= 0:
+        return rA, rB
+    tB = wB / wsum; tA = wA / wsum
+    rB_full = q_mul(rel_c, rA)
+    rA_full = q_mul(q_conj(rel_c), rB)
+    if not kinB and tB > 0:
+        rB = q_normalize(_rb_slerp(rB, rB_full, tB))
+    if not kinA and tA > 0:
+        rA = q_normalize(_rb_slerp(rA, rA_full, tA))
+    return rA, rB
+
+
+def _rb_solve_distance_constraint(pA, rA, invmA, invIA, kinA, ptA_local,
+                                  pB, rB, invmB, invIB, kinB, ptB_local,
+                                  rest_dist, slack):
+    wA = _add(pA, q_rotate_vec(rA, ptA_local))
+    wB = _add(pB, q_rotate_vec(rB, ptB_local))
+    C = _sub(wB, wA)
+    dist = _len(C)
+    if dist < 1e-12:
+        return pA, rA, pB, rB
+    lo, hi = rest_dist - slack, rest_dist + slack
+    if lo <= dist <= hi:
+        return pA, rA, pB, rB
+    target = lo if dist < lo else hi
+    n = _scale(C, 1.0/dist)
+    Cerr = dist - target
+    rA_ = q_rotate_vec(rA, ptA_local)
+    rB_ = q_rotate_vec(rB, ptB_local)
+    rAxn = _cross(rA_, n); rBxn = _cross(rB_, n)
+    angA = sum(rAxn[i]**2*invIA[i] for i in range(3)) if not kinA else 0.0
+    angB = sum(rBxn[i]**2*invIB[i] for i in range(3)) if not kinB else 0.0
+    w_sum = invmA + invmB + angA + angB
+    if w_sum <= 0:
+        return pA, rA, pB, rB
+    lam = -Cerr / w_sum
+    p = _scale(n, lam)
+    if not kinA:
+        pA = _sub(pA, _scale(p, invmA))
+        rxp = _cross(rA_, p)
+        dq = tuple(-0.5*invIA[i]*rxp[i] for i in range(3)) + (0.0,)
+        rA = q_normalize(_add4(rA, q_mul(dq, rA)))
+    if not kinB:
+        pB = _add(pB, _scale(p, invmB))
+        rxp = _cross(rB_, p)
+        dq = tuple(0.5*invIB[i]*rxp[i] for i in range(3)) + (0.0,)
+        rB = q_normalize(_add4(rB, q_mul(dq, rB)))
+    return pA, rA, pB, rB
+
+
+def _rb_solve_min_separation(pA, invmA, kinA, pB, invmB, kinB, min_dist):
+    """隣接する2つのスカート剛体の重心が、min_distより近づかないよう押し離す
+    (球近似の剛体間衝突、回転は変えず並進のみ)。遠ざかる分には何もしない
+    (最小距離のみの片側拘束)。バネの無いジョイントだけでは重力下で全パネル
+    が「なるべく鉛直に垂れる」方向へ収束し扇形を保てない(実機フィードバック
+    で発覚)問題への対策。本家も隣接パネル同士の衝突を持っていると推測される。
+    """
+    C = _sub(pB, pA)
+    dist = _len(C)
+    if dist >= min_dist or dist < 1e-9:
+        return pA, pB
+    n = _scale(C, 1.0 / dist)
+    err = min_dist - dist
+    w_sum = invmA + invmB
+    if w_sum <= 0:
+        return pA, pB
+    lam = err / w_sum
+    push = _scale(n, lam)
+    if not kinA:
+        pA = _sub(pA, _scale(push, invmA))
+    if not kinB:
+        pB = _add(pB, _scale(push, invmB))
+    return pA, pB
+
+
+def _rb_solve_collision_pos(pos, colliders, margin):
+    """剛体の重心を脚コライダーの外へ押し出す(簡易版: 剛体の厚みは考慮
+    しない点ベースの押し出しで、回転は変えず並進のみ。既存のresolve_
+    collisionsと同じcolliders形式を使う。衝突が無ければposをそのまま返す。
+    """
+    best_push = None
+    best_depth = 0.0
+    for col in colliders:
+        kind = col[0]
+        if kind == "capsule":
+            a, b, radius = col[1], col[2], col[3]
+            c = _closest_on_segment(pos, a, b)
+        elif kind == "sphere":
+            c, radius = col[1], col[2]
+        else:
+            continue
+        d = _sub(pos, c)
+        dist = _len(d)
+        depth = radius + margin - dist
+        if depth > best_depth:
+            best_depth = depth
+            best_push = _scale(d, depth / dist) if dist > 1e-9 else (0.0, margin, 0.0)
+    if best_push:
+        return _add(pos, best_push)
+    return pos
+
+
+# ======================================================================
 # コライダー衝突（push-out）: スカート等が脚カプセルを突き抜けないように
 # ======================================================================
 def _closest_on_segment(p, a, b):
@@ -1561,9 +2864,61 @@ def _closest_on_segment(p, a, b):
     t = 0.0 if t < 0 else (1.0 if t > 1 else t)
     return _add(a, _scale(ab, t))
 
+def _closest_on_segment_t(p, a, b):
+    """_closest_on_segmentと同じだが、区間パラメータt(0=a側、1=b側)も返す。
+    セグメント衝突の押し出しをa/bへ按分する際に使う。
+    """
+    ab = _sub(b, a)
+    denom = _dot(ab, ab)
+    if denom < 1e-12:
+        return a, 0.0
+    t = _dot(_sub(p, a), ab) / denom
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    return _add(a, _scale(ab, t)), t
+
+def _closest_segment_segment_t(p1, q1, p2, q2):
+    """2本の3D線分[p1,q1]・[p2,q2]間の最近接点対とパラメータを返す。
+    戻り値: (t1, t2) — セグメント1・セグメント2それぞれの位置(0=始点,1=終点)。
+    標準的なアルゴリズム(Ericson "Real-Time Collision Detection" 5.1.9)の実装。
+    パーティクルの「区間」(親→子)がコライダーの軸(カプセル)のどのあたりに
+    最接近しているかを求め、押し出しを親・子へ按分するために使う。
+    """
+    d1 = _sub(q1, p1)   # セグメント1の方向
+    d2 = _sub(q2, p2)   # セグメント2の方向
+    r = _sub(p1, p2)
+    a = _dot(d1, d1)
+    e = _dot(d2, d2)
+    f = _dot(d2, r)
+    if a < 1e-12 and e < 1e-12:
+        return 0.0, 0.0
+    if a < 1e-12:
+        t1 = 0.0
+        t2 = max(0.0, min(1.0, f / e)) if e > 1e-12 else 0.0
+        return t1, t2
+    c = _dot(d1, r)
+    if e < 1e-12:
+        t2 = 0.0
+        t1 = max(0.0, min(1.0, -c / a))
+        return t1, t2
+    b = _dot(d1, d2)
+    denom = a * e - b * b
+    if denom > 1e-12:
+        t1 = max(0.0, min(1.0, (b * f - c * e) / denom))
+    else:
+        t1 = 0.0
+    t2 = (b * t1 + f) / e
+    if t2 < 0.0:
+        t2 = 0.0
+        t1 = max(0.0, min(1.0, -c / a))
+    elif t2 > 1.0:
+        t2 = 1.0
+        t1 = max(0.0, min(1.0, (b - c) / a))
+    return t1, t2
+
 def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                        radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None,
-                       hem_weight=None, hem_extra_margin=0.0):
+                       hem_weight=None, hem_extra_margin=0.0, accum=None,
+                       extra_margin_by_rb=None):
     """dynamic パーティクルを各コライダーの外へ押し出す（片方向）。
 
     body_axis: (center, up) 下半身(腰)の世界位置と縦軸。指定時、かつ対象が
@@ -1587,6 +2942,19 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
       裾へ滑らかに繋げつつ安全にクリアランスを稼ぐ。
     colliders: [("capsule", p0, p1, radius, group, no_collision_mask, rb_index),
                 ("sphere", center, radius, group, no_collision_mask, rb_index), ...]
+    accum: 指定すると{rb: (dx,dy,dz)}の累積辞書に、このコールで実際に押し出した
+        変位ベクトルを加算していく(Noneなら何もしない・既存挙動と完全に同じ)。
+        1フレーム内でこの関数は反復拘束解決のため複数回呼ばれることがあるが、
+        呼び出しごとの押し出し量は(特に終盤の呼び出しでは)ほぼ収束していて
+        小さすぎるため、「弾み」演出のような視覚効果はフレーム全体を通じた
+        累積量を見ないと意味のある大きさにならない。この関数自体はもう弾みの
+        適用(位置のオーバーシュートやprev操作)を行わない。呼び出し側が
+        accumを使って1フレーム分の合計を集計し、フレームの終わりに一度だけ
+        (かつ以降の長さ拘束の再適用より後に)効果を適用すること。
+    extra_margin_by_rb: {rb_index: 追加クリアランス値} の辞書(rb_size_margin_scale
+        から生成)。指定時、該当rbのパーティクルにはそのぶんmarginへ単純加算
+        する(hem_weightのような深さ補間はせず定数)。Noneまたは空辞書なら
+        加算0で既存挙動と完全に同じ。
     """
     if not colliders:
         return
@@ -1601,7 +2969,11 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
     # allowed_collider_rbi指定時は、ここでアローリスト外のコライダーを
     # 丸ごと弾く(以降の一切の判定から除外)。
     _bp = []   # (col, cx, cy, cz, cull_sq, rbi)
-    _cull_margin = margin + max(hem_extra_margin, 0.0)  # 裾の上乗せ込みで保守的に見積もる
+    # 裾の上乗せ(hem_extra_margin)と剛体実サイズ由来の上乗せ(extra_margin_by_rb)の
+    # 両方を、ブロードフェーズのカル半径には保守的に(=最大値を)見積もっておく。
+    # 個々のパーティクルに実際に適用される値(_eff_margin)はこれ以下になる。
+    _max_extra_by_rb = max(extra_margin_by_rb.values()) if extra_margin_by_rb else 0.0
+    _cull_margin = margin + max(hem_extra_margin, 0.0) + _max_extra_by_rb
     for col in colliders:
         rbi = col[-1]
         if allowed_collider_rbi is not None and rbi not in allowed_collider_rbi:
@@ -1639,9 +3011,12 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
         if p.kinematic:
             continue
         P = pos[rb]
+        P0 = P
         px, py, pz = P
         excl = exclude_rb.get(rb) if exclude_rb else None
-        _eff_margin = margin + hem_extra_margin * (hem_weight.get(rb, 0.0) if hem_weight else 0.0)
+        _eff_margin = (margin
+                       + hem_extra_margin * (hem_weight.get(rb, 0.0) if hem_weight else 0.0)
+                       + (extra_margin_by_rb.get(rb, 0.0) if extra_margin_by_rb else 0.0))
         for col, ccx, ccy, ccz, cull_sq, rbi in _bp:
             if excl is not None and rbi in excl:
                 # このパーティクルのチェーンが直接ぶら下がっているコライダー自身。
@@ -1708,7 +3083,183 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
             if t < 0.0:
                 t = 0.0
             P = _add(P, _scale(n, t))
+        if accum is not None:
+            disp = _sub(P, P0)
+            if _len(disp) > 1e-12:
+                accum[rb] = _add(accum.get(rb, (0.0, 0.0, 0.0)), disp)
         pos[rb] = P
+
+
+def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin=0.0,
+                                radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None,
+                                hem_weight=None, hem_extra_margin=0.0, accum=None,
+                                extra_margin_by_rb=None):
+    """resolve_collisions と同じ押し出しロジックを使うが、パーティクル単体でなく
+    「親→子の区間(セグメント)」をコライダーに対してテストする。
+
+    従来の resolve_collisions は各パーティクルを独立した点として扱うため、
+    衝突がたまたま検出された段だけが飛び出し、上下の段には何も伝わらない
+    「階段形状」(片足を上げるポーズでの輪切り感)の一因になっていた
+    (実機フィードバックで指摘: 「本来ならぶつかった点のベクトルがスカート側の
+    点に転写されるべき」)。
+
+    区間として扱うことで、衝突の実際の位置(区間パラメータt、0=親側・1=子側)
+    に応じて押し出しの強さを調整する。t=1(衝突点がちょうど子端)のときは
+    既存のresolve_collisionsと完全に同じ全量。tが小さい(親寄り)ほど弱め、
+    その分は「一段上の区間(この親をさらに子とする区間)」自身のテストが、
+    その区間の子端(=この親の位置)側で拾う前提。
+    親側は動かさない(実測で親・子の両方を按分して動かす版は、縦チェーンの
+    rest_len強制拘束と噛み合わず過剰補正・振動を招いたため撤回した)。
+
+    引数は resolve_collisions とほぼ同じだが、chains(ChainInfoのリスト、
+    親子関係を得るために必要)を追加で受け取る。state.part はグループ/
+    非衝突マスク判定のみに使う(子側の設定を区間の代表値として使う)。
+    """
+    if not colliders:
+        return
+    pos = state.pos
+    part = state.part
+    bc = bup = None
+    if body_axis is not None:
+        bc, bup = body_axis
+
+    _bp = []
+    _max_extra_by_rb = max(extra_margin_by_rb.values()) if extra_margin_by_rb else 0.0
+    _cull_margin = margin + max(hem_extra_margin, 0.0) + _max_extra_by_rb
+    for col in colliders:
+        rbi = col[-1]
+        if allowed_collider_rbi is not None and rbi not in allowed_collider_rbi:
+            continue
+        if col[0] == "capsule":
+            _, a, b, rad, _grp, _msk, _rbi = col
+            cx = (a[0] + b[0]) * 0.5; cy = (a[1] + b[1]) * 0.5; cz = (a[2] + b[2]) * 0.5
+            half = 0.5 * math.sqrt((b[0]-a[0])**2 + (b[1]-a[1])**2 + (b[2]-a[2])**2)
+            cull = half + rad + _cull_margin
+        elif col[0] == "sphere":
+            _, c, rad, _grp, _msk, _rbi = col
+            cx, cy, cz = c
+            cull = rad + _cull_margin
+        else:
+            continue
+        _bp.append((col, cx, cy, cz, cull, rbi))
+
+    def body_out(P, u_axis):
+        if bc is None:
+            return None
+        rel = _sub(P, bc)
+        horiz = _sub(rel, _scale(bup, _dot(rel, bup)))
+        if _len(horiz) < 1e-6:
+            return None
+        n = _norm(horiz)
+        if u_axis is not None:
+            n = _sub(n, _scale(u_axis, _dot(n, u_axis)))
+            if _len(n) < 1e-6:
+                return None
+            n = _norm(n)
+        return n
+
+    # 同じパーティクルが複数の区間・複数のコライダーから補正を受けうるため、
+    # 一旦{rb: 補正ベクトルの合計}へ集めてから最後に一括でposへ適用する。
+    corrections = {}
+
+    def add_correction(rb, delta):
+        if _len(delta) < 1e-12:
+            return
+        corrections[rb] = _add(corrections.get(rb, (0.0, 0.0, 0.0)), delta)
+
+    for ch in chains:
+        plist = ch.particles
+        for k in range(1, len(plist)):
+            c = plist[k]; pa = plist[k-1]
+            if c.kinematic and pa.kinematic:
+                continue
+            Pa = pos[pa.rb]; Pc = pos[c.rb]
+            excl_a = exclude_rb.get(pa.rb) if exclude_rb else None
+            excl_c = exclude_rb.get(c.rb) if exclude_rb else None
+            _eff_margin_c = (margin
+                           + hem_extra_margin * (hem_weight.get(c.rb, 0.0) if hem_weight else 0.0)
+                           + (extra_margin_by_rb.get(c.rb, 0.0) if extra_margin_by_rb else 0.0))
+            seg_half = _len(_sub(Pc, Pa)) * 0.5
+            midx = (Pa[0]+Pc[0])*0.5; midy = (Pa[1]+Pc[1])*0.5; midz = (Pa[2]+Pc[2])*0.5
+            for col, ccx, ccy, ccz, cull, rbi in _bp:
+                dxc = midx-ccx; dyc = midy-ccy; dzc = midz-ccz
+                cull_total = cull + seg_half
+                if dxc*dxc+dyc*dyc+dzc*dzc > cull_total*cull_total:
+                    continue
+                if excl_a is not None and rbi in excl_a and excl_c is not None and rbi in excl_c:
+                    continue
+                kind = col[0]
+                if kind == "capsule":
+                    _, a_, b_, rad, cgroup, cmask, _rbi = col
+                    t_self, t_col = _closest_segment_segment_t(Pa, Pc, a_, b_)
+                    Q = _add(Pa, _scale(_sub(Pc, Pa), t_self))
+                    C = _add(a_, _scale(_sub(b_, a_), t_col))
+                    u_axis = _norm(_sub(b_, a_))
+                elif kind == "sphere":
+                    _, C, rad, cgroup, cmask, _rbi = col
+                    Q, t_self = _closest_on_segment_t(C, Pa, Pc)
+                    u_axis = None
+                else:
+                    continue
+                if allowed_collider_rbi is None:
+                    if (cmask & (1 << c.group)) or (c.no_collision_mask & (1 << cgroup)):
+                        continue
+                dvec = _sub(Q, C)
+                d = _len(dvec)
+                R = rad + _eff_margin_c
+                if d >= R:
+                    continue
+                use_radial = ((bc is not None) and (C[1] < bc[1])
+                             and (radial_rbs is None or c.rb in radial_rbs)
+                             and (d < R * 0.5))
+                n = body_out(Q, u_axis) if use_radial else None
+                if n is None:
+                    if d > 1e-9:
+                        push = _scale(dvec, (R - d) / d)
+                    else:
+                        push = (R, 0.0, 0.0)
+                else:
+                    perp = _sub(Q, C)
+                    pn = _dot(perp, n)
+                    pp = _dot(perp, perp)
+                    disc = pn * pn - (pp - R * R)
+                    if disc < 0.0:
+                        push = _scale(dvec, (R - d) / d) if d > 1e-9 else (0.0, 0.0, 0.0)
+                    else:
+                        tpush = max(0.0, -pn + math.sqrt(disc))
+                        push = _scale(n, tpush)
+                if _len(push) < 1e-12:
+                    continue
+                # 親は動かさず、子側だけをt(0=親端・1=子端)倍で押し出す。
+                # 衝突点がちょうど子端(t=1)なら従来のresolve_collisionsと
+                # 完全に同じ全量。親寄り(t小)ほど弱め、その分は「一段上の
+                # 区間(この親をさらに子とする区間)」自身のテストが、その
+                # 区間のt(子端=この親の位置)側で拾う前提(実測で親も同時に
+                # 動かす按分は縦拘束と噛み合わず過剰補正になったため撤回)。
+                if not c.kinematic and not (excl_c is not None and rbi in excl_c):
+                    add_correction(c.rb, _scale(push, t_self))
+
+    # 最終適用: 単純に加算するのではなく、親からの距離がrest_lenちょうどに
+    # なるよう再正規化する。これにより「親を中心とした球面上を動く」実質的な
+    # 円運動になり、後続の縦チェーン反復でrest_len拘束に無理やり戻される
+    # 不自然さ(硬い・ガタガタする見た目)が無くなる(実機フィードバック
+    # 「押し出されて移動する点の動きは親を中心にする円運動だと思うが、直線的
+    # に動いているように見える」を受けて追加)。
+    for rb, delta in corrections.items():
+        p_obj = part.get(rb)
+        P0 = pos[rb]
+        new_pos = _add(P0, delta)
+        if p_obj is not None and p_obj.parent != -1 and p_obj.parent in pos and p_obj.rest_len > 1e-9:
+            ppos = pos[p_obj.parent]
+            rel = _sub(new_pos, ppos)
+            rlen = _len(rel)
+            if rlen > 1e-9:
+                new_pos = _add(ppos, _scale(rel, p_obj.rest_len / rlen))
+        pos[rb] = new_pos
+        if accum is not None:
+            actual_disp = _sub(new_pos, P0)
+            if _len(actual_disp) > 1e-12:
+                accum[rb] = _add(accum.get(rb, (0.0, 0.0, 0.0)), actual_disp)
 
 
 # ======================================================================

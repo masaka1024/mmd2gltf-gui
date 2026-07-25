@@ -68,6 +68,10 @@ def main(argv=None):
                     help="rest-shape restoring force (default 1.5)")
     ap.add_argument("--hair-gravity", type=float, default=0.02, metavar="F",
                     help="gravity strength (default 0.02; 0 keeps rest shape)")
+    ap.add_argument("--collision-bounce", type=float, default=0.0, metavar="F",
+                    help="extra bounce when a hair/cloth particle is pushed "
+                    "out of a collider (default 0.0 = no bounce, unchanged "
+                    "behavior; higher = springier on contact)")
     ap.add_argument("--collision-margin", type=float, default=0.01, metavar="F",
                     help="clearance kept between cloth and body colliders in "
                     "glTF units (default 0.01). Increase if the skirt visually "
@@ -140,6 +144,191 @@ def main(argv=None):
                     "scales roughly linearly with N. The push direction is "
                     "always horizontal (perpendicular to gravity), never "
                     "up/down, regardless of this setting")
+    ap.add_argument("--rb-size-margin-scale", type=float, default=0.0,
+                    metavar="F",
+                    help="derive extra clearance from each skirt rigid "
+                    "body's own PMX box size (the smallest of size_x/y/z, "
+                    "taken as the panel's thickness), scaled by this factor "
+                    "and added on top of --collision-margin/--hem-extra-margin "
+                    "(default 0.0 = off, unchanged behavior). Bone-position "
+                    "collision treats particles as zero-size points, while "
+                    "the PMX skirt rigid bodies are actually thin boxes, so "
+                    "real MMD viewers get a snug, non-bulging fit 'for free' "
+                    "from that volume; this approximates the same effect by "
+                    "reading the box size back out of the model. Only "
+                    "affects box-shaped (shape=1) rigid bodies within the "
+                    "skirt/lower-body chain set; capsule/sphere jiggle bodies "
+                    "are unaffected. Start around 1.0 and adjust to taste, "
+                    "since whether PMX size values are half- or full-extent "
+                    "can vary by tool/model")
+    ap.add_argument("--lateral-slack-scale", type=float, default=0.0,
+                    metavar="F",
+                    help="allow slack in the skirt's lateral ring distance "
+                    "constraint (between adjacent panels at the same height), "
+                    "derived from the real PMX joint's linearLimitMin/Max "
+                    "(default 0.0 = off, unchanged hard equality constraint). "
+                    "Real MMD/Bullet solves these joints with spring "
+                    "stiffness 0 and a translation limit -- free movement "
+                    "inside that range, hard stop at the edges -- while this "
+                    "solver always pulled the distance back to exactly "
+                    "rest_len, which can look stiff/origami-like on flare "
+                    "skirts. At 1.0, distances within [rest_len-slack, "
+                    "rest_len+slack] are left uncorrected; only distances "
+                    "outside that range are pushed back to the nearest edge "
+                    "(not all the way to rest_len). Start around 1.0 and "
+                    "adjust to taste")
+    ap.add_argument("--vertical-spread-scale", type=float, default=0.0,
+                    metavar="F",
+                    help="distribute a collision-pushed particle's "
+                    "displacement to its immediate vertical neighbors "
+                    "(one ring up, one ring down) in the same chain "
+                    "(default 0.0 = off, unchanged). Since this solver moves "
+                    "one point at a time, a single ring pushed out by a leg "
+                    "can look like a sliced tube, especially on bent-leg "
+                    "poses, whereas real MMD's panels rotate around a joint "
+                    "with very free rotation limits and follow the leg's "
+                    "angle smoothly. This approximates that by leaking a "
+                    "fraction of the push to neighboring rings so the bend "
+                    "spreads out instead of kinking at one ring. Start "
+                    "around 1.0 and adjust to taste")
+    ap.add_argument("--cloth-algorithm", choices=["points", "rigid_chain", "rigid_body"],
+                    default="points",
+                    help="skirt solver: 'points' (default) is the existing "
+                    "point-mass chain. 'rigid_chain' is an experimental "
+                    "alternative that simulates each ring's orientation "
+                    "directly (inertia + gravity torque + stiffness + the "
+                    "real PMX joint's per-axis X/Y/Z angle limits), matching "
+                    "how real MMD/Bullet panels rotate around a joint instead "
+                    "of moving as bare points. Currently vertical drive + "
+                    "lateral ring only: no collision, adaptive substep, or "
+                    "midpoint correction support yet")
+    ap.add_argument("--rigid-chain-gravity-power", type=float, default=20.0,
+                    metavar="F",
+                    help="gravity strength for --cloth-algorithm rigid_chain, "
+                    "in radians of rotation per second (not the same units "
+                    "as --gravity, which is a linear displacement). Default "
+                    "20.0 was picked from real-data testing where the hem's "
+                    "deviation angle saturates against the joint's own X-axis "
+                    "limit around this value")
+    ap.add_argument("--rigid-chain-stiffness-force", type=float, default=1.0,
+                    metavar="F",
+                    help="stiffness for --cloth-algorithm rigid_chain: "
+                    "fraction of the orientation deviation relaxed back "
+                    "toward rest per second (clamped 0..1 after *dt). "
+                    "Default 1.0")
+    ap.add_argument("--rigid-body-gravity", type=float, default=9.8,
+                    metavar="F",
+                    help="gravity acceleration magnitude for --cloth-algorithm "
+                    "rigid_body (a real physical value, unlike --gravity's "
+                    "per-frame nudge). Default 9.8 (Earth gravity)")
+    ap.add_argument("--rigid-body-linear-damping", type=float, default=1.0,
+                    metavar="F",
+                    help="scale factor applied to each skirt rigid body's "
+                    "OWN linear damping value from the PMX file (matching "
+                    "Bullet's applyDamping). Default 1.0 uses the model's "
+                    "real value as-is (e.g. 0.9 for this IA model); previous "
+                    "versions used a flat 0.1 for every body regardless of "
+                    "the model, which was found to under-damp the "
+                    "simulation significantly")
+    ap.add_argument("--rigid-body-angular-damping", type=float, default=1.0,
+                    metavar="F",
+                    help="scale factor applied to each skirt rigid body's "
+                    "OWN angular damping value from the PMX file. Default "
+                    "1.0 uses the model's real value as-is")
+    ap.add_argument("--rigid-body-warmup-seconds", type=float, default=20.0/30.0,
+                    metavar="F",
+                    help="settling time (seconds, holding frame 0's pose) "
+                    "for --cloth-algorithm rigid_body before real playback "
+                    "starts, letting the skirt fall from bind pose to a "
+                    "natural hang under gravity. Default matches the "
+                    "existing 20-frame warmup (~0.67s). Increase this if "
+                    "the initial drop from bind pose looks too abrupt")
+    ap.add_argument("--rigid-body-iterations", type=int, default=4,
+                    metavar="N",
+                    help="Gauss-Seidel constraint solver iterations per "
+                    "frame for --cloth-algorithm rigid_body. Default 4. "
+                    "Using the PMX model's own (often high, e.g. 0.9) "
+                    "damping values can require more iterations to converge "
+                    "without the skirt ring collapsing; prefer raising this "
+                    "over lowering damping away from the model's real "
+                    "values, which would defeat the purpose of a physically "
+                    "faithful simulation")
+    ap.add_argument("--rigid-body-prime-full-motion", action="store_true",
+                    help="for --cloth-algorithm rigid_body: play through the "
+                    "whole motion once first (output discarded) before "
+                    "recording the real pass from frame 0, using the settled "
+                    "physics state as the new starting point. Mirrors real "
+                    "MMD viewers, where the first playthrough's frame 0 "
+                    "looks chaotic but the second playthrough (bones reset "
+                    "to their frame-0 keyframes, physics keeps its settled "
+                    "state) looks correct. Roughly doubles conversion time")
+    ap.add_argument("--rigid-body-self-collision-scale", type=float, default=1.0,
+                    metavar="F",
+                    help="fraction of each pair's combined half-width used "
+                    "as the minimum separation distance for skirt self-"
+                    "collision. Default 1.0 (the full half-width sum). A "
+                    "lower value was tried as a fix for the skirt getting "
+                    "stuck near its initial pose, but the real cause turned "
+                    "out to be a damping formula bug (see --rigid-body-"
+                    "linear-damping); with that fixed, 1.0 gives clearly "
+                    "better results")
+    ap.add_argument("--rigid-body-max-linear-speed", type=float, default=20.0,
+                    metavar="F",
+                    help="clamp on each skirt rigid body's linear speed "
+                    "(units/sec). Default 20.0. Mirrors Bullet's own "
+                    "MAX_ANGVEL safety clamp in btRigidBody::"
+                    "integrateVelocities, which this implementation lacked; "
+                    "without it, a sudden large anchor jump (e.g. motion "
+                    "start, or the transition from a rigid-body-prime-full-"
+                    "motion priming pass to the recorded pass) can inject "
+                    "runaway velocity that propagates and never settles")
+    ap.add_argument("--rigid-body-max-angular-speed", type=float, default=30.0,
+                    metavar="F",
+                    help="clamp on each skirt rigid body's angular speed "
+                    "(radians/sec). Default 30.0. See --rigid-body-max-"
+                    "linear-speed")
+    ap.add_argument("--rigid-body-substeps", type=int, default=2,
+                    metavar="N",
+                    help="split each 1/fps-second frame into N substeps for "
+                    "--cloth-algorithm rigid_body, interpolating the anchor "
+                    "bone's position/rotation between frames for the "
+                    "in-between substeps. Default 2. Added after learning "
+                    "the real MMD viewer runs at 60fps (double this tool's "
+                    "default 30fps): a smaller timestep gives the same "
+                    "iteration count less error to resolve each step, which "
+                    "may help more than simply raising --rigid-body-"
+                    "iterations. 1 disables substepping (one step per frame, "
+                    "the original behavior)")
+    ap.add_argument("--segment-aware-collision", action="store_true",
+                    help="for --cloth-algorithm points (skirt only, does not "
+                    "affect hair): resolve collider push-out against each "
+                    "parent-to-child SEGMENT instead of a single particle. "
+                    "When the collision point falls partway along a segment, "
+                    "the push-out is distributed between the parent and "
+                    "child particles instead of only moving whichever one "
+                    "happened to be the one flagged as colliding. Aims at "
+                    "the 'staircase' look (segments popping out unevenly, "
+                    "e.g. when one leg lifts) at its root cause rather than "
+                    "smoothing the result afterward like --vertical-spread-"
+                    "scale does. Default off (identical to the existing "
+                    "per-particle resolve_collisions)")
+    ap.add_argument("--skirt-bone-twist", action="store_true",
+                    help="for --cloth-algorithm points (skirt only, does not "
+                    "affect hair): keep each skirt bone's real rotation "
+                    "(mesh twist) instead of always forcing it to identity. "
+                    "World position is unaffected either way (already baked "
+                    "exactly via translation); this only controls how the "
+                    "segment's tilt is conveyed to skin weighting. Off by "
+                    "default because early testing found the raw rotation "
+                    "could jump ~109 degrees in one frame at a q_from_to "
+                    "singularity for tangled chain topologies (e.g. ring-"
+                    "crossing joints) -- but that jump is already clamped by "
+                    "simulate_step_cloth's own q_slerp_toward safety net "
+                    "(max 60 degrees change per frame from the previous "
+                    "frame), so enabling this should be safe while fixing "
+                    "the 'bulge at the midpoint of a segment, not the bone "
+                    "itself' artifact from discarding twist information "
+                    "entirely")
     a = ap.parse_args(argv)
 
     out = a.output or os.path.splitext(a.pmx)[0] + ".glb"
@@ -166,7 +355,26 @@ def main(argv=None):
                 midpoint_correction_iters=a.midpoint_correction_iters,
                 midpoint_correction_margin=a.midpoint_correction_margin,
                 midpoint_correction_collider_names=a.midpoint_correction_collider,
-                midpoint_correction_samples=a.midpoint_correction_samples)
+                midpoint_correction_samples=a.midpoint_correction_samples,
+                collision_bounce=a.collision_bounce,
+                rb_size_margin_scale=a.rb_size_margin_scale,
+                lateral_slack_scale=a.lateral_slack_scale,
+                vertical_spread_scale=a.vertical_spread_scale,
+                cloth_algorithm=a.cloth_algorithm,
+                rigid_chain_gravity_power=a.rigid_chain_gravity_power,
+                rigid_chain_stiffness_force=a.rigid_chain_stiffness_force,
+                rigid_body_gravity=a.rigid_body_gravity,
+                rigid_body_linear_damping=a.rigid_body_linear_damping,
+                rigid_body_angular_damping=a.rigid_body_angular_damping,
+                rigid_body_warmup_seconds=a.rigid_body_warmup_seconds,
+                rigid_body_iterations=a.rigid_body_iterations,
+                rigid_body_prime_full_motion=a.rigid_body_prime_full_motion,
+                rigid_body_self_collision_scale=a.rigid_body_self_collision_scale,
+                rigid_body_max_linear_speed=a.rigid_body_max_linear_speed,
+                rigid_body_max_angular_speed=a.rigid_body_max_angular_speed,
+                rigid_body_substeps=a.rigid_body_substeps,
+                segment_aware_collision=a.segment_aware_collision,
+                skirt_bone_twist=a.skirt_bone_twist)
     except Exception as e:
         print("error:", e, file=sys.stderr)
         return 1
