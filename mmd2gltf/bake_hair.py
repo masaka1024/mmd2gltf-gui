@@ -9,7 +9,7 @@ import math
 # 本体(パッケージ)では from .physics import に変更すること
 from .physics import (q_mul, q_rotate_vec, q_conj, q_normalize,
                      compute_bone_world_matrices, trs_to_mat, mat_mul,
-                     mat_ident, mat_to_trs, euler_to_quat, MMD_EULER_ORDER)
+                     mat_ident, mat_to_trs, euler_to_quat)
 
 # このファイルが実際にどのビルドかをログで確認するためのバージョン識別子。
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
@@ -73,7 +73,6 @@ def extract_chains(physics_gltf, bone_world_matrices, only_names=None):
         parent_rb[j["rigidB"]] = (j["rigidA"], j)
 
     # dynamic（mode1/2）で対象の剛体をパーティクル化
-    idx_of = {}
     parts = {}
     for i, rb in enumerate(rbs):
         if rb["mode"] in (1, 2) and target(rb):
@@ -227,6 +226,11 @@ class SpringState:
         self.prev = {}
         self.part = {}
         self.rest_dir = {}  # rb(child) -> 親からのrest方向(world, 単位)。親rest回転=identity前提
+        # set_anchor()内の遅延初期化(getattr)に頼らずここで作る。アンカーが
+        # 1つも無いモデルではset_anchorが一度も呼ばれず、rigid_chainパスの
+        # state_cloth._anchor_rot 直接参照がAttributeErrorで落ちていた。
+        # set_anchorが呼ばれる通常ケースでは挙動・演算結果とも完全に同一。
+        self._anchor_rot = {}  # rb -> アンカーボーンのワールド回転(quat)
         for ch in chains:
             for p in ch.particles:
                 if p.rb not in self.part:
@@ -261,7 +265,7 @@ def simulate_step(state, gravity_dir, dt, drag_force, stiffness_force,
       gravity_power  : 重力の強さ（gravity_dir 方向、*dt でスケール）
     戻り値: seg_rot[rb] = 各ボーンセグメントのワールド回転(quat)
     """
-    pos, prev, part, rest_dir = state.pos, state.prev, state.part, state.rest_dir
+    pos, prev, rest_dir = state.pos, state.prev, state.rest_dir
     anchor_rot = getattr(state, "_anchor_rot", {})
     seg_rot = {}
     stiff = stiffness_force * dt
@@ -2472,9 +2476,9 @@ def _quat_to_euler_yxz(q):
     xx, yy, zz = x*x, y*y, z*z
     xy, xz, yz = x*y, x*z, y*z
     wx, wy, wz = w*x, w*y, w*z
-    m11 = 1 - 2*(yy+zz); m12 = 2*(xy-wz); m13 = 2*(xz+wy)
+    m11 = 1 - 2*(yy+zz); m13 = 2*(xz+wy)
     m21 = 2*(xy+wz);     m22 = 1 - 2*(xx+zz); m23 = 2*(yz-wx)
-    m31 = 2*(xz-wy);     m32 = 2*(yz+wx);     m33 = 1 - 2*(xx+yy)
+    m31 = 2*(xz-wy);     m33 = 1 - 2*(xx+yy)
     m23c = max(-1.0, min(1.0, m23))
     rx = math.asin(-m23c)
     if abs(m23c) < 0.9999999:
@@ -2564,7 +2568,6 @@ def simulate_step_rigid_chain(chains, rest_dir, rest_len, part, pos, anchor_rot,
             # 3) stiffness: 親相対の偏差(dev = wq を q_par 基準に見たもの)を
             #    rest(恒等)へ向けてstiff割合だけ緩和する。restは「親の現在
             #    の姿勢に対して」定義されるので、ここだけは親相対で扱う。
-            tgt_dir = q_rotate_vec(q_par, rdir)
             if stiff > 0.0:
                 dev = q_mul(wq, q_conj(q_par))
                 axis_s, ang_s = _quat_to_axis_angle(dev)

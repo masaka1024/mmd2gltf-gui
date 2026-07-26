@@ -11,7 +11,6 @@ material & bone morphs, SDEF, display frames, ...) is preserved verbatim
 """
 import io
 import os
-import struct
 import sys
 
 from .pmx import parse_pmx
@@ -19,7 +18,7 @@ from .vmd import parse_vmd
 from . import gltf as G
 from . import physics
 from .bake_hair import bake_hair_into_gltf
-from .animation import bake, Track, FPS
+from .animation import bake, FPS
 
 try:
     from PIL import Image

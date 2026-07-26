@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Minimal glTF 2.0 / GLB builder."""
 import json
+import os
 import struct
 
 FLOAT = 5126
@@ -105,14 +106,31 @@ class GltfBuilder:
         while len(self.bin) % 4:
             self.bin.append(0)
         self.j["buffers"] = [{"byteLength": len(self.bin)}]
-        js = json.dumps(self.j, ensure_ascii=False,
-                        separators=(",", ":")).encode("utf-8")
+        # allow_nan=False: 物理ベイク等の計算がNaN/Infinityを混入させた場合、
+        # 従来は json.dumps がPython拡張の 'NaN' トークンを黙って書き出し、
+        # JSON仕様違反の壊れたGLB(多くのビューアで読み込み不能)が完成して
+        # いた。ここで即エラーにして原因箇所を特定可能にする。正常なデータ
+        # では出力バイト列は完全に不変。
+        try:
+            js = json.dumps(self.j, ensure_ascii=False, allow_nan=False,
+                            separators=(",", ":")).encode("utf-8")
+        except ValueError as e:
+            raise ValueError(
+                "glTF JSON contains NaN/Infinity (invalid JSON; the GLB "
+                "would fail to load in most viewers). "
+                "Original error: %s" % e) from e
         while len(js) % 4:
             js += b" "
         total = 12 + 8 + len(js) + 8 + len(self.bin)
-        with open(path, "wb") as f:
+        # 一時ファイルに書いてから os.replace で差し替える(アトミック書き込み)。
+        # 従来は出力先を直接開いて書いていたため、書き込み途中の強制終了
+        # (ウィンドウを閉じる=daemonワーカーkill 等)で「前回の正常な.glbが
+        # 壊れた中途半端なファイルで上書きされる」危険があった。
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
             f.write(struct.pack("<4sII", b"glTF", 2, total))
             f.write(struct.pack("<I4s", len(js), b"JSON"))
             f.write(js)
             f.write(struct.pack("<I4s", len(self.bin), b"BIN\x00"))
             f.write(bytes(self.bin))
+        os.replace(tmp, path)
