@@ -44,8 +44,23 @@ def _parse_dropped_paths(data):
 
 
 def _detect_default_lang():
+    # locale.getdefaultlocale() はPython 3.13でDeprecationWarning、3.15で削除
+    # 予定。存在する間はこれまで通り使い(判定結果を変えないため)、無くなった
+    # 環境では getlocale() → 環境変数 の順でフォールバックする。
+    # 日本語Windowsでは getdefaultlocale()が'ja_JP'、getlocale()が
+    # 'Japanese_Japan'を返し、どちらも "ja" 判定になるので結果は同じ。
+    loc = ""
     try:
-        loc = locale.getdefaultlocale()[0] or ""
+        get = getattr(locale, "getdefaultlocale", None)
+        if get is not None:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                loc = get()[0] or ""
+        if not loc:
+            loc = locale.getlocale()[0] or ""
+        if not loc:
+            loc = os.environ.get("LANG", "") or os.environ.get("LC_ALL", "")
     except Exception:
         loc = ""
     return "ja" if loc.lower().startswith("ja") else "en"
