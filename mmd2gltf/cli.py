@@ -62,8 +62,11 @@ def main(argv=None):
                     "all=all dynamic bodies incl. skirts (cloth solver "
                     "handles ring structures) (default: hair)")
     ap.add_argument("--hair-drag", type=float, default=0.85, metavar="F",
-                    help="velocity retention 0..1 (default 0.85; higher = "
-                    "floppier)")
+                    help="velocity damping 0..1 (default 0.85). Each frame, "
+                    "this fraction of the previous momentum is discarded "
+                    "(inertia scales by 1-drag): lower = keeps more momentum "
+                    "(stronger centrifugal swing on turns), higher = settles "
+                    "faster")
     ap.add_argument("--hair-stiffness", type=float, default=1.5, metavar="F",
                     help="rest-shape restoring force (default 1.5)")
     ap.add_argument("--hair-gravity", type=float, default=0.02, metavar="F",
@@ -95,6 +98,16 @@ def main(argv=None):
                     "chain (default 0.0 = off). Unlike raising --collision-margin "
                     "globally, this does not push waist-side segments outward "
                     "(verified: waist angle stays fixed while raising this)")
+    ap.add_argument("--hem-extend-scale", type=float, default=0.0, metavar="F",
+                    help="virtually extend each skirt chain's last (hem) "
+                    "segment downward for collision testing, by the tail rigid "
+                    "body's half height (PMX box size[1]) times this factor "
+                    "(default 0.0 = off; 1.0 = reach the bottom of the authored "
+                    "box). Motivated by inspecting real models: the tail bone "
+                    "sits at the center of the lowest rigid body plate, so the "
+                    "authored collision volume extends half a plate below the "
+                    "last particle. Effective only together with "
+                    "--segment-aware-collision")
     ap.add_argument("--adaptive-substep-threshold", type=float, default=None,
                     metavar="F",
                     help="enable adaptive substepping for cloth (skirts etc.) "
@@ -348,6 +361,7 @@ def main(argv=None):
                 force_no_collision_names=a.force_no_collision,
                 allowed_collider_names=a.allowed_collider,
                 hem_extra_margin=a.hem_extra_margin,
+                hem_extend_scale=a.hem_extend_scale,
                 adaptive_substep_threshold=a.adaptive_substep_threshold,
                 adaptive_substep_max_n=a.adaptive_substep_max_n,
                 adaptive_substep_collider_names=a.adaptive_substep_collider,

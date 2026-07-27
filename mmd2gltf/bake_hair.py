@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj, q_normalize,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-25f (rigid_chain: inertia now tracks world-space orientation instead of parent-relative deviation, so centrifugal swing-out under fast parent rotation works; fixes 'never flares out when spinning' reported by user viewer feedback)"
+BAKE_HAIR_VERSION = "2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -448,6 +448,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         gravity_dir=(0.0, -1.0, 0.0), fps=30.0,
                         only_names=("髪",), force_no_collision_names=None,
                         allowed_collider_names=None, hem_extra_margin=0.0,
+                        hem_extend_scale=0.0,
                         adaptive_substep_threshold=None, adaptive_substep_max_n=4,
                         adaptive_substep_collider_names=None,
                         midpoint_correction=False, midpoint_correction_iters=2,
@@ -729,6 +730,19 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         相当まで戻る)ため、根元は完全に不変のまま裾へ向けて安全にクリアランスを
         稼ぐための逃げ道。裾の1パーティクルだけをON/OFFする段差ではなく、
         チェーンの深さに比例して連続的に変化するので不自然な継ぎ目が出ない。
+    hem_extend_scale : 裾延長。スカート各チェーンの終端セグメントを、最下段
+        剛体(形状=箱)の半高さ×この倍率だけ子端方向へ仮想的に延長して衝突
+        評価する(resolve_collisions_segments専用。segment_aware_collision=True
+        とセットで使う)。実機の物理インスペクターでの観察「縦ボーンの終端は
+        剛体プレートの中央にある」に基づく: 本家では最下段の箱が終端ボーンの
+        下へ半高さぶんはみ出して干渉域を持つが、リング(パーティクル/線分)
+        評価にはその領域が存在せず、同じ姿勢でも脚が一段深く入ってから
+        押し返し始める。延長量はPMXの実寸(size[1]。PMXの箱サイズは半値=
+        Bulletのhalf extentsなので、そのまま半高さ)から取るため、
+        rb_size_margin_scale等と同じ「モデルにある数値を使う」設計。
+        1.0でちょうど本家の箱の底に相当する位置まで届く。延長部でのヒットは
+        「裾の縁が押された」とみなし子端全量(t=1.0)として転写する。
+        デフォルト0.0で無効(既存挙動とビット単位で完全に同じ)。
     adaptive_substep_threshold : 適応サブステップの発動閾値(コライダー半径に
         対する比率)。フレーム間の「布アンカー変位＋近傍コライダー変位」の
         合計(三角不等式による安全側の上限見積もり)が、最も近いコライダーの
@@ -998,6 +1012,42 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                   "steps)"
                   % (rb_size_margin_scale, len(rb_size_extra),
                      min(_vals), max(_vals), sum(_vals) / len(_vals)))
+
+    # 裾延長(hem_extend_scale): 実機の物理インスペクター観察「縦ボーンの終端は
+    # 剛体プレートの中央」に基づき、最下段剛体が終端パーティクルの下へはみ出す
+    # 半高さぶんだけ、終端セグメントを仮想延長して衝突評価する(適用は
+    # resolve_collisions_segments側。segment_aware_collision=True時のみ効く)。
+    # 値はチェーン終端剛体(形状=箱)のsize[1](PMX箱サイズ=半値なのでそのまま
+    # 半高さ)×倍率。physicsGltf由来のサイズは衝突評価と同じ空間なので単位
+    # 変換は不要(colliders_defと同じ流儀)。
+    # hem_extend_scale=0.0(デフォルト)なら空辞書のままで既存挙動と完全に同じ。
+    hem_extend = {}
+    if hem_extend_scale > 0.0:
+        for ch in chains:
+            dyn = [p for p in ch.particles if p.rb in skirt_rbs and not p.kinematic]
+            if not dyn:
+                continue
+            _tp = dyn[-1]
+            if not (0 <= _tp.rb < len(rbs_names_all)):
+                continue
+            _rbdef = rbs_names_all[_tp.rb]
+            if _rbdef.get("shape") != 1:   # 1=箱 以外は対象外
+                continue
+            _sz = _rbdef.get("size", ())
+            if len(_sz) < 2 or _sz[1] <= 0:
+                continue
+            hem_extend[_tp.rb] = _sz[1] * hem_extend_scale
+        if hem_extend:
+            _vals = list(hem_extend.values())
+            print("  [physics] hem_extend_scale=%.3f: %d skirt chain tail "
+                  "segment(s) virtually extended for collision "
+                  "(min=%.4f, max=%.4f, mean=%.4f)"
+                  % (hem_extend_scale, len(hem_extend),
+                     min(_vals), max(_vals), sum(_vals) / len(_vals)))
+        else:
+            print("  [physics] hem_extend_scale=%.3f: no eligible skirt chain "
+                  "tail rigid body (shape=box) found; feature inactive"
+                  % hem_extend_scale)
 
     # 横拘束(lateral)はスカートのリング(2次元クロス)専用。髪・ネクタイ・胸などの
     # チェーン型揺れ物は、モデルにストランド間ジョイントがあると非ツリー辺として
@@ -1439,7 +1489,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                 lateral_slack_scale=lateral_slack_scale,
                                 vertical_spread_scale=vertical_spread_scale,
                                 vertical_neighbors=vertical_neighbors,
-                                segment_aware_collision=segment_aware_collision)
+                                segment_aware_collision=segment_aware_collision,
+                                hem_extend=hem_extend)
 
     # cloth_algorithm="rigid_body"専用: 全モーションを通しで一度「助走」させて
     # から、frame0から本番の記録をやり直す2パス方式。実機フィードバックで
@@ -1773,23 +1824,38 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                             lateral_slack_scale=lateral_slack_scale,
                                             vertical_spread_scale=vertical_spread_scale,
                                             vertical_neighbors=vertical_neighbors,
-                                            segment_aware_collision=segment_aware_collision)
+                                            segment_aware_collision=segment_aware_collision,
+                                            hem_extend=hem_extend)
             if _midpoint_enabled:
                 # N=1(実質1サブステップ)のフレームでは、通常呼び出し直後に1回だけ補正。
                 _apply_midpoint_correction(a, cols_f)
         else:
             # 発動フレーム: アンカー・コライダーをN分割補間しつつN回呼ぶ。
-            # gravity_power は 1/N、drag_force は N乗根でスケーリングし、
-            # N回分の積み重ねが1回分と釣り合うようにする(dtは変更しない)。
+            # gravity_power は 1/N でスケーリングし、N回分の積み重ねが1回分と
+            # 釣り合うようにする(dtは変更しない)。
+            # drag は「減衰率」で、積分では速度に (1 - drag) が掛かる(保持率が
+            # 1-drag)。N回の積み重ねで保持率が (1-drag) に戻るように、
+            # サブステップごとの保持率を (1-drag)^(1/N) にする。
+            # 旧実装 drag_force**(1/N) は「drag=保持率」という誤ったモデルの
+            # 合成則で、drag=0.85・N=2なら保持率が意図の15%に対し0.6%、N=4で
+            # ほぼ0となり、発動フレーム(=一番勢いが欲しい速い動きのフレーム)
+            # だけ慣性が毎回消える過減衰を招いていた(実機フィードバック
+            # 「サブステップを有効にすると減衰が早くなる」の原因)。
             grav_sub = gravity_power / n_sub
-            drag_sub = drag_force ** (1.0 / n_sub)
+            drag_sub = 1.0 - (1.0 - drag_force) ** (1.0 / n_sub)
+            # stiffness は積分内で毎呼び出し stiffness_force*dt の変位を rest 方向へ
+            # 加算するため、無スケールだとN回でフレームあたりN倍の引き戻しになる。
+            # gravity_power と同格の 1/N でスケーリングし、N回分の合計が1回分と
+            # 釣り合うようにする(拘束反復が間に挟まるため厳密等価にはならないが、
+            # N倍の系統的な偏りは除去される)。
+            stiff_sub = stiffness_force / n_sub
             for si in range(1, n_sub + 1):
                 t = si / n_sub
                 a_sub = _lerp_anchor(prev_anchor_full, a, t)
                 cols_sub = _lerp_colliders(prev_colliders_full, cols_f, t)
                 _set_anchors(state_cloth, a_sub)
                 seg_cloth = simulate_step_cloth(state_cloth, gravity_dir, dt, drag_sub,
-                                                stiffness_force, lateral,
+                                                stiff_sub, lateral,
                                                 gravity_power=grav_sub, iterations=6,
                                                 colliders=cols_sub, body_axis=body_axis_f,
                                                 radial_rbs=skirt_rbs, margin=collision_margin,
@@ -1801,7 +1867,8 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                                 lateral_slack_scale=lateral_slack_scale,
                                                 vertical_spread_scale=vertical_spread_scale,
                                                 vertical_neighbors=vertical_neighbors,
-                                                segment_aware_collision=segment_aware_collision)
+                                                segment_aware_collision=segment_aware_collision,
+                                                hem_extend=hem_extend)
                 if _midpoint_enabled:
                     # 「逆順」= サブステップ1回ごとに毎回補正をかける。フレーム
                     # 終わりに1回だけ補正するより、検証の結果わずかに有利
@@ -2180,13 +2247,17 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         allowed_collider_rbi=None, hem_weight=None, hem_extra_margin=0.0,
                         collision_bounce=0.0, extra_margin_by_rb=None,
                         lateral_slack_scale=0.0, vertical_spread_scale=0.0,
-                        vertical_neighbors=None, segment_aware_collision=False):
+                        vertical_neighbors=None, segment_aware_collision=False,
+                        hem_extend=None):
     """縦チェーン＋横距離拘束を反復して解くクロスソルバ。
     lateral: [(rb_i, rb_j, rest_len, joint_slack), ...]
     segment_aware_collision: Trueだと衝突判定をパーティクル単体でなく
       「親→子の区間」に対して行い(resolve_collisions_segments)、衝突点が
       区間の途中にあるときは押し出しを親・子へ按分する。既定Falseで
       既存挙動(resolve_collisions、パーティクル単体判定)と完全に同じ。
+    hem_extend: {終端パーティクルrb: 延長長} の辞書。segment_aware_collision=True
+      のときのみ使用(裾延長。詳細はbake_hair_into_gltfのhem_extend_scale参照)。
+      None/空(デフォルト)なら既存挙動と完全に同じ。
     戻り値: seg_rot[rb]
     """
     pos, prev, part, rest_dir = state.pos, state.prev, state.part, state.rest_dir
@@ -2272,7 +2343,8 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                                             exclude_rb=exclude_rb,
                                             allowed_collider_rbi=allowed_collider_rbi,
                                             hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
-                                            accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+                                            accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb,
+                                            hem_extend=hem_extend)
             else:
                 resolve_collisions(state, colliders, body_axis=body_axis,
                                    radial_rbs=radial_rbs, margin=margin,
@@ -2291,7 +2363,8 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                                         exclude_rb=exclude_rb,
                                         allowed_collider_rbi=allowed_collider_rbi,
                                         hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
-                                        accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+                                        accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb,
+                                        hem_extend=hem_extend)
         else:
             resolve_collisions(state, colliders, body_axis=body_axis,
                                radial_rbs=radial_rbs, margin=margin,
@@ -3096,7 +3169,7 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
 def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin=0.0,
                                 radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None,
                                 hem_weight=None, hem_extra_margin=0.0, accum=None,
-                                extra_margin_by_rb=None):
+                                extra_margin_by_rb=None, hem_extend=None):
     """resolve_collisions と同じ押し出しロジックを使うが、パーティクル単体でなく
     「親→子の区間(セグメント)」をコライダーに対してテストする。
 
@@ -3182,8 +3255,23 @@ def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin
             _eff_margin_c = (margin
                            + hem_extra_margin * (hem_weight.get(c.rb, 0.0) if hem_weight else 0.0)
                            + (extra_margin_by_rb.get(c.rb, 0.0) if extra_margin_by_rb else 0.0))
-            seg_half = _len(_sub(Pc, Pa)) * 0.5
-            midx = (Pa[0]+Pc[0])*0.5; midy = (Pa[1]+Pc[1])*0.5; midz = (Pa[2]+Pc[2])*0.5
+            # 裾延長(hem_extend): 終端セグメントのみ、最下段剛体のはみ出し分
+            # (半高さ×倍率)だけ子端を仮想延長した線分Pa→Peで衝突評価する。
+            # ext=0(hem_extend未指定/該当なし)ならPe==Pcとなり、以降の計算は
+            # 既存とビット単位で同一。
+            ext = hem_extend.get(c.rb, 0.0) if (hem_extend and k == len(plist) - 1) else 0.0
+            if ext > 0.0:
+                _sv = _sub(Pc, Pa)
+                seg_len = _len(_sv)
+                if seg_len > 1e-9:
+                    Pe = _add(Pc, _scale(_sv, ext / seg_len))
+                else:
+                    ext = 0.0
+                    Pe = Pc
+            else:
+                Pe = Pc
+            seg_half = _len(_sub(Pe, Pa)) * 0.5
+            midx = (Pa[0]+Pe[0])*0.5; midy = (Pa[1]+Pe[1])*0.5; midz = (Pa[2]+Pe[2])*0.5
             for col, ccx, ccy, ccz, cull, rbi in _bp:
                 dxc = midx-ccx; dyc = midy-ccy; dzc = midz-ccz
                 cull_total = cull + seg_half
@@ -3194,13 +3282,13 @@ def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin
                 kind = col[0]
                 if kind == "capsule":
                     _, a_, b_, rad, cgroup, cmask, _rbi = col
-                    t_self, t_col = _closest_segment_segment_t(Pa, Pc, a_, b_)
-                    Q = _add(Pa, _scale(_sub(Pc, Pa), t_self))
+                    t_self, t_col = _closest_segment_segment_t(Pa, Pe, a_, b_)
+                    Q = _add(Pa, _scale(_sub(Pe, Pa), t_self))
                     C = _add(a_, _scale(_sub(b_, a_), t_col))
                     u_axis = _norm(_sub(b_, a_))
                 elif kind == "sphere":
                     _, C, rad, cgroup, cmask, _rbi = col
-                    Q, t_self = _closest_on_segment_t(C, Pa, Pc)
+                    Q, t_self = _closest_on_segment_t(C, Pa, Pe)
                     u_axis = None
                 else:
                     continue
@@ -3239,6 +3327,11 @@ def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin
                 # 区間(この親をさらに子とする区間)」自身のテストが、その
                 # 区間のt(子端=この親の位置)側で拾う前提(実測で親も同時に
                 # 動かす按分は縦拘束と噛み合わず過剰補正になったため撤回)。
+                if ext > 0.0:
+                    # t_selfは延長線分Pa→Pe上の割合。押し出しの転写は実セグメント
+                    # Pa→Pc基準に読み替え、延長部でのヒット(実セグメントの外)は
+                    # 「裾の縁が押された」として子端全量(t=1.0)に飽和させる。
+                    t_self = min(t_self * (seg_len + ext) / seg_len, 1.0)
                 if not c.kinematic and not (excl_c is not None and rbi in excl_c):
                     add_correction(c.rb, _scale(push, t_self))
 
