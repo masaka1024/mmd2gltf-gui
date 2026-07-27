@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MMD Physics Inspector — 剛体・ジョイント可視化</title>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1d222a; --panel2: #232a34; --line: #313a47;
+    --text: #dde3ec; --muted: #8a94a6; --accent: #f0a832; --danger: #e05555;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, system-ui, sans-serif; font-size: 13px; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header { display: flex; align-items: center; gap: 14px; padding: 8px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .04em; }
+  header h1 span { color: var(--accent); }
+  header .ctrl { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+  header label { cursor: pointer; user-select: none; }
+  select, input[type=number], input[type=text] {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 3px 6px; font-size: 12px; }
+  input[type=number] { width: 64px; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #side { width: 300px; background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0; }
+  #side .search { padding: 8px; border-bottom: 1px solid var(--line); }
+  #side .search input { width: 100%; }
+  #list { flex: 1; overflow-y: auto; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 4px 10px; cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,.03); }
+  .row:hover { background: var(--panel2); }
+  .row.sel { background: #2c3646; outline: 1px solid var(--accent); }
+  .row .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .row .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .tag { color: var(--muted); font-size: 11px; font-family: ui-monospace, Consolas, monospace; }
+  #info { border-top: 1px solid var(--line); padding: 10px; max-height: 45%; overflow-y: auto;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.7; }
+  #info .k { color: var(--muted); }
+  #info .warn { color: var(--danger); }
+  #viewportWrap { flex: 1; position: relative; min-width: 0; }
+  #viewport { position: absolute; inset: 0; }
+  #legend { position: absolute; left: 10px; bottom: 10px; display: flex; flex-wrap: wrap; gap: 6px;
+    max-width: 70%; }
+  .chip { display: flex; align-items: center; gap: 4px; background: rgba(20,23,28,.85);
+    border: 1px solid var(--line); border-radius: 10px; padding: 2px 8px; font-size: 11px; }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+  #drop { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 10px; color: var(--muted); background: rgba(20,23,28,.92);
+    border: 2px dashed var(--line); margin: 18px; border-radius: 12px; z-index: 5; text-align: center; }
+  #drop.hide { display: none; }
+  #drop b { color: var(--text); font-size: 16px; }
+  #status { position: absolute; right: 10px; top: 10px; background: rgba(20,23,28,.85);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font-size: 11px;
+    color: var(--muted); max-width: 320px; }
+  button.mini { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 3px 10px; cursor: pointer; font-size: 12px; }
+  button.mini:hover { border-color: var(--accent); }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>MMD <span>Physics</span> Inspector</h1>
+    <div class="ctrl"><label><input type="checkbox" id="cbMesh" checked> モデル表示</label></div>
+    <div class="ctrl"><label><input type="checkbox" id="cbBodies" checked> 剛体</label></div>
+    <div class="ctrl"><label><input type="checkbox" id="cbJoints" checked> ジョイント</label></div>
+    <div class="ctrl">色分け
+      <select id="selColor"><option value="group">グループ別</option><option value="mode">モード別</option></select></div>
+    <div class="ctrl">回転順
+      <select id="selOrder"><option>YXZ</option><option>XYZ</option><option>ZXY</option><option>ZYX</option></select></div>
+    <div class="ctrl"><label><input type="checkbox" id="cbMirror"> Z反転(MMD⇄glTF)</label></div>
+    <div class="ctrl"><label><input type="checkbox" id="cbHalf" checked> 箱サイズ=半値</label></div>
+    <div class="ctrl">物理スケール <input type="number" id="numScale" value="1" step="0.01">
+      <button class="mini" data-sc="1">×1</button>
+      <button class="mini" data-sc="0.08">×0.08</button>
+      <button class="mini" id="btnAuto">自動</button></div>
+    <div class="ctrl">不透明度 <input type="range" id="rngOp" min="0.05" max="1" step="0.05" value="0.45" style="width:80px"></div>
+    <button class="mini" id="btnOpen">GLBを開く</button>
+    <input type="file" id="file" accept=".glb,.gltf" style="display:none">
+  </header>
+  <div id="main">
+    <div id="side">
+      <div class="search"><input type="text" id="txtFilter" placeholder="剛体名でフィルタ…"></div>
+      <div id="list"></div>
+      <div id="info">GLBを読み込むと、剛体をクリック（3D上でも一覧でも）して詳細と非衝突関係を確認できます。</div>
+    </div>
+    <div id="viewportWrap">
+      <div id="viewport"></div>
+      <div id="legend"></div>
+      <div id="status">未読み込み</div>
+      <div id="drop"><b>GLBファイルをここにドロップ</b>
+        <div>mmd2gltf-gui が出力した extras.mmd 入りGLBを想定<br>剛体・ジョイント・非衝突グループを目視確認できます</div></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+/* ---------- 基本セットアップ ---------- */
+const vp = document.getElementById('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+vp.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14171c);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 2000);
+camera.position.set(0, 14, 34);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 10, 0);
+scene.add(new THREE.HemisphereLight(0xbfd0e8, 0x3a3126, 1.1));
+const dir = new THREE.DirectionalLight(0xffffff, 1.4); dir.position.set(4, 10, 6); scene.add(dir);
+scene.add(new THREE.GridHelper(60, 30, 0x2c3542, 0x20262f));
+
+function resize() {
+  const w = vp.clientWidth, h = vp.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(vp); resize();
+(function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+/* ---------- 状態 ---------- */
+const physGroup = new THREE.Group(); scene.add(physGroup);
+const jointGroup = new THREE.Group(); scene.add(jointGroup);
+const meshGroup = new THREE.Group(); scene.add(meshGroup);
+let rigids = [], joints = [], meshes = [], selected = -1, glbBuffer = null;
+
+const GROUP_COLORS = [0xe05555,0xf0a832,0xe8e04a,0x8ed14b,0x3fc98f,0x3fb9c9,0x4a8fe0,0x6a5de0,
+  0xa957d8,0xe05f9e,0xd98868,0x9aa64a,0x55b1a0,0x7f95b5,0xb0b6c2,0x8a6f5a];
+const MODE_COLORS = { 0: 0x7f95b5, 1: 0x3fc98f, 2: 0xf0a832 };
+const MODE_NAMES = { 0: 'ボーン追従', 1: '物理演算', 2: '物理+ボーン合わせ' };
+const SHAPE_NAMES = { 0: '球', 1: '箱', 2: 'カプセル' };
+
+const F = (o, ...keys) => { for (const k of keys) if (o && o[k] !== undefined) return o[k]; return undefined; };
+
+/* ---------- GLB読み込み ---------- */
+function parseGLBJson(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46546C67) {           // 'glTF' でなければテキストglTFとして試す
+    return JSON.parse(new TextDecoder().decode(buf));
+  }
+  const len = dv.getUint32(12, true), type = dv.getUint32(16, true);
+  if (type !== 0x4E4F534A) throw new Error('JSONチャンクが見つかりません');
+  return JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, len)));
+}
+
+function deepFindPhysics(obj, path, out, depth) {
+  if (!obj || typeof obj !== 'object' || depth > 8) return;
+  const rbs = F(obj, 'rigidBodies', 'rigid_bodies', 'rigidbodies');
+  if (Array.isArray(rbs)) { out.push({ path, rbs, joints: F(obj, 'joints') || [] }); return; }
+  for (const k of Object.keys(obj)) {
+    if (k === 'buffers' || k === 'accessors' || k === 'bufferViews') continue;
+    deepFindPhysics(obj[k], path + '.' + k, out, depth + 1);
+  }
+}
+
+async function loadFile(file) {
+  const buf = await file.arrayBuffer();
+  glbBuffer = buf;
+  let json;
+  try { json = parseGLBJson(buf); }
+  catch (e) { setStatus('読み込み失敗: ' + e.message, true); return; }
+  const found = [];
+  deepFindPhysics(json, 'gltf', found, 0);
+  if (!found.length) { setStatus('extras内にrigidBodiesが見つかりません。extras.mmdを含むGLBか確認してください。', true); return; }
+  const src = found[0];
+  rigids = src.rbs.map((rb, i) => ({
+    i, raw: rb,
+    name: F(rb, 'name', 'rigid_name') ?? ('剛体' + i),
+    bone: F(rb, 'bone', 'bone_index'),
+    shape: F(rb, 'shape', 'shape_type') ?? 0,
+    size: F(rb, 'size', 'shape_size', 'dimensions') ?? [0.5, 0.5, 0.5],
+    pos: F(rb, 'pos', 'position') ?? [0, 0, 0],
+    rot: F(rb, 'rot', 'rotation') ?? [0, 0, 0],
+    group: F(rb, 'group', 'collision_group') ?? 0,
+    mask: F(rb, 'no_collision_mask', 'noCollisionMask', 'non_collision_mask', 'no_collision_group') ?? 0,
+    mode: F(rb, 'mode', 'physics_mode') ?? 0,
+    mass: F(rb, 'mass'),
+    ld: F(rb, 'linear_damping', 'linearDamping'),
+    ad: F(rb, 'angular_damping', 'angularDamping'),
+  }));
+  joints = (src.joints || []).map((j, i) => ({
+    i, name: F(j, 'name') ?? ('J' + i),
+    a: F(j, 'rigid_a', 'rigidA'), b: F(j, 'rigid_b', 'rigidB'),
+    pos: F(j, 'pos', 'position') ?? [0, 0, 0],
+  }));
+  document.getElementById('drop').classList.add('hide');
+  setStatus(`${file.name}｜剛体 ${rigids.length} / ジョイント ${joints.length}｜取得元 ${src.path}`);
+  loadMesh(buf);
+  rebuild();
+  buildLegend();
+  fitCamera();
+}
+
+function loadMesh(buf) {
+  meshGroup.clear(); meshes = [];
+  new GLTFLoader().parse(buf.slice(0), '', (g) => {
+    meshGroup.add(g.scene);
+    g.scene.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.material.transparent = true; o.material.opacity = 0.9; meshes.push(o); } });
+    suggestScale();
+  }, () => {});
+}
+
+/* ---------- 剛体・ジョイント描画 ---------- */
+function bodyColor(rb) {
+  return document.getElementById('selColor').value === 'mode'
+    ? (MODE_COLORS[rb.mode] ?? 0xffffff) : GROUP_COLORS[rb.group % 16];
+}
+function noCollide(a, b) { return ((a.mask >> b.group) & 1) || ((b.mask >> a.group) & 1); }
+
+function rebuild() {
+  physGroup.clear(); jointGroup.clear();
+  const order = document.getElementById('selOrder').value;
+  const mirror = document.getElementById('cbMirror').checked;
+  const half = document.getElementById('cbHalf').checked;
+  const op = parseFloat(document.getElementById('rngOp').value);
+  for (const rb of rigids) {
+    let geo;
+    const s = rb.size;
+    if (rb.shape === 0) geo = new THREE.SphereGeometry(s[0], 20, 14);
+    else if (rb.shape === 1) geo = new THREE.BoxGeometry(s[0] * (half ? 2 : 1), s[1] * (half ? 2 : 1), s[2] * (half ? 2 : 1));
+    else geo = new THREE.CapsuleGeometry(s[0], s[1], 6, 14);
+    const mat = new THREE.MeshLambertMaterial({ color: bodyColor(rb), transparent: true, opacity: op, depthWrite: false });
+    const mesh = new THREE.Mesh(geo, mat);
+    const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: bodyColor(rb), transparent: true, opacity: Math.min(1, op + 0.3) }));
+    mesh.add(edge);
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(rb.rot[0], rb.rot[1], rb.rot[2], order));
+    let px = rb.pos[0], py = rb.pos[1], pz = rb.pos[2];
+    if (mirror) { pz = -pz; q.x = -q.x; q.y = -q.y; }
+    mesh.position.set(px, py, pz); mesh.quaternion.copy(q);
+    mesh.userData.idx = rb.i;
+    physGroup.add(mesh);
+    rb.mesh = mesh;
+  }
+  const jm = new THREE.MeshBasicMaterial({ color: 0xf0784a });
+  for (const j of joints) {
+    const a = rigids[j.a], b = rigids[j.b];
+    if (!a || !b) continue;
+    const g = new THREE.BufferGeometry().setFromPoints([a.mesh.position, b.mesh.position]);
+    jointGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xf0784a, transparent: true, opacity: 0.7 })));
+    const dotG = new THREE.OctahedronGeometry(0.06);
+    const dot = new THREE.Mesh(dotG, jm);
+    dot.position.copy(a.mesh.position).add(b.mesh.position).multiplyScalar(0.5);
+    jointGroup.add(dot);
+  }
+  applyScale(); applyVisibility(); applySelection(); buildList();
+}
+
+function applyScale() {
+  const sc = parseFloat(document.getElementById('numScale').value) || 1;
+  physGroup.scale.setScalar(sc); jointGroup.scale.setScalar(sc);
+}
+function applyVisibility() {
+  meshGroup.visible = document.getElementById('cbMesh').checked;
+  physGroup.visible = document.getElementById('cbBodies').checked;
+  jointGroup.visible = document.getElementById('cbJoints').checked;
+}
+
+function suggestScale() {
+  if (!rigids.length || !meshGroup.children.length) return;
+  const mb = new THREE.Box3().setFromObject(meshGroup);
+  let minY = Infinity, maxY = -Infinity;
+  for (const rb of rigids) {
+    const s = rb.size;
+    const ry = rb.shape === 0 ? s[0] : (rb.shape === 2 ? s[1] / 2 + s[0] : s[1]);  // 形状の縦半径も含める
+    minY = Math.min(minY, rb.mesh.position.y - ry);
+    maxY = Math.max(maxY, rb.mesh.position.y + ry);
+  }
+  const mh = mb.max.y - mb.min.y, ph = maxY - minY;
+  if (!(mh > 0 && ph > 0)) return;
+  let r = mh / ph;
+  for (const cand of [1, 0.08, 0.01, 12.5, 100]) {   // 変換ツールでよく使われる倍率にスナップ
+    if (Math.abs(r / cand - 1) < 0.12) { r = cand; break; }
+  }
+  document.getElementById('numScale').value = +r.toFixed(4);
+  applyScale();
+}
+
+function fitCamera() {
+  const box = new THREE.Box3().setFromObject(physGroup.children.length ? physGroup : meshGroup);
+  if (box.isEmpty()) return;
+  const c = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3()).length();
+  controls.target.copy(c);
+  camera.position.set(c.x, c.y + size * 0.15, c.z + size * 1.1);
+}
+
+/* ---------- 選択と非衝突ハイライト ---------- */
+function applySelection() {
+  const op = parseFloat(document.getElementById('rngOp').value);
+  if (selected < 0) {
+    rigids.forEach(rb => { rb.mesh.material.opacity = op; rb.mesh.material.color.setHex(bodyColor(rb)); });
+    showInfo(); return;
+  }
+  const s = rigids[selected];
+  rigids.forEach(rb => {
+    if (rb.i === selected) { rb.mesh.material.opacity = 0.9; rb.mesh.material.color.setHex(0xf0a832); }
+    else if (noCollide(s, rb)) { rb.mesh.material.opacity = 0.05; rb.mesh.material.color.setHex(0x666e7a); }
+    else { rb.mesh.material.opacity = Math.min(1, op + 0.15); rb.mesh.material.color.setHex(bodyColor(rb)); }
+  });
+  showInfo(s);
+}
+
+function maskGroups(mask) {
+  const arr = []; for (let g = 0; g < 16; g++) if ((mask >> g) & 1) arr.push(g);
+  return arr.length ? arr.join(', ') : 'なし';
+}
+
+function showInfo(rb) {
+  const info = document.getElementById('info');
+  if (!rb) { info.innerHTML = '剛体をクリックすると詳細を表示します。<br><span class="k">選択中は「その剛体と衝突しない相手」が薄く消えます（残った剛体＝衝突する相手）。</span>'; return; }
+  const partners = rigids.filter(o => o.i !== rb.i && noCollide(rb, o)).length;
+  info.innerHTML =
+    `<b>${rb.name}</b><br>` +
+    `<span class="k">形状</span> ${SHAPE_NAMES[rb.shape] ?? rb.shape}　<span class="k">サイズ</span> [${rb.size.map(v=>(+v).toFixed(3)).join(', ')}]<br>` +
+    `<span class="k">モード</span> ${MODE_NAMES[rb.mode] ?? rb.mode}　<span class="k">ボーン</span> ${rb.bone ?? '—'}<br>` +
+    `<span class="k">グループ</span> ${rb.group}　<span class="k">非衝突グループ</span> ${maskGroups(rb.mask)}<br>` +
+    `<span class="k">質量</span> ${rb.mass ?? '—'}　<span class="k">減衰</span> ${rb.ld ?? '—'} / ${rb.ad ?? '—'}<br>` +
+    `<span class="k">位置</span> [${rb.pos.map(v=>(+v).toFixed(3)).join(', ')}]<br>` +
+    `<span class="k">この剛体と衝突しない剛体</span> ${partners} 個（画面上で薄く表示）` +
+    (rb.mask === undefined ? '<br><span class="warn">※このGLBには非衝突マスクが含まれていません</span>' : '');
+}
+
+/* ---------- 一覧 ---------- */
+function buildList() {
+  const list = document.getElementById('list');
+  const f = document.getElementById('txtFilter').value.trim();
+  list.innerHTML = '';
+  rigids.filter(rb => !f || rb.name.includes(f)).forEach(rb => {
+    const row = document.createElement('div');
+    row.className = 'row' + (rb.i === selected ? ' sel' : '');
+    row.innerHTML = `<span class="dot" style="background:#${bodyColor(rb).toString(16).padStart(6,'0')}"></span>` +
+      `<span class="nm">${rb.name}</span><span class="tag">G${rb.group} ${SHAPE_NAMES[rb.shape] ?? ''} m${rb.mode}</span>`;
+    row.onclick = () => { selected = (selected === rb.i ? -1 : rb.i); applySelection(); buildList(); };
+    list.appendChild(row);
+  });
+}
+
+function buildLegend() {
+  const lg = document.getElementById('legend'); lg.innerHTML = '';
+  const mode = document.getElementById('selColor').value;
+  if (mode === 'mode') {
+    for (const m of Object.keys(MODE_NAMES)) lg.innerHTML +=
+      `<span class="chip"><span class="dot" style="background:#${MODE_COLORS[m].toString(16).padStart(6,'0')}"></span>${m}: ${MODE_NAMES[m]}</span>`;
+  } else {
+    const used = [...new Set(rigids.map(r => r.group))].sort((a,b)=>a-b);
+    for (const g of used) lg.innerHTML +=
+      `<span class="chip"><span class="dot" style="background:#${GROUP_COLORS[g%16].toString(16).padStart(6,'0')}"></span>グループ ${g}</span>`;
+  }
+}
+
+/* ---------- 3Dクリック選択 ---------- */
+const ray = new THREE.Raycaster(), ptr = new THREE.Vector2();
+let downXY = null;
+renderer.domElement.addEventListener('pointerdown', e => { downXY = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!downXY || Math.hypot(e.clientX - downXY[0], e.clientY - downXY[1]) > 4) return;  // ドラッグは無視
+  const r = renderer.domElement.getBoundingClientRect();
+  ptr.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  ptr.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  ray.setFromCamera(ptr, camera);
+  const hits = ray.intersectObjects(physGroup.children, false);
+  selected = hits.length ? hits[0].object.userData.idx : -1;
+  applySelection(); buildList();
+});
+
+/* ---------- UIイベント ---------- */
+for (const id of ['cbMesh', 'cbBodies', 'cbJoints']) document.getElementById(id).onchange = applyVisibility;
+for (const id of ['selColor', 'selOrder', 'cbMirror', 'cbHalf']) document.getElementById(id).onchange = () => { rebuild(); buildLegend(); };
+document.getElementById('rngOp').oninput = () => applySelection();
+document.getElementById('numScale').onchange = applyScale;
+document.querySelectorAll('button[data-sc]').forEach(b => b.onclick = () => {
+  document.getElementById('numScale').value = b.dataset.sc; applyScale();
+});
+document.getElementById('btnAuto').onclick = suggestScale;
+document.getElementById('txtFilter').oninput = buildList;
+document.getElementById('btnOpen').onclick = () => document.getElementById('file').click();
+document.getElementById('file').onchange = e => { if (e.target.files[0]) loadFile(e.target.files[0]); };
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+function setStatus(msg, isErr) {
+  const s = document.getElementById('status');
+  s.textContent = msg; s.style.color = isErr ? '#e05555' : '';
+}
+</script>
+</body>
+</html>
