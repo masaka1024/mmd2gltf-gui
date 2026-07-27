@@ -103,14 +103,14 @@
     <div id="side">
       <div class="search"><input type="text" id="txtFilter" placeholder="剛体名でフィルタ…"></div>
       <div id="list"></div>
-      <div id="info">GLBを読み込むと、剛体をクリック（3D上でも一覧でも）して詳細と非衝突関係を確認できます。</div>
+      <div id="info">GLBを読み込むと、剛体をクリック（3D上でも一覧でも）して詳細と衝突関係を確認できます。</div>
     </div>
     <div id="viewportWrap">
       <div id="viewport"></div>
       <div id="legend"></div>
       <div id="status">未読み込み</div>
       <div id="drop"><b>GLBファイルをここにドロップ</b>
-        <div>mmd2gltf-gui が出力した extras.mmd 入りGLBを想定<br>剛体・ジョイント・非衝突グループを目視確認できます</div></div>
+        <div>mmd2gltf-gui が出力した extras.mmd 入りGLBを想定<br>剛体・ジョイント・衝突グループを目視確認できます</div></div>
     </div>
   </div>
 </div>
@@ -269,7 +269,11 @@ function bodyColor(rb) {
   return document.getElementById('selColor').value === 'mode'
     ? (MODE_COLORS[rb.mode] ?? 0xffffff) : GROUP_COLORS[rb.group % 16];
 }
-function noCollide(a, b) { return ((a.mask >> b.group) & 1) || ((b.mask >> a.group) & 1); }
+// PMXの16bitマスクは「立っているビットのグループと衝突する」を意味する
+// (Bulletのcollision filter maskと同じ。PMXエディタの表示とは反転)。
+// 衝突条件は双方向で、両方が相手のグループを許可しているときだけ衝突する。
+function collide(a, b) { return !!(((a.mask >> b.group) & 1) && ((b.mask >> a.group) & 1)); }
+function noCollide(a, b) { return !collide(a, b); }
 
 function rebuild() {
   physGroup.clear(); jointGroup.clear();
@@ -418,16 +422,16 @@ function maskGroups(mask) {
 function showInfo(rb) {
   const info = document.getElementById('info');
   if (!rb) { info.innerHTML = '剛体をクリックすると詳細を表示します。<br><span class="k">選択中は「その剛体と衝突しない相手」が薄く消えます（残った剛体＝衝突する相手）。</span>'; return; }
-  const partners = rigids.filter(o => o.i !== rb.i && noCollide(rb, o)).length;
+  const partners = rigids.filter(o => o.i !== rb.i && collide(rb, o)).length;
   info.innerHTML =
     `<b>${rb.name}</b><br>` +
     `<span class="k">形状</span> ${SHAPE_NAMES[rb.shape] ?? rb.shape}　<span class="k">サイズ</span> [${rb.size.map(v=>(+v).toFixed(3)).join(', ')}]<br>` +
     `<span class="k">モード</span> ${MODE_NAMES[rb.mode] ?? rb.mode}　<span class="k">ボーン</span> ${rb.bone ?? '—'}<br>` +
-    `<span class="k">グループ</span> ${rb.group}　<span class="k">非衝突グループ</span> ${maskGroups(rb.mask)}<br>` +
+    `<span class="k">グループ</span> ${rb.group}　<span class="k">衝突するグループ</span> ${maskGroups(rb.mask)}<br>` +
     `<span class="k">質量</span> ${rb.mass ?? '—'}　<span class="k">減衰</span> ${rb.ld ?? '—'} / ${rb.ad ?? '—'}<br>` +
     `<span class="k">位置</span> [${rb.pos.map(v=>(+v).toFixed(3)).join(', ')}]<br>` +
-    `<span class="k">この剛体と衝突しない剛体</span> ${partners} 個（画面上で薄く表示）` +
-    (rb.mask === undefined ? '<br><span class="warn">※このGLBには非衝突マスクが含まれていません</span>' : '');
+    `<span class="k">この剛体と衝突する剛体</span> ${partners} 個（衝突しない剛体は画面上で薄く表示）` +
+    (rb.mask === undefined ? '<br><span class="warn">※このGLBには衝突グループのマスクが含まれていません</span>' : '');
 }
 
 /* ---------- 一覧 ---------- */
