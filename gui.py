@@ -105,6 +105,10 @@ STRINGS = {
         "adv_target_all": "全部(髪・スカート・ネクタイ等)",
         "adv_gravity_label": "重力の強さ",
         "adv_gravity_hint": "値を大きくするほど揺れ物が重く垂れ下がります。0で重力なし(元の形状を維持)。",
+        "adv_drag_label": "空気抵抗(勢いの減衰)",
+        "adv_drag_hint": "毎フレーム、前の勢い(速度)をどれだけ捨てるかの割合です。\n"
+                          "下げるほど勢いが残り、ターンで裾が遠心力で大きく振り出され\n"
+                          "ます。上げるほど動きが早く落ち着きます。既定は0.85。",
         "adv_stiffness_label": "バネの反発力(元の形へ戻る強さ)",
         "adv_stiffness_hint": "値を大きくするほど揺れが速く収まり、髪型が崩れにくくなります。",
         "adv_bounce_label": "衝突時の弾み",
@@ -141,6 +145,13 @@ STRINGS = {
                                     "剛体が実際に持っている厚みを利用するので、パラメータを\n"
                                     "手探りで太くするより自然な密着感が期待できます。まずは\n"
                                     "1.0前後から試し、見た目に合わせて上下してください。",
+        "adv_hem_extend_label": "裾の当たり判定を下へ延長",
+        "adv_hem_extend_hint": "縦ボーンの終端は剛体プレートの中央にあるため、本家では\n"
+                                "プレートの下半分も脚に当たります。そのはみ出し分だけ裾の\n"
+                                "セグメントを仮想的に延長して衝突を評価します。0で無効\n"
+                                "(変化なし)。1.0でモデル自身の剛体の底と同じ位置まで届き\n"
+                                "ます。「衝突判定を『区間』単位で行う」がオンのときだけ\n"
+                                "効きます。",
         "adv_collision_mode_label": "衝突モード",
         "adv_collision_mode_normal": "通常（リストの剛体だけ衝突させない）",
         "adv_collision_mode_allow": "限定（リストの剛体だけ衝突させる）",
@@ -254,6 +265,11 @@ STRINGS = {
         "adv_gravity_label": "Gravity strength",
         "adv_gravity_hint": "Higher values make dynamics hang heavier. 0 disables gravity "
                             "(keeps rest shape).",
+        "adv_drag_label": "Air drag (momentum damping)",
+        "adv_drag_hint": "The fraction of the previous frame's momentum discarded "
+                          "each frame. Lower values keep more momentum, so hems "
+                          "swing outward more on turns; higher values settle "
+                          "faster. Default 0.85.",
         "adv_stiffness_label": "Spring stiffness (rest-shape pull)",
         "adv_stiffness_hint": "Higher values settle faster and hold the hairstyle's shape "
                               "more.",
@@ -297,6 +313,13 @@ STRINGS = {
                                     "already has, it tends to look more natural than hand-"
                                     "tuning a flat margin. Start around 1.0 and adjust to "
                                     "taste.",
+        "adv_hem_extend_label": "Extend hem collision downward",
+        "adv_hem_extend_hint": "The last bone sits at the center of the lowest rigid body "
+                                "plate, so in MMD the plate's bottom half also collides with "
+                                "the legs. This virtually extends each hem segment by that "
+                                "amount for collision testing. 0 disables (unchanged); 1.0 "
+                                "reaches the bottom of the model's own rigid body. Only "
+                                "effective while per-segment collision is enabled.",
         "adv_collision_mode_label": "Collision mode",
         "adv_collision_mode_normal": "Normal (exclude only the listed bodies)",
         "adv_collision_mode_allow": "Restricted (only the listed bodies collide)",
@@ -629,6 +652,7 @@ class App(_BaseTk):
         self.bakehair_var = tk.BooleanVar(value=False)
         self.baketarget_var = tk.StringVar(value="hair")
         self.gravity_var = tk.StringVar(value="0.02")
+        self.drag_var = tk.StringVar(value="0.85")
         self.stiffness_var = tk.StringVar(value="1.5")
         self.bounce_var = tk.StringVar(value="0.0")
         self.lateralslack_var = tk.StringVar(value="6.0")
@@ -636,6 +660,7 @@ class App(_BaseTk):
         self.margin_var = tk.StringVar(value="0.01")
         self.hemmargin_var = tk.StringVar(value="0.0")
         self.rbsizemargin_var = tk.StringVar(value="1.0")
+        self.hemextend_var = tk.StringVar(value="0.0")
         self.segmentaware_var = tk.BooleanVar(value=True)
         self.skirttwist_var = tk.BooleanVar(value=True)
         self.collmode_var = tk.StringVar(value="normal")
@@ -710,60 +735,70 @@ class App(_BaseTk):
         self.lbl_grav_hint.grid(row=3, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_grav_hint, "adv_gravity_hint"))
 
+        lbl_drag = ttk.Label(p, text="")
+        lbl_drag.grid(row=4, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_drag, "adv_drag_label"))
+        ttk.Entry(p, textvariable=self.drag_var, width=8).grid(
+            row=4, column=1, sticky="w", **pad)
+        self.lbl_drag_hint = ttk.Label(p, text="", foreground="#666666",
+                                       wraplength=380, justify="left")
+        self.lbl_drag_hint.grid(row=5, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_drag_hint, "adv_drag_hint"))
+
         lbl_stiff = ttk.Label(p, text="")
-        lbl_stiff.grid(row=4, column=0, sticky="w", **pad)
+        lbl_stiff.grid(row=6, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_stiff, "adv_stiffness_label"))
         ttk.Entry(p, textvariable=self.stiffness_var, width=8).grid(
-            row=4, column=1, sticky="w", **pad)
+            row=6, column=1, sticky="w", **pad)
         self.lbl_stiff_hint = ttk.Label(p, text="", foreground="#666666",
                                         wraplength=380, justify="left")
-        self.lbl_stiff_hint.grid(row=5, column=1, sticky="w", **pad)
+        self.lbl_stiff_hint.grid(row=7, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_stiff_hint, "adv_stiffness_hint"))
 
         lbl_bounce = ttk.Label(p, text="")
-        lbl_bounce.grid(row=6, column=0, sticky="w", **pad)
+        lbl_bounce.grid(row=8, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_bounce, "adv_bounce_label"))
         ttk.Entry(p, textvariable=self.bounce_var, width=8).grid(
-            row=6, column=1, sticky="w", **pad)
+            row=8, column=1, sticky="w", **pad)
         self.lbl_bounce_hint = ttk.Label(p, text="", foreground="#666666",
                                          wraplength=380, justify="left")
-        self.lbl_bounce_hint.grid(row=7, column=1, sticky="w", **pad)
+        self.lbl_bounce_hint.grid(row=9, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_bounce_hint, "adv_bounce_hint"))
 
         lbl_lslack = ttk.Label(p, text="")
-        lbl_lslack.grid(row=8, column=0, sticky="w", **pad)
+        lbl_lslack.grid(row=10, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_lslack, "adv_lateral_slack_label"))
         ttk.Entry(p, textvariable=self.lateralslack_var, width=8).grid(
-            row=8, column=1, sticky="w", **pad)
+            row=10, column=1, sticky="w", **pad)
         self.lbl_lslack_hint = ttk.Label(p, text="", foreground="#666666",
                                          wraplength=380, justify="left")
-        self.lbl_lslack_hint.grid(row=9, column=1, sticky="w", **pad)
+        self.lbl_lslack_hint.grid(row=11, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_lslack_hint, "adv_lateral_slack_hint"))
 
         lbl_vspread = ttk.Label(p, text="")
-        lbl_vspread.grid(row=10, column=0, sticky="w", **pad)
+        lbl_vspread.grid(row=12, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_vspread, "adv_vertical_spread_label"))
         ttk.Entry(p, textvariable=self.verticalspread_var, width=8).grid(
-            row=10, column=1, sticky="w", **pad)
+            row=12, column=1, sticky="w", **pad)
         self.lbl_vspread_hint = ttk.Label(p, text="", foreground="#666666",
                                           wraplength=380, justify="left")
-        self.lbl_vspread_hint.grid(row=11, column=1, sticky="w", **pad)
+        self.lbl_vspread_hint.grid(row=13, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_vspread_hint, "adv_vertical_spread_hint"))
 
         cb_segaware = ttk.Checkbutton(p, variable=self.segmentaware_var)
-        cb_segaware.grid(row=12, column=0, columnspan=2, sticky="w", **pad)
+        cb_segaware.grid(row=14, column=0, columnspan=2, sticky="w", **pad)
         self._i18n_widgets.append((cb_segaware, "adv_segment_aware_label"))
         self.lbl_segaware_hint = ttk.Label(p, text="", foreground="#666666",
                                            wraplength=380, justify="left")
-        self.lbl_segaware_hint.grid(row=13, column=1, sticky="w", **pad)
+        self.lbl_segaware_hint.grid(row=15, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_segaware_hint, "adv_segment_aware_hint"))
 
         cb_skirttwist = ttk.Checkbutton(p, variable=self.skirttwist_var)
-        cb_skirttwist.grid(row=14, column=0, columnspan=2, sticky="w", **pad)
+        cb_skirttwist.grid(row=16, column=0, columnspan=2, sticky="w", **pad)
         self._i18n_widgets.append((cb_skirttwist, "adv_skirt_twist_label"))
         self.lbl_skirttwist_hint = ttk.Label(p, text="", foreground="#666666",
                                              wraplength=380, justify="left")
-        self.lbl_skirttwist_hint.grid(row=15, column=1, sticky="w", **pad)
+        self.lbl_skirttwist_hint.grid(row=17, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_skirttwist_hint, "adv_skirt_twist_hint"))
 
         # ---- タブ3: 衝突・クリアランス ----
@@ -794,11 +829,21 @@ class App(_BaseTk):
         self.lbl_rsm_hint.grid(row=4, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_rsm_hint, "adv_rb_size_margin_hint"))
 
+        lbl_hex = ttk.Label(c, text="")
+        lbl_hex.grid(row=5, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_hex, "adv_hem_extend_label"))
+        ttk.Entry(c, textvariable=self.hemextend_var, width=8).grid(
+            row=5, column=1, sticky="w", **pad)
+        self.lbl_hex_hint = ttk.Label(c, text="", foreground="#666666",
+                                      wraplength=380, justify="left")
+        self.lbl_hex_hint.grid(row=6, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_hex_hint, "adv_hem_extend_hint"))
+
         lbl_cm = ttk.Label(c, text="")
-        lbl_cm.grid(row=5, column=0, sticky="w", **pad)
+        lbl_cm.grid(row=7, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_cm, "adv_collision_mode_label"))
         cm_frame = ttk.Frame(c)
-        cm_frame.grid(row=5, column=1, sticky="w", **pad)
+        cm_frame.grid(row=7, column=1, sticky="w", **pad)
         rb_normal = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
                                     value="normal")
         rb_normal.pack(anchor="w")
@@ -809,10 +854,10 @@ class App(_BaseTk):
         self._i18n_widgets.append((rb_allow, "adv_collision_mode_allow"))
 
         lbl_cn = ttk.Label(c, text="")
-        lbl_cn.grid(row=6, column=0, sticky="w", **pad)
+        lbl_cn.grid(row=8, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_cn, "adv_collision_names_label"))
         cn_frame = ttk.Frame(c)
-        cn_frame.grid(row=6, column=1, sticky="ew", **pad)
+        cn_frame.grid(row=8, column=1, sticky="ew", **pad)
         ttk.Entry(cn_frame, textvariable=self.collnames_var).pack(
             side="left", fill="x", expand=True)
         self.browse_rb_btn = ttk.Button(cn_frame, command=self._show_rigidbody_picker)
@@ -821,17 +866,17 @@ class App(_BaseTk):
 
         self.lbl_cn_hint = ttk.Label(c, text="", foreground="#666666",
                                      wraplength=380, justify="left")
-        self.lbl_cn_hint.grid(row=7, column=1, sticky="w", **pad)
+        self.lbl_cn_hint.grid(row=9, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_cn_hint, "adv_collision_names_hint"))
 
         vrm_frame = ttk.Frame(c)
-        vrm_frame.grid(row=8, column=1, sticky="w", **pad)
+        vrm_frame.grid(row=10, column=1, sticky="w", **pad)
         self.vrm_compat_btn = ttk.Button(vrm_frame, command=self._apply_vrm_compat_mode)
         self.vrm_compat_btn.pack(side="left")
         self._i18n_widgets.append((self.vrm_compat_btn, "adv_vrm_compat_btn"))
         self.lbl_vrm_hint = ttk.Label(c, text="", foreground="#666666",
                                       wraplength=380, justify="left")
-        self.lbl_vrm_hint.grid(row=9, column=1, sticky="w", **pad)
+        self.lbl_vrm_hint.grid(row=11, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_vrm_hint, "adv_vrm_compat_hint"))
 
         # ---- タブ4: サブステップ／中間パーティクル ----
@@ -1092,6 +1137,10 @@ class App(_BaseTk):
         except Exception:
             gravity = 0.02
         try:
+            drag = float(self.drag_var.get())
+        except Exception:
+            drag = 0.85
+        try:
             stiffness = float(self.stiffness_var.get())
         except Exception:
             stiffness = 1.5
@@ -1115,6 +1164,10 @@ class App(_BaseTk):
             rb_size_margin_scale = float(self.rbsizemargin_var.get())
         except Exception:
             rb_size_margin_scale = 0.0
+        try:
+            hem_extend_scale = float(self.hemextend_var.get())
+        except Exception:
+            hem_extend_scale = 0.0
         _coll_names = [s.strip() for s in self.collnames_var.get().split(",") if s.strip()] or None
         force_no_collision = _coll_names if self.collmode_var.get() == "normal" else None
         allowed_collider = _coll_names if self.collmode_var.get() == "allow" else None
@@ -1165,12 +1218,14 @@ class App(_BaseTk):
             bake_physics=self.bakehair_var.get(),
             bake_target=self.baketarget_var.get(),
             hair_gravity=gravity,
+            hair_drag=drag,
             hair_stiffness=stiffness,
             collision_bounce=bounce,
             collision_margin=margin,
             force_no_collision_names=force_no_collision,
             allowed_collider_names=allowed_collider,
             hem_extra_margin=hem_margin,
+            hem_extend_scale=hem_extend_scale,
             adaptive_substep_threshold=substep_threshold,
             adaptive_substep_max_n=substep_maxn,
             adaptive_substep_collider_names=substep_names,
