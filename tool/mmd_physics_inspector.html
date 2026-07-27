@@ -41,7 +41,9 @@
   #info .k { color: var(--muted); }
   #info .warn { color: var(--danger); }
   #viewportWrap { flex: 1; position: relative; min-width: 0; }
-  #viewport { position: absolute; inset: 0; }
+  #viewport { position: absolute; inset: 0; overflow: hidden; }
+  /* キャンバスのサイズはCSS側で固定する（JSからstyleを書き換えるとResizeObserverと往復して震える） */
+  #viewport canvas { display: block; width: 100% !important; height: 100% !important; }
   #legend { position: absolute; left: 10px; bottom: 10px; display: flex; flex-wrap: wrap; gap: 6px;
     max-width: 70%; }
   .chip { display: flex; align-items: center; gap: 4px; background: rgba(20,23,28,.85);
@@ -83,7 +85,17 @@
       <button class="mini" data-sc="1">×1</button>
       <button class="mini" data-sc="0.08">×0.08</button>
       <button class="mini" id="btnAuto">自動</button></div>
-    <div class="ctrl">不透明度 <input type="range" id="rngOp" min="0.05" max="1" step="0.05" value="0.45" style="width:80px"></div>
+    <div class="ctrl">剛体の不透明度 <input type="range" id="rngOp" min="0.05" max="1" step="0.05" value="0.45" style="width:80px"></div>
+    <div class="ctrl">モデル
+      <select id="selMeshMode">
+        <option value="ghost">半透明</option>
+        <option value="xray">X線（背面のみ）</option>
+        <option value="solid">不透明</option>
+      </select>
+      <input type="range" id="rngOpMesh" min="0" max="1" step="0.01" value="0.5" style="width:110px">
+      <span id="lblOpMesh" style="width:34px;display:inline-block;text-align:right">15%</span></div>
+    <button class="mini" id="btnFocus" title="選択中の剛体に寄る（Fキー / 3Dでダブルクリック）">選択に寄る</button>
+    <button class="mini" id="btnFit" title="全体を映す">全体表示</button>
     <button class="mini" id="btnOpen">GLBを開く</button>
     <input type="file" id="file" accept=".glb,.gltf" style="display:none">
   </header>
@@ -115,20 +127,49 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 vp.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x14171c);
-const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 2000);
+// near値が小さすぎると深度精度が落ちて面と輪郭線がちらつくため 0.05 に変更
+const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 2000);
 camera.position.set(0, 14, 34);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 10, 0);
+controls.zoomToCursor = true;      // マウス位置を中心にズーム（見たい剛体に寄りやすくなる）
+controls.enableDamping = true; controls.dampingFactor = 0.08;
+controls.minDistance = 0;          // 近づく距離の下限を外す
 scene.add(new THREE.HemisphereLight(0xbfd0e8, 0x3a3126, 1.1));
 const dir = new THREE.DirectionalLight(0xffffff, 1.4); dir.position.set(4, 10, 6); scene.add(dir);
 scene.add(new THREE.GridHelper(60, 30, 0x2c3542, 0x20262f));
 
+let lastW = 0, lastH = 0, lastDpr = 0, resizeQueued = false;
 function resize() {
-  const w = vp.clientWidth, h = vp.clientHeight;
-  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+  // 小数を切り捨てて整数化し、前回と同じなら何もしない（拡大縮小表示での振動対策）
+  const w = Math.max(1, Math.floor(vp.clientWidth));
+  const h = Math.max(1, Math.floor(vp.clientHeight));
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  if (w === lastW && h === lastH && dpr === lastDpr) return;
+  lastW = w; lastH = h; lastDpr = dpr;
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(w, h, false);   // 第3引数false＝CSSサイズを書き換えない
+  camera.aspect = w / h; camera.updateProjectionMatrix();
 }
-new ResizeObserver(resize).observe(vp); resize();
-(function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+// 通知を1フレームにまとめる（連続通知による再入を防ぐ）
+new ResizeObserver(() => {
+  if (resizeQueued) return;
+  resizeQueued = true;
+  requestAnimationFrame(() => { resizeQueued = false; resize(); });
+}).observe(vp);
+resize();
+// 注視点までの距離に応じてnear/farを自動調整する。
+// 近づくほどnearも小さくなるので、寄っても手前が切れない。比率は一定なので深度精度も保たれる。
+function updateClip() {
+  const dist = camera.position.distanceTo(controls.target);
+  const near = Math.max(dist / 1000, 1e-5);
+  if (Math.abs(camera.near - near) > near * 0.25) {
+    camera.near = near;
+    camera.far = Math.max(dist * 50, 200);
+    camera.updateProjectionMatrix();
+  }
+}
+(function loop(){ requestAnimationFrame(loop); controls.update(); updateClip(); renderer.render(scene, camera); })();
 
 /* ---------- 状態 ---------- */
 const physGroup = new THREE.Group(); scene.add(physGroup);
@@ -207,7 +248,18 @@ function loadMesh(buf) {
   meshGroup.clear(); meshes = [];
   new GLTFLoader().parse(buf.slice(0), '', (g) => {
     meshGroup.add(g.scene);
-    g.scene.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.material.transparent = true; o.material.opacity = 0.9; meshes.push(o); } });
+    g.scene.traverse(o => {
+      if (!o.isMesh) return;
+      // マテリアルが配列の場合もあるので複製処理を分ける
+      o.material = Array.isArray(o.material) ? o.material.map(m => m.clone()) : o.material.clone();
+      for (const m of (Array.isArray(o.material) ? o.material : [o.material])) {
+        m.userData.origTransparent = m.transparent;   // 元の透過設定を覚えておく（髪の抜き等）
+        m.userData.origSide = m.side;
+      }
+      o.renderOrder = 2;        // 剛体より後に描く → 内部の剛体が透けて見える
+      meshes.push(o);
+    });
+    applyMeshOpacity();
     suggestScale();
   }, () => {});
 }
@@ -231,15 +283,19 @@ function rebuild() {
     if (rb.shape === 0) geo = new THREE.SphereGeometry(s[0], 20, 14);
     else if (rb.shape === 1) geo = new THREE.BoxGeometry(s[0] * (half ? 2 : 1), s[1] * (half ? 2 : 1), s[2] * (half ? 2 : 1));
     else geo = new THREE.CapsuleGeometry(s[0], s[1], 6, 14);
-    const mat = new THREE.MeshLambertMaterial({ color: bodyColor(rb), transparent: true, opacity: op, depthWrite: false });
+    // polygonOffsetで面をわずかに奥へ押し、輪郭線とのZファイティング（ちらつき）を防ぐ
+    const mat = new THREE.MeshLambertMaterial({ color: bodyColor(rb), transparent: true, opacity: op, depthWrite: false,
+      polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
     const mesh = new THREE.Mesh(geo, mat);
     const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: bodyColor(rb), transparent: true, opacity: Math.min(1, op + 0.3) }));
     mesh.add(edge);
+    mesh.userData.edge = edge;
     const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(rb.rot[0], rb.rot[1], rb.rot[2], order));
     let px = rb.pos[0], py = rb.pos[1], pz = rb.pos[2];
     if (mirror) { pz = -pz; q.x = -q.x; q.y = -q.y; }
     mesh.position.set(px, py, pz); mesh.quaternion.copy(q);
     mesh.userData.idx = rb.i;
+    mesh.renderOrder = 1;
     physGroup.add(mesh);
     rb.mesh = mesh;
   }
@@ -260,6 +316,28 @@ function rebuild() {
 function applyScale() {
   const sc = parseFloat(document.getElementById('numScale').value) || 1;
   physGroup.scale.setScalar(sc); jointGroup.scale.setScalar(sc);
+}
+function applyMeshOpacity() {
+  const mode = document.getElementById('selMeshMode').value;
+  const rng = document.getElementById('rngOpMesh');
+  const t = parseFloat(rng.value);
+  // 3乗カーブ。モデルは肌・服・髪が重なるので実効的な濃さが急に上がる。
+  // 低い側にスライダーの移動量を多く割り当てて微調整しやすくする。
+  const a = mode === 'solid' ? 1 : Math.min(1, 0.02 + 0.98 * Math.pow(t, 3));
+  const solid = a >= 0.999;
+  rng.disabled = (mode === 'solid');
+  document.getElementById('lblOpMesh').textContent = solid ? '—' : Math.round(a * 100) + '%';
+  for (const o of meshes) {
+    for (const m of (Array.isArray(o.material) ? o.material : [o.material])) {
+      m.opacity = a;
+      // 100%のときは半透明扱いをやめる → 描画順の乱れ（ちらつき）も起きない
+      m.transparent = solid ? (m.userData.origTransparent ?? false) : true;
+      m.depthWrite = solid;
+      // X線：背面だけを描くと、輪郭を残したまま内部の剛体がはっきり見える
+      m.side = (mode === 'xray') ? THREE.BackSide : (m.userData.origSide ?? THREE.FrontSide);
+      m.needsUpdate = true;
+    }
+  }
 }
 function applyVisibility() {
   meshGroup.visible = document.getElementById('cbMesh').checked;
@@ -295,18 +373,39 @@ function fitCamera() {
   camera.position.set(c.x, c.y + size * 0.15, c.z + size * 1.1);
 }
 
+// 指定した剛体を注視点にして、その大きさに応じた距離まで寄る
+function focusBody(rb) {
+  if (!rb || !rb.mesh) { fitCamera(); return; }
+  const sc = physGroup.scale.x || 1;
+  const s = rb.size;
+  const r = (rb.shape === 0 ? s[0] : rb.shape === 2 ? s[0] + s[1] / 2 : Math.max(s[0], s[1], s[2])) * sc;
+  const p = rb.mesh.getWorldPosition(new THREE.Vector3());
+  const d = Math.max(r * 5, 1e-4);
+  const v = camera.position.clone().sub(controls.target);
+  if (v.lengthSq() < 1e-12) v.set(0, 0.3, 1);
+  v.normalize();
+  controls.target.copy(p);
+  camera.position.copy(p).addScaledVector(v, d);
+}
+
 /* ---------- 選択と非衝突ハイライト ---------- */
 function applySelection() {
   const op = parseFloat(document.getElementById('rngOp').value);
+  const setOp = (rb, o, col) => {
+    rb.mesh.material.opacity = o;
+    rb.mesh.material.color.setHex(col);
+    const e = rb.mesh.userData.edge;                  // 輪郭線も追従させる
+    if (e) { e.material.opacity = Math.min(1, o + 0.3); e.material.color.setHex(col); }
+  };
   if (selected < 0) {
-    rigids.forEach(rb => { rb.mesh.material.opacity = op; rb.mesh.material.color.setHex(bodyColor(rb)); });
+    rigids.forEach(rb => setOp(rb, op, bodyColor(rb)));
     showInfo(); return;
   }
   const s = rigids[selected];
   rigids.forEach(rb => {
-    if (rb.i === selected) { rb.mesh.material.opacity = 0.9; rb.mesh.material.color.setHex(0xf0a832); }
-    else if (noCollide(s, rb)) { rb.mesh.material.opacity = 0.05; rb.mesh.material.color.setHex(0x666e7a); }
-    else { rb.mesh.material.opacity = Math.min(1, op + 0.15); rb.mesh.material.color.setHex(bodyColor(rb)); }
+    if (rb.i === selected) setOp(rb, Math.min(1, op + 0.45), 0xf0a832);
+    else if (noCollide(s, rb)) setOp(rb, op * 0.12, 0x666e7a);
+    else setOp(rb, Math.min(1, op + 0.15), bodyColor(rb));
   });
   showInfo(s);
 }
@@ -374,16 +473,35 @@ renderer.domElement.addEventListener('pointerup', e => {
   applySelection(); buildList();
 });
 
+// ダブルクリックした剛体に寄る
+renderer.domElement.addEventListener('dblclick', e => {
+  const r = renderer.domElement.getBoundingClientRect();
+  ptr.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  ptr.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  ray.setFromCamera(ptr, camera);
+  const hits = ray.intersectObjects(physGroup.children, false);
+  if (hits.length) { selected = hits[0].object.userData.idx; applySelection(); buildList(); focusBody(rigids[selected]); }
+});
+
 /* ---------- UIイベント ---------- */
 for (const id of ['cbMesh', 'cbBodies', 'cbJoints']) document.getElementById(id).onchange = applyVisibility;
 for (const id of ['selColor', 'selOrder', 'cbMirror', 'cbHalf']) document.getElementById(id).onchange = () => { rebuild(); buildLegend(); };
 document.getElementById('rngOp').oninput = () => applySelection();
+document.getElementById('rngOpMesh').oninput = applyMeshOpacity;
+document.getElementById('selMeshMode').onchange = applyMeshOpacity;
 document.getElementById('numScale').onchange = applyScale;
 document.querySelectorAll('button[data-sc]').forEach(b => b.onclick = () => {
   document.getElementById('numScale').value = b.dataset.sc; applyScale();
 });
 document.getElementById('btnAuto').onclick = suggestScale;
 document.getElementById('txtFilter').oninput = buildList;
+document.getElementById('btnFocus').onclick = () => focusBody(rigids[selected]);
+document.getElementById('btnFit').onclick = fitCamera;
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;   // 入力欄では無効
+  if (e.key === 'f' || e.key === 'F') focusBody(rigids[selected]);
+  if (e.key === 'a' || e.key === 'A') fitCamera();
+});
 document.getElementById('btnOpen').onclick = () => document.getElementById('file').click();
 document.getElementById('file').onchange = e => { if (e.target.files[0]) loadFile(e.target.files[0]); };
 addEventListener('dragover', e => e.preventDefault());
