@@ -53,7 +53,14 @@ mmd2gltf は、MMD（PMX）の剛体・ジョイント情報を glTF 出力の `
   "shape": 2,               // 0=球 / 1=箱 / 2=カプセル
   "mode": 2,                // 0=ボーン追従 / 1=物理 / 2=物理+ボーン
   "group": 4,               // 衝突グループ 0..15
-  "noCollisionMask": 65507, // 非衝突グループのビットマスク（16bit）
+  "noCollisionMask": 65507, // 衝突グループのビットマスク（16bit）。PMXの値をそのまま保持
+                            // 【重要】キー名は PMX のフィールド名「非衝突グループフラグ」に
+                            // 由来するが、立っているビットは「そのグループと衝突する」を意味する
+                            // （Bullet の collision filter mask と同じ。PMXエディタのチェック
+                            // 表示＝非衝突とは反転している）。衝突条件は双方向で、
+                            // (1<<A.group & B.mask) && (1<<B.group & A.mask) のときだけ衝突する。
+                            // 他実装での対応する名前: three.js mmd-parser = groupTarget、
+                            // saba = m_collisionGroup。互換性のためキー名は据え置き。
   "size": [0.0061, 0.0305, 0.0],          // shape依存（下記）
   "position": [0.0131, 0.0078, -0.0008],  // space基準の位置
   "rotation": [-0.0218, 0.0123, -0.4922, 0.8701], // space基準の quat (x,y,z,w)

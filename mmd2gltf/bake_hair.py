@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj, q_normalize,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
+BAKE_HAIR_VERSION = "2026-07-28b (collision mask semantics fixed: the PMX 16bit field stores which groups a body DOES collide with, Bullet-style; the old code treated a set bit as no-collision and skipped with or, which inverted every group decision) | previously 2026-07-28a (drape_depth_scale: use mesh-measured drape depth per bone as the skirt extra clearance, replacing the rb_size_margin_scale approximation; measured on IA: waist 0.089 / mid 0.118 / hem 0.330 in PMX units, i.e. a 3.7x root-to-hem gradient that a single uniform clearance cannot match) | previously 2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -23,8 +23,8 @@ def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
 class Particle:
     __slots__ = ("rb", "bone", "mass", "inv_mass", "parent", "rest_len",
                  "rest_dir_local", "ang_min", "ang_max", "joint_rot", "rest_pos",
-                 "kinematic", "group", "no_collision_mask")
-    def __init__(self, rb, bone, mass, kinematic, group=0, no_collision_mask=0):
+                 "kinematic", "group", "collision_mask")
+    def __init__(self, rb, bone, mass, kinematic, group=0, collision_mask=0xFFFF):
         self.rb = rb              # physicsGltf.rigidBodies のindex
         self.bone = bone          # node index
         self.mass = mass
@@ -39,7 +39,14 @@ class Particle:
                                    # simulate_step_rigid_chainの軸別クランプでのみ使用。
         self.rest_pos = None      # rest世界座標(glTF)
         self.group = group                      # MMDの非衝突グループ番号(0-15)
-        self.no_collision_mask = no_collision_mask  # このグループとは衝突しない、というビットマスク
+        # PMXの16bitフィールド。名前は「非衝突グループフラグ」だが、格納されている
+        # ビット=1は「そのグループと衝突する」を意味する(Bulletのcollision filter
+        # maskそのもの)。PMXエディタのチェックボックス表示(チェック=非衝突)とは
+        # 反転しているので注意。three.jsのmmd-parserはgroupTarget、sabaは
+        # m_collisionGroupという名前を使っており、いずれもBulletのmaskへ直接渡す。
+        # blender mmd_toolsはimport時に反転して「衝突しないグループ」へ変換している。
+        # glTF側のキー名 "noCollisionMask" は互換性のため据え置き(値の意味は同じ)。
+        self.collision_mask = collision_mask
 
 class Chain:
     def __init__(self):
@@ -457,6 +464,9 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         midpoint_correction_samples=1,
                         collision_bounce=0.0,
                         rb_size_margin_scale=0.0,
+                        drape_depth_by_bone=None,
+                        drape_depth_scale=0.0,
+                        drape_probe=True,
                         lateral_slack_scale=0.0,
                         vertical_spread_scale=0.0,
                         cloth_algorithm="points",
@@ -552,6 +562,48 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         1.0を基準にモデル・実機の見た目で上下に調整することを想定する
         (collision_margin/hem_extra_margin と同様、値の妥当性は実測ではなく
         目視で追い込む前提)。
+    drape_depth_by_bone / drape_depth_scale : ドレープの落ち込み(メッシュ実測)を
+        追加クリアランスとして使う。drape_depth_scale=0.0(デフォルト)で無効。
+        drape_depth_by_bone は {ボーンindex: 落ち込み量(PMX原単位)} の辞書で、
+        mmd2gltf.drape.measure_drape_depth() が返すものを convert.py 経由で
+        受け取る。値は scale を掛けて glTF 単位に変換したうえで
+        extra_margin_by_rb として使う(rb_size_margin_scale と同じ配線)。
+        狙い: 物理インスペクタでの目視から、スカートボーンが布の外寄り(山側)に
+        置かれており、実メッシュはそこからさらに内側へ落ち込んでいることが
+        判明した。パーティクル(=ボーン)をコライダーの外に保っても、内側へ
+        落ち込んだ布は脚を突き抜けて見える。これが貫入の見かけ上の原因で、
+        rb_size_margin_scale で剛体の厚みを何倍かしていたのは、この落ち込みを
+        間接的に近似していたことになる。
+        IAモデルの実測(PMX原単位・p90)では、落ち込みは腰側リングで平均0.089、
+        中段0.118、裾側0.330と、根元から裾へ約3.7倍の勾配があった。一方
+        rb_size_margin_scale=3 は全リング一律の約0.29に相当し、腰側では実測の
+        3倍以上、裾側では実測にわずかに足りない配分になっていた。実機で
+        「3で本家と同程度、5で貫入ゼロだが膨らむ」となったのはこのためと
+        考えられる。本パラメータはモデルごとの実測値をそのまま使うので、
+        倍率の手調整を前提としない(1.0 = 実測どおり)。
+        リング間の段差を避けるため、チェーンに沿って [0.25, 0.5, 0.25] の
+        平滑化を1回かける(両端は保持)。rb_size_margin_scale のような根元-裾の
+        直線補間ではなく実測の形を残すのは、中間リングの落ち込みが直線上には
+        乗らない(IAでは腰0.089→中段0.118→裾0.330)ため。
+        drape_depth_scale > 0.0 のときは rb_size_margin_scale 由来の値を
+        置き換える(同じ現象を二重に埋めないため。ログにその旨を出力する)。
+        静止姿勢クランプ: 実測どおりの深さでも、そのぶん内側に置いた点が
+        フレーム0の時点で既にコライダーの内側に入る箇所がある(IA実測では
+        36本中4本、いずれも左右の側面=太ももに最も近い列)。そこを無条件に
+        押し出すと常時押し出しが働き、避けたかった腰まわりの膨らみが出るため、
+        フレーム0の実クリアランス - collision_margin を上限として各剛体ごとに
+        頭打ちにする。該当箇所ではモデル自身の布が静止姿勢でカプセルを貫いて
+        おり(カプセルが粗い近似であるため)、本家MMDもそこは許容している。
+    drape_probe : True(既定)なら、中間パーティクル補正のサンプル点を、ドレープの
+        深さぶん内側(体の軸から見た水平の内向き)へ寄せてから衝突を判定する。
+        深さを「マージンの上乗せ」ではなく「点の位置」で表現する方式で、
+        中間パーティクルが実際のドレープの深い位置に置かれるため、押し出しの
+        向きも布の内側基準になる。二重計上を避けるため、この方式のときは
+        深さをマージン側には加算しない。drape_depth_scale=0.0(既定)のときは
+        drape_extra が空なので、この設定に関わらず従来挙動と完全に同じ。
+        False にすると従来どおりマージンへの上乗せとして扱う(比較用)。
+        なお hem_extend_scale で終端セグメントを仮想的に延長したのと同じ
+        「状態を持たない仮想点」の設計で、パーティクル自体は増やさない。
     lateral_slack_scale : スカートの横リング(隣接パネル間、lateral)の距離拘束に
         「遊び」を持たせる倍率。デフォルト0.0で無効(既存の常にrest_lenぴったり
         へ戻すハード等式拘束のまま、既存挙動と完全に同じ)。
@@ -810,7 +862,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         _forced = 0
         for p in parts.values():
             if rbs_names_all[p.rb]["name"] in _force_set:
-                p.no_collision_mask = 0xFFFF
+                p.collision_mask = 0     # 0 = どのグループとも衝突しない
                 _forced += 1
         if _forced:
             print("  [physics] force_no_collision_names: %d particle(s) forced "
@@ -902,9 +954,9 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             while bb != -1:
                 path.append(bb); bb = parent[bb]
             path.reverse()
-            _mask = rb.get("noCollisionMask", 0)
+            _mask = rb.get("noCollisionMask", 0xFFFF)
             if force_no_collision_names and rb["name"] in force_no_collision_names:
-                _mask = 0xFFFF
+                _mask = 0     # 0 = どのグループとも衝突しない
             colliders_def.append((rb["shape"], path, rb["size"],
                                   rb["position"], rb["rotation"],
                                   rb.get("group", 0), _mask, _rbi))
@@ -1012,6 +1064,94 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                   "steps)"
                   % (rb_size_margin_scale, len(rb_size_extra),
                      min(_vals), max(_vals), sum(_vals) / len(_vals)))
+
+    # ドレープの落ち込み(メッシュ実測)を追加クリアランスとして使う。
+    _drape_active = False
+    # drape_depth_scale=0.0(デフォルト)なら何もしない=既存挙動と完全に同じ。
+    # 剛体の厚み×倍率(rb_size_margin_scale)は同じ現象を間接的に近似したもの
+    # なので、こちらが有効なときは置き換える(二重に埋めない)。
+    if drape_depth_scale > 0.0 and drape_depth_by_bone:
+        _drape_raw = {}
+        for ch in chains:
+            for p in ch.particles:
+                if p.kinematic or p.rb not in skirt_rbs:
+                    continue
+                _dv = drape_depth_by_bone.get(p.bone)
+                if _dv is None or _dv <= 0.0:
+                    continue
+                # PMX原単位 → glTF単位
+                _drape_raw[p.rb] = _dv * scale * drape_depth_scale
+        drape_extra = {}
+        for ch in chains:
+            dyn = [p for p in ch.particles if p.rb in skirt_rbs and not p.kinematic]
+            _seq = [p for p in dyn if p.rb in _drape_raw]
+            if not _seq:
+                continue
+            _v = [_drape_raw[p.rb] for p in _seq]
+            # リング間の段差を避けるため [0.25, 0.5, 0.25] で1回平滑化(両端は保持)
+            _sm = list(_v)
+            for i in range(1, len(_v) - 1):
+                _sm[i] = _v[i - 1] * 0.25 + _v[i] * 0.5 + _v[i + 1] * 0.25
+            for p, val in zip(_seq, _sm):
+                drape_extra[p.rb] = val
+        # 静止姿勢クランプ。実測どおりの深さでも、そのぶん内側に置いた点が
+        # 最初からコライダーの中に入ってしまう箇所がある(IAでは36本中4本、
+        # いずれも左右の側面=太ももに最も近い列)。そこを無条件に押し出すと
+        # 常時押し出しが働き、避けたかった腰まわりの膨らみが出る。
+        # フレーム0の実クリアランスで上限を掛ける(モデル自身が静止姿勢で
+        # カプセルを貫いている箇所は、そもそも本家も許容している)。
+        _cols0 = colliders_at(0)
+        _rest_room = {}
+        for ch in chains:
+            for p in ch.particles:
+                if p.kinematic or p.rb not in drape_extra:
+                    continue
+                if not (0 <= p.bone < len(nodes)):
+                    continue
+                _rp = bone_world_pos(p.bone, 0)
+                _room = None
+                for _col in _cols0:
+                    if allowed_collider_rbi is not None:
+                        if _col[-1] not in allowed_collider_rbi:
+                            continue
+                    elif not ((_col[-2] & (1 << p.group)) and (p.collision_mask & (1 << _col[-3]))):
+                        continue
+                    if _col[0] == "sphere":
+                        _C, _rad = _col[1], _col[2]
+                    else:
+                        _C = _closest_on_segment(_rp, _col[1], _col[2])
+                        _rad = _col[3]
+                    _dd = _len(_sub(_rp, _C)) - _rad
+                    if _room is None or _dd < _room:
+                        _room = _dd
+                if _room is not None:
+                    _rest_room[p.rb] = _room
+        _clamped = 0
+        for _rbi in list(drape_extra):
+            _room = _rest_room.get(_rbi)
+            if _room is None:
+                continue
+            _lim = max(0.0, _room - max(collision_margin, 0.0))
+            if drape_extra[_rbi] > _lim:
+                drape_extra[_rbi] = _lim
+                _clamped += 1
+
+        if drape_extra:
+            _drape_active = True
+            _vals = list(drape_extra.values())
+            print("  [physics] drape_depth_scale=%.3f: %d skirt rigid body/bodies "
+                  "using mesh-measured drape depth as extra margin "
+                  "(min=%.4f, max=%.4f, mean=%.4f; smoothed along chain)"
+                  % (drape_depth_scale, len(drape_extra),
+                     min(_vals), max(_vals), sum(_vals) / len(_vals)))
+            if _clamped:
+                print("  [physics] drape depth clamped on %d rigid body/bodies "
+                      "(the inward point would already be inside a collider at rest)"
+                      % _clamped)
+            if rb_size_extra:
+                print("  [physics] note: rb_size_margin_scale values are superseded "
+                      "by drape_depth_scale (same phenomenon; not stacked)")
+            rb_size_extra = drape_extra
 
     # 裾延長(hem_extend_scale): 実機の物理インスペクター観察「縦ボーンの終端は
     # 剛体プレートの中央」に基づき、最下段剛体が終端パーティクルの下へはみ出す
@@ -1628,6 +1768,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     # フレーム数」自体はほぼ変わらない(浅く広く残る)緩和策。
     # ------------------------------------------------------------------
     _midpoint_enabled = midpoint_correction
+    _drape_probe_on = bool(drape_probe and _drape_active)
     _midpoint_allowed_rbi = None
     if _midpoint_enabled and midpoint_correction_collider_names is not None:
         _allow_mp = set(midpoint_correction_collider_names)
@@ -1657,7 +1798,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             return None
         return _scale(best_dir, best_depth)
 
-    def _apply_midpoint_correction(a_full, cols):
+    def _apply_midpoint_correction(a_full, cols, axis=None):
         n_samples = max(1, midpoint_correction_samples)
         ts = [si / (n_samples + 1) for si in range(1, n_samples + 1)]
         for _ in range(midpoint_correction_iters):
@@ -1674,7 +1815,16 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 # rb_size_extra(剛体実サイズ由来)も同様に両端の平均をボーン本体と
                 # 一貫適用する。rb_size_margin_scale=0.0(既定)なら常に空辞書で加算0。
                 _rse = (rb_size_extra.get(rb_a, 0.0) + rb_size_extra.get(rb_b, 0.0)) * 0.5
-                _edge_extra = hem_extra_margin * _hw + _rse
+                # drape_probe: 深さを「マージンの上乗せ」ではなく「サンプル点を
+                # 内側へ寄せる」形で表現する。中間パーティクルが実際のドレープの
+                # 深い位置に置かれるので、押し出しの向きも布の内側基準になる。
+                # 位置と量の二重計上を避けるため、_rse はマージンから外す。
+                if _drape_probe_on:
+                    _edge_extra = hem_extra_margin * _hw
+                    _probe_in = _rse
+                else:
+                    _edge_extra = hem_extra_margin * _hw + _rse
+                    _probe_in = 0.0
                 for t in ts:
                     if pa.kinematic:
                         if rb_a not in a_full:
@@ -1689,6 +1839,15 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                     else:
                         pos_b = state_cloth.pos[rb_b]
                     m = _lerp(pos_a, pos_b, t)
+                    if _probe_in > 0.0 and axis is not None:
+                        # 体の軸(腰ボーン)から見た水平の外向きを求め、その逆へ寄せる。
+                        # 体が傾いてもアンカーが動くので追従する。
+                        _bc = axis[0]
+                        _hx, _hz = m[0] - _bc[0], m[2] - _bc[2]
+                        _hl = math.hypot(_hx, _hz)
+                        if _hl > 1e-6:
+                            m = (m[0] - _hx / _hl * _probe_in, m[1],
+                                 m[2] - _hz / _hl * _probe_in)
                     corr = _midpoint_push(m, cols, _edge_extra)
                     if corr is None:
                         continue
@@ -1828,7 +1987,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                             hem_extend=hem_extend)
             if _midpoint_enabled:
                 # N=1(実質1サブステップ)のフレームでは、通常呼び出し直後に1回だけ補正。
-                _apply_midpoint_correction(a, cols_f)
+                _apply_midpoint_correction(a, cols_f, body_axis_at(f))
         else:
             # 発動フレーム: アンカー・コライダーをN分割補間しつつN回呼ぶ。
             # gravity_power は 1/N でスケーリングし、N回分の積み重ねが1回分と
@@ -1873,7 +2032,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                     # 「逆順」= サブステップ1回ごとに毎回補正をかける。フレーム
                     # 終わりに1回だけ補正するより、検証の結果わずかに有利
                     # (貫入面積・貫入フレーム数の両方でごくわずかに改善)だった。
-                    _apply_midpoint_correction(a_sub, cols_sub)
+                    _apply_midpoint_correction(a_sub, cols_sub, body_axis_at(f))
 
         loc = {}
         loc.update(seg_rot_to_local(state_other, seg_other))
@@ -2020,13 +2179,13 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
         p = Particle(rbs[i]["rb"] if False else i, rbs[i]["bone"], rbs[i]["mass"],
                      kinematic=False,
                      group=rbs[i].get("group", 0),
-                     no_collision_mask=rbs[i].get("noCollisionMask", 0))
+                     collision_mask=rbs[i].get("noCollisionMask", 0xFFFF))
         p.rest_pos = bpos(rbs[i]["bone"])
         parts[i] = p
     for i in anchors:
         p = Particle(i, rbs[i]["bone"], rbs[i]["mass"], kinematic=True,
                      group=rbs[i].get("group", 0),
-                     no_collision_mask=rbs[i].get("noCollisionMask", 0))
+                     collision_mask=rbs[i].get("noCollisionMask", 0xFFFF))
         p.rest_pos = bpos(rbs[i]["bone"])
         parts[i] = p
 
@@ -3016,8 +3175,8 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
       メッシュ面の見た目上の食い込みは裾で起きやすい一方、marginを全体で
       上げると腰に近いセグメントが押し出されて傘化に近づくため、根元から
       裾へ滑らかに繋げつつ安全にクリアランスを稼ぐ。
-    colliders: [("capsule", p0, p1, radius, group, no_collision_mask, rb_index),
-                ("sphere", center, radius, group, no_collision_mask, rb_index), ...]
+    colliders: [("capsule", p0, p1, radius, group, collision_mask, rb_index),
+                ("sphere", center, radius, group, collision_mask, rb_index), ...]
     accum: 指定すると{rb: (dx,dy,dz)}の累積辞書に、このコールで実際に押し出した
         変位ベクトルを加算していく(Noneなら何もしない・既存挙動と完全に同じ)。
         1フレーム内でこの関数は反復拘束解決のため複数回呼ばれることがあるが、
@@ -3112,19 +3271,23 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                 u_axis = None
             else:
                 continue
-            # MMDの非衝突グループ判定: PMXの剛体はgroup(0-15)とnoCollisionMask
-            # (自分がどのgroupと衝突しないかのビットマスク)を持つ。モデル制作者が
-            # 明示的に「このコライダーとこの揺れ物は衝突させない」と設定している
-            # 場合があり(実測: あるモデルの下半身の球コライダーはスカートの
-            # groupを、腕/ひじのカプセルは全groupを非衝突に設定していた)、これを
-            # 無視すると本来当たらないはずのコライダーにスカートが押し当てられて
-            # 伸びたり戻らなくなったりする。相手側のmaskが自分のgroupを、または
-            # 自分のmaskが相手のgroupを除外していれば、双方向にスキップする。
+            # MMDのグループ判定: PMXの剛体はgroup(0-15)と16bitのマスクを持つ。
+            # マスクは名前こそ「非衝突グループフラグ」だが、立っているビットが
+            # 「そのグループと衝突する」を表す(Bulletのcollision filter mask)。
+            # 衝突の条件はBulletと同じく双方向で、相手のmaskに自分のgroupが立ち、
+            # かつ自分のmaskに相手のgroupが立っているときだけ衝突する。
+            # 【2026-07-28修正】以前はビット=非衝突と解釈して or でスキップして
+            # おり、判定が反転していた。実データで確認すると、体のボーン追従剛体は
+            # マスク=0xFFFF(全グループと衝突)、揺れ物は自分のgroupだけを落とす、
+            # というMMDの定番の作り方になっており、旧解釈では「体のコライダーが
+            # 何とも衝突せず、髪同士だけが衝突する」という逆の動作になっていた。
+            # 他実装(three.js mmd-parser: groupTarget、saba: m_collisionGroup、
+            # blender mmd_tools: import時に反転)も全てこの解釈で一致している。
             # アローリスト方式(allowed_collider_rbi指定)の場合は、この判定自体を
             # 行わない。アローリストに入っているコライダーは無条件に有効な相手と
             # みなす(group/noCollisionMaskの設定がどうであれ関係ない)。
             if allowed_collider_rbi is None:
-                if (cmask & (1 << p.group)) or (p.no_collision_mask & (1 << cgroup)):
+                if not ((cmask & (1 << p.group)) and (p.collision_mask & (1 << cgroup))):
                     continue
             dvec = _sub(P, C)
             d = _len(dvec)
@@ -3293,7 +3456,7 @@ def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin
                 else:
                     continue
                 if allowed_collider_rbi is None:
-                    if (cmask & (1 << c.group)) or (c.no_collision_mask & (1 << cgroup)):
+                    if not ((cmask & (1 << c.group)) and (c.collision_mask & (1 << cgroup))):
                         continue
                 dvec = _sub(Q, C)
                 d = _len(dvec)
