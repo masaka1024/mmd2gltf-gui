@@ -157,6 +157,42 @@ def main(argv=None):
                     "scales roughly linearly with N. The push direction is "
                     "always horizontal (perpendicular to gravity), never "
                     "up/down, regardless of this setting")
+    ap.add_argument("--drape-depth-scale", type=float, default=1.0,
+                    metavar="F",
+                    help="use the drape depth measured from the PMX mesh as "
+                    "the skirt's extra clearance, scaled by this factor "
+                    "(default 0.0 = off; 1.0 = use the measured value as is). "
+                    "Skirt bones usually sit on the outer side of the cloth "
+                    "while the mesh sags further inward, so the mesh can look "
+                    "like it penetrates the legs even when the particles do "
+                    "not. Measured per bone and smoothed along each chain. "
+                    "Supersedes --rb-size-margin-scale when both are given.")
+    ap.add_argument("--symmetrize-colliders", action="store_true",
+                    help="mirror-average left/right collider pairs before "
+                    "baking, so a small left/right slip in the model does not "
+                    "make the skirt bulge on one side only. The data written "
+                    "to extras.mmd is left untouched.")
+    ap.add_argument("--physics-report", action="store_true",
+                    help="print per-ring skirt diagnostics after baking: how "
+                    "far each ring opened compared with its rest radius, which "
+                    "collider it was closest to, and how often the collision "
+                    "push fired. Useful when tracking down cloth behaviour.")
+    ap.add_argument("--collision-velocity-damp", type=float, default=1.0,
+                    metavar="F",
+                    help="how much of the velocity created by a collision "
+                    "push-out is cancelled (1.0 = fully inelastic, the "
+                    "default; 0.0 = the old behaviour where each push also "
+                    "injected outward velocity into the Verlet integrator).")
+    ap.add_argument("--margin-rest-clamp", action="store_true",
+                    help="cap the total clearance of each particle-collider "
+                    "pair at the distance available in the rest pose. Off by "
+                    "default: it was added while chasing a one-sided skirt "
+                    "flare whose real cause turned out to be elsewhere, and it "
+                    "trims the measured drape depth more than is useful.")
+    ap.add_argument("--no-drape-probe", action="store_true",
+                    help="with --drape-depth-scale, treat the measured depth as "
+                    "extra margin instead of moving the midpoint sample inward "
+                    "(comparison / fallback; the inward sample is the default).")
     ap.add_argument("--rb-size-margin-scale", type=float, default=0.0,
                     metavar="F",
                     help="derive extra clearance from each skirt rigid "
@@ -372,6 +408,12 @@ def main(argv=None):
                 midpoint_correction_samples=a.midpoint_correction_samples,
                 collision_bounce=a.collision_bounce,
                 rb_size_margin_scale=a.rb_size_margin_scale,
+                drape_depth_scale=a.drape_depth_scale,
+                drape_probe=not a.no_drape_probe,
+                margin_rest_clamp=a.margin_rest_clamp,
+                collision_velocity_damp=a.collision_velocity_damp,
+                physics_report=a.physics_report,
+                symmetrize_colliders=a.symmetrize_colliders,
                 lateral_slack_scale=a.lateral_slack_scale,
                 vertical_spread_scale=a.vertical_spread_scale,
                 cloth_algorithm=a.cloth_algorithm,

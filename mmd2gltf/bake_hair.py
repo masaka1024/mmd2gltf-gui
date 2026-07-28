@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj, q_normalize,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-28b (collision mask semantics fixed: the PMX 16bit field stores which groups a body DOES collide with, Bullet-style; the old code treated a set bit as no-collision and skipped with or, which inverted every group decision) | previously 2026-07-28a (drape_depth_scale: use mesh-measured drape depth per bone as the skirt extra clearance, replacing the rb_size_margin_scale approximation; measured on IA: waist 0.089 / mid 0.118 / hem 0.330 in PMX units, i.e. a 3.7x root-to-hem gradient that a single uniform clearance cannot match) | previously 2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
+BAKE_HAIR_VERSION = "2026-07-28n (drape_depth_scale now falls back to the rigid body thickness for bodies whose drape depth could not be measured, instead of dropping their clearance to zero) | previously 2026-07-28m (symmetrize_colliders option: mirror-average left/right collider pairs for baking, since modelling is normally done mirrored and small left/right slips show up as a one-sided skirt bulge; also fixes the report, which ignored exclude_rb and the group mask and therefore counted the chain anchor as a collider) | previously 2026-07-28l (physics_report also estimates mesh-level penetration: clearance measured against the mesh-derived drape depth, so the number reflects what is visible rather than whether the bone itself is clear) | previously 2026-07-28k (the per-ring diagnostics are now opt-in via physics_report) | previously 2026-07-28j (skip_embedded_parent: when a segment starts inside a collider by design — IA seats the skirt chain's parent body 0.052 inside the 下半身1 capsule — the segment test read that as a deep collision and transferred part of it to the first skirt ring every single frame; such a segment is now tested at its child end only) | previously 2026-07-28i (push_preserve_length: after a segment-aware collision push, the particle was re-projected onto the rest_len sphere around its parent, so any contact also stretched a compressed segment to full length — a tiny push became a large outward move. It now keeps the pre-push distance and only rotates about the parent, as the circular-motion design intended) | previously 2026-07-28h (diagnostic: count how often the collision push actually fires per skirt ring and how large it is) | previously 2026-07-28g (diagnostic: sample which collider each skirt ring is closest to during the motion, and at what surface distance, to name what the cloth is actually resting on) | previously 2026-07-28f (collision_velocity_damp: collision push-out moved pos only, so in Verlet every push injected outward velocity; with contact on most frames the skirt was fed outward and never came back — measured as a flat +0.025 waist-ring expansion that vanished with colliders off. prev now moves with the push so the response is fully inelastic) | previously 2026-07-28e (diagnostic: also report which skirt particles are already touching a collider in the rest pose, and the tightest particle-collider pairs, since a permanent contact shows up as a constant ring expansion) | previously 2026-07-28d (diagnostic: report per-ring skirt expansion vs the rest radius each frame, with a 10-slice timeline, to tell contact-driven opening apart from opening that never recovers) | previously 2026-07-28c (margin_rest_clamp: cap the total clearance of each particle-collider pair at the distance actually available in the rest pose, so no margin pushes the cloth outward while the model stands still; needed because the collision-mask fix widened the skirt's collider set to the hip capsules) | previously 2026-07-28b (collision mask semantics fixed: the PMX 16bit field stores which groups a body DOES collide with, Bullet-style; the old code treated a set bit as no-collision and skipped with or, which inverted every group decision) | previously 2026-07-28a (drape_depth_scale: use mesh-measured drape depth per bone as the skirt extra clearance, replacing the rb_size_margin_scale approximation; measured on IA: waist 0.089 / mid 0.118 / hem 0.330 in PMX units, i.e. a 3.7x root-to-hem gradient that a single uniform clearance cannot match) | previously 2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -467,6 +467,12 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                         drape_depth_by_bone=None,
                         drape_depth_scale=0.0,
                         drape_probe=True,
+                        margin_rest_clamp=True,
+                        collision_velocity_damp=1.0,
+                        push_preserve_length=True,
+                        skip_embedded_parent=True,
+                        physics_report=False,
+                        symmetrize_colliders=False,
                         lateral_slack_scale=0.0,
                         vertical_spread_scale=0.0,
                         cloth_algorithm="points",
@@ -604,6 +610,45 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         False にすると従来どおりマージンへの上乗せとして扱う(比較用)。
         なお hem_extend_scale で終端セグメントを仮想的に延長したのと同じ
         「状態を持たない仮想点」の設計で、パーティクル自体は増やさない。
+    collision_velocity_damp : 押し出しが速度を生まないようにする度合い。
+        1.0(既定)で完全に打ち消す、0.0で従来どおり。
+        背景: resolve_collisions は pos だけを動かす。Verlet積分では速度を
+        pos-prev で表すため、押し出した分がそのまま外向きの速度になり、次の
+        フレームの慣性に乗ってしまう。毎フレーム接触が起きていると外向きの
+        速度が供給され続け、布は押し戻されるどころか外へ送られ続ける。
+        実測(IA、7001フレーム): コライダー有りでは腰リングの開きが全区間
+        +0.025で平坦(最小でも+0.017、一度も戻らない)、コライダーを外すと
+        中央-0.001で±0.03を振動。静止姿勢で食い込んでいるパーティクルは
+        36本中1本しかなく、常時食い込みでは説明できなかった。
+        押し出した変位と同じだけ prev も動かせば、押し出しは位置だけを直し
+        速度には触れない(完全非弾性の法線応答)。collision_bounce は逆に
+        prev を戻して弾みを与える機能で、両立する(bounce適用後に打ち消す)。
+    symmetrize_colliders : True にすると、左右対のコライダー(「左○○」と「右○○」)
+        のボーンから見た相対位置・サイズ・回転を鏡像平均し、ベイクの入力だけを
+        左右対称にする(既定 False。extras.mmd に書き出す元データは変更しない)。
+        モデル制作は基本ミラー作業なので、左右の食い違いは作者の意図ではなく
+        作業上のブレであることが多い。IAでは太ももカプセルのローカルXが
+        左-0.193/右+0.147(鏡像なら+0.193)、足が左-0.153/右+0.086と0.046〜0.067
+        ずれており、ボーン自体は±1.034で完全対称だった。このずれはドレープの
+        マージンと同程度の大きさなので、片側だけスカートが押されて膨らむ。
+    physics_report : True にすると、スカートの各リングについて「静止時の半径から
+        どれだけ開いたか」「どのコライダーに一番近いか」「押し出しが何%のフレームで
+        起きたか」をベイク後にログ出力する(既定 False)。原因の切り分け用で、
+        毎フレームの集計ぶん少し遅くなる。
+    margin_rest_clamp : True(既定)なら、各(パーティクル, コライダー)の組み合わせに
+        ついて、フレーム0での実クリアランスを超えるマージンを使わない。
+        collision_margin / hem_extra_margin / extra_margin_by_rb の合計に対して
+        効く。考え方は「静止姿勢のモデルは作者が正しく作った状態なのだから、
+        どのマージンも静止姿勢で布を押し出してはいけない」。
+        背景: PMXのグループ判定を正しく直した結果、スカートの衝突相手が脚だけ
+        でなく腰・胴のコライダーにも広がった(IAでは16個)。腰のコライダーは
+        スカート上端のすぐ内側にあり、実測クリアランスはリング0で中央0.0156・
+        最小0.0065(glTF単位)しかない。ここに既定のcollision_margin=0.01と
+        rb_size_margin_scale=1.0相当の0.0077が乗ると合計0.018となり、静止姿勢
+        から腰リング全周が押し出されて、スカートが傘型に開いてしまう。
+        ペア単位で上限を持たせるのが要点で、同じ腰のパーティクルでも太ももに
+        対しては0.024程度の余裕があるため、脚への当たりは甘くならない。
+        False にすると従来どおり上限なし(比較用)。
     lateral_slack_scale : スカートの横リング(隣接パネル間、lateral)の距離拘束に
         「遊び」を持たせる倍率。デフォルト0.0で無効(既存の常にrest_lenぴったり
         へ戻すハード等式拘束のまま、既存挙動と完全に同じ)。
@@ -857,6 +902,7 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     chains, parts, excluded, lateral = extract_chains_bfs(
         physics_gltf, bwm, only_names=only_names)
     rbs_names_all = physics_gltf["rigidBodies"]
+    _push_report = {}   # 計測用(ウォームアップ中の分は本計測前にリセットする)
     if force_no_collision_names:
         _force_set = set(force_no_collision_names)
         _forced = 0
@@ -960,6 +1006,56 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
             colliders_def.append((rb["shape"], path, rb["size"],
                                   rb["position"], rb["rotation"],
                                   rb.get("group", 0), _mask, _rbi))
+
+    if symmetrize_colliders:
+        # 左右対のコライダー(「左○○」と「右○○」)の、ボーンから見た相対位置・
+        # サイズ・回転を鏡像平均して左右対称にする。
+        # 背景: モデル制作は基本ミラー作業なので、左右の食い違いは作者の意図では
+        # なく作業上のブレであることが多い。IAでは太ももカプセルのローカルXが
+        # 左-0.193/右+0.147(鏡像なら+0.193)と0.046ずれており、足も0.067ずれて
+        # いた(ボーン自体は±1.034で完全対称)。この差はドレープのマージンと
+        # 同程度の大きさになるため、片側だけスカートが押されて膨らむ。
+        # extras.mmd に書き出す元データは変更しない(ベイクの入力だけを直す)。
+        _by_name = {}
+        for _i, _c in enumerate(colliders_def):
+            _nm = rbs_names_all[_c[-1]].get("name", "")
+            _by_name[_nm] = _i
+        _done = set()
+        _nsym = 0
+        for _nm, _i in list(_by_name.items()):
+            if not _nm.startswith("左") or _i in _done:
+                continue
+            _j = _by_name.get("右" + _nm[1:])
+            if _j is None or _j in _done:
+                continue
+            _L, _R = colliders_def[_i], colliders_def[_j]
+            if _L[0] != _R[0]:
+                continue
+            _lp, _rp = _L[3], _R[3]
+            _ls, _rs = _L[2], _R[2]
+            # 位置: xは符号を保って絶対値を平均、y/zはそのまま平均
+            _ax = (abs(_lp[0]) + abs(_rp[0])) * 0.5
+            _ay = (_lp[1] + _rp[1]) * 0.5
+            _az = (_lp[2] + _rp[2]) * 0.5
+            _npL = (_ax if _lp[0] >= 0 else -_ax, _ay, _az)
+            _npR = (_ax if _rp[0] >= 0 else -_ax, _ay, _az)
+            _ns = [ (_ls[_k] + _rs[_k]) * 0.5 for _k in range(min(len(_ls), len(_rs))) ]
+            # 回転: 右をX面で鏡像((x,y,z,w)->(x,-y,-z,w))してから平均し、右へ戻す
+            _lr, _rr = _L[4], _R[4]
+            _mr = (_rr[0], -_rr[1], -_rr[2], _rr[3])
+            if (_lr[0]*_mr[0] + _lr[1]*_mr[1] + _lr[2]*_mr[2] + _lr[3]*_mr[3]) < 0.0:
+                _mr = (-_mr[0], -_mr[1], -_mr[2], -_mr[3])
+            _q = [(_lr[_k] + _mr[_k]) * 0.5 for _k in range(4)]
+            _qn = math.sqrt(sum(_v * _v for _v in _q)) or 1.0
+            _q = [_v / _qn for _v in _q]
+            _qR = (_q[0], -_q[1], -_q[2], _q[3])
+            colliders_def[_i] = (_L[0], _L[1], _ns, _npL, tuple(_q), _L[5], _L[6], _L[7])
+            colliders_def[_j] = (_R[0], _R[1], _ns, _npR, _qR, _R[5], _R[6], _R[7])
+            _done.add(_i); _done.add(_j)
+            _nsym += 1
+        if _nsym:
+            print("  [physics] symmetrize_colliders: %d left/right collider pair(s) "
+                  "mirror-averaged for baking (source data unchanged)" % _nsym)
 
     def colliders_at(f):
         cols = []
@@ -1065,6 +1161,74 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                   % (rb_size_margin_scale, len(rb_size_extra),
                      min(_vals), max(_vals), sum(_vals) / len(_vals)))
 
+    # 静止姿勢クランプ用の表: {(パーティクルのrb, コライダーのrb): 静止時クリアランス}
+    # 考え方は単純で、「静止姿勢のモデルは作者が正しく作った状態なのだから、
+    # どのマージンも静止姿勢で布を押し出してはいけない」。フレーム0で実際に
+    # 空いている距離を、その組み合わせで使えるマージンの上限とする。
+    # ペア単位にするのが要点で、腰のパーティクルは下半身カプセルに対しては
+    # わずかな余裕しか無いが、太ももに対しては十分な余裕がある。一律に絞ると
+    # 脚への当たりまで甘くなるため、相手ごとに上限を持たせる。
+    _pair_cap = None
+    if margin_rest_clamp:
+        _pair_cap = {}
+        _cols0 = colliders_at(0)
+        for ch in chains:
+            for p in ch.particles:
+                if p.kinematic or not (0 <= p.bone < len(nodes)):
+                    continue
+                _rp = bone_world_pos(p.bone, 0)
+                for _col in _cols0:
+                    _crbi = _col[-1]
+                    if allowed_collider_rbi is not None:
+                        if _crbi not in allowed_collider_rbi:
+                            continue
+                    elif not ((_col[-2] & (1 << p.group)) and (p.collision_mask & (1 << _col[-3]))):
+                        continue
+                    if _col[0] == "sphere":
+                        _C, _rad = _col[1], _col[2]
+                    else:
+                        _C = _closest_on_segment(_rp, _col[1], _col[2])
+                        _rad = _col[3]
+                    _pair_cap[(p.rb, _crbi)] = max(0.0, _len(_sub(_rp, _C)) - _rad)
+        if _pair_cap:
+            _cv = list(_pair_cap.values())
+            print("  [physics] margin_rest_clamp: %d particle-collider pair(s), "
+                  "rest clearance min=%.4f, median=%.4f, max=%.4f"
+                  % (len(_cv), min(_cv), sorted(_cv)[len(_cv) // 2], max(_cv)))
+            # どのパーティクルが静止姿勢で「もう触っている」かを出す。
+            # ここが多いと、そのぶんは毎フレーム押し出され続ける＝開いたままになる。
+            _tight = {}
+            _tight_rb = {}
+            if not physics_report:
+                _pair_cap_items = []
+            else:
+                _pair_cap_items = list(_pair_cap.items())
+            for (_prb, _crbi), _room in _pair_cap_items:
+                if _prb not in skirt_rbs or _room > 1e-6:
+                    continue
+                _cn = rbs_names_all[_crbi]["name"] if 0 <= _crbi < len(rbs_names_all) else str(_crbi)
+                _tight[_cn] = _tight.get(_cn, 0) + 1
+                _tight_rb[_prb] = min(_tight_rb.get(_prb, 9e9), _room)
+            if _tight:
+                print("  [physics]   %d skirt particle(s) already touch a collider in the rest "
+                      "pose (clearance <= 0); by collider: %s"
+                      % (len(_tight_rb),
+                         ", ".join("%s x%d" % (k, v) for k, v in
+                                   sorted(_tight.items(), key=lambda t: -t[1])[:6])))
+            # 各スカートパーティクルについて、一番きつい相手との余裕
+            _minroom = {}
+            for (_prb, _crbi), _room in _pair_cap_items:
+                if _prb not in skirt_rbs:
+                    continue
+                if _prb not in _minroom or _room < _minroom[_prb][0]:
+                    _minroom[_prb] = (_room, _crbi)
+            if _minroom:
+                _mr = sorted(_minroom.items(), key=lambda t: t[1][0])[:8]
+                print("  [physics]   tightest skirt particles at rest: %s"
+                      % ", ".join("%s->%s %.4f"
+                                  % (rbs_names_all[k]["name"],
+                                     rbs_names_all[v[1]]["name"], v[0]) for k, v in _mr))
+
     # ドレープの落ち込み(メッシュ実測)を追加クリアランスとして使う。
     _drape_active = False
     # drape_depth_scale=0.0(デフォルト)なら何もしない=既存挙動と完全に同じ。
@@ -1098,43 +1262,23 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
         # 最初からコライダーの中に入ってしまう箇所がある(IAでは36本中4本、
         # いずれも左右の側面=太ももに最も近い列)。そこを無条件に押し出すと
         # 常時押し出しが働き、避けたかった腰まわりの膨らみが出る。
-        # フレーム0の実クリアランスで上限を掛ける(モデル自身が静止姿勢で
-        # カプセルを貫いている箇所は、そもそも本家も許容している)。
-        _cols0 = colliders_at(0)
-        _rest_room = {}
-        for ch in chains:
-            for p in ch.particles:
-                if p.kinematic or p.rb not in drape_extra:
-                    continue
-                if not (0 <= p.bone < len(nodes)):
-                    continue
-                _rp = bone_world_pos(p.bone, 0)
-                _room = None
-                for _col in _cols0:
-                    if allowed_collider_rbi is not None:
-                        if _col[-1] not in allowed_collider_rbi:
-                            continue
-                    elif not ((_col[-2] & (1 << p.group)) and (p.collision_mask & (1 << _col[-3]))):
-                        continue
-                    if _col[0] == "sphere":
-                        _C, _rad = _col[1], _col[2]
-                    else:
-                        _C = _closest_on_segment(_rp, _col[1], _col[2])
-                        _rad = _col[3]
-                    _dd = _len(_sub(_rp, _C)) - _rad
-                    if _room is None or _dd < _room:
-                        _room = _dd
-                if _room is not None:
-                    _rest_room[p.rb] = _room
+        # 上で作った _pair_cap(フレーム0の実クリアランス)の、その剛体に対する
+        # 最小値で上限を掛ける。
         _clamped = 0
-        for _rbi in list(drape_extra):
-            _room = _rest_room.get(_rbi)
-            if _room is None:
-                continue
-            _lim = max(0.0, _room - max(collision_margin, 0.0))
-            if drape_extra[_rbi] > _lim:
-                drape_extra[_rbi] = _lim
-                _clamped += 1
+        if _pair_cap:
+            _room_by_rb = {}
+            for (_prb, _crbi), _room in _pair_cap.items():
+                if _prb in drape_extra:
+                    if _prb not in _room_by_rb or _room < _room_by_rb[_prb]:
+                        _room_by_rb[_prb] = _room
+            for _rbi in list(drape_extra):
+                _room = _room_by_rb.get(_rbi)
+                if _room is None:
+                    continue
+                _lim = max(0.0, _room - max(collision_margin, 0.0))
+                if drape_extra[_rbi] > _lim:
+                    drape_extra[_rbi] = _lim
+                    _clamped += 1
 
         if drape_extra:
             _drape_active = True
@@ -1148,9 +1292,21 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                 print("  [physics] drape depth clamped on %d rigid body/bodies "
                       "(the inward point would already be inside a collider at rest)"
                       % _clamped)
+            # ドレープ深さが測れなかった剛体(その骨に支配される頂点が少ない等)は
+            # 剛体の厚み(rb_size_margin_scale)の値を残す。まるごと置き換えると、
+            # 測れなかったぶんがクリアランス0になって貫通が増える
+            # (ぽんぷは48本中28本しか測れず、置き換え版では腰側の貫通が
+            #  3.0%→4.1%と悪化していた)。
+            _kept = 0
+            for _rbi, _v in rb_size_extra.items():
+                if _rbi not in drape_extra:
+                    drape_extra[_rbi] = _v
+                    _kept += 1
             if rb_size_extra:
                 print("  [physics] note: rb_size_margin_scale values are superseded "
-                      "by drape_depth_scale (same phenomenon; not stacked)")
+                      "by drape_depth_scale where the drape depth could be measured"
+                      + (" (%d body/bodies keep the rigid body thickness)" % _kept
+                         if _kept else ""))
             rb_size_extra = drape_extra
 
     # 裾延長(hem_extend_scale): 実機の物理インスペクター観察「縦ボーンの終端は
@@ -1601,6 +1757,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                             hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                             collision_bounce=collision_bounce,
                             extra_margin_by_rb=rb_size_extra,
+                            margin_cap_by_pair=_pair_cap,
+                            collision_velocity_damp=collision_velocity_damp,
+                            push_report=(_push_report if physics_report else None),
+                            push_preserve_length=push_preserve_length,
+                            skip_embedded_parent=skip_embedded_parent,
                             lateral_slack_scale=lateral_slack_scale,
                             vertical_spread_scale=vertical_spread_scale,
                             vertical_neighbors=vertical_neighbors)
@@ -1626,6 +1787,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                 hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                                 collision_bounce=collision_bounce,
                                 extra_margin_by_rb=rb_size_extra,
+                            margin_cap_by_pair=_pair_cap,
+                            collision_velocity_damp=collision_velocity_damp,
+                            push_report=(_push_report if physics_report else None),
+                            push_preserve_length=push_preserve_length,
+                            skip_embedded_parent=skip_embedded_parent,
                                 lateral_slack_scale=lateral_slack_scale,
                                 vertical_spread_scale=vertical_spread_scale,
                                 vertical_neighbors=vertical_neighbors,
@@ -1898,6 +2064,41 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
               % (midpoint_correction_iters, midpoint_correction_margin))
 
     prev_anchor_full = a0            # frame -1相当 = warmupの最終姿勢(frame0と同じ)
+    # --- 計測: スカートの各リングが静止時の半径からどれだけ開いたかを毎フレーム記録する。
+    # 「接触で開く」のか「開いたまま戻らない」のかを、目視でなく数字で切り分けるため。
+    _rep_rings, _rep_rest, _rep_series = {}, {}, {}
+    _rep_part = {}
+    _rep_axis0 = body_axis_at(0) if physics_report else None
+    if _rep_axis0 and skirt_rbs:
+        _bc0 = _rep_axis0[0]
+        for ch in chains:
+            for k, p in enumerate(ch.particles):
+                if p.rb not in skirt_rbs or p.kinematic:
+                    continue
+                if not (0 <= p.bone < len(nodes)):
+                    continue
+                _rp = bone_world_pos(p.bone, 0)
+                _rep_rest[p.rb] = math.hypot(_rp[0] - _bc0[0], _rp[2] - _bc0[2])
+                _rep_part[p.rb] = p
+                _rep_rings.setdefault(k, []).append(p.rb)
+        for _k in _rep_rings:
+            _rep_series[_k] = []
+    _rep_near = {}
+    # レポート用: メッシュ実測のドレープ深さ(glTF単位)。ボーンが当たっていなくても
+    # 「谷」がこの深さぶん内側にあるので、クリアランスがこれを下回るとメッシュは
+    # 見た目に貫通する。drape_depth_scale とは独立に、計測のためだけに使う。
+    _rep_drape = {}
+    if physics_report and drape_depth_by_bone:
+        for ch in chains:
+            for p in ch.particles:
+                if p.kinematic or p.rb not in skirt_rbs:
+                    continue
+                _dv = drape_depth_by_bone.get(p.bone)
+                if _dv and _dv > 0.0:
+                    _rep_drape[p.rb] = _dv * scale
+    _rep_pen = {}
+    _push_report = {}
+
     prev_colliders_full = colliders_at(0)
     # 適応サブステップの発動回数を集計するカウンタ。以前はn_sub>1のフレームで
     # 毎回1行printしていたが、発動率が高いモーションでは数千行に達し
@@ -1940,6 +2141,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                         hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                                         collision_bounce=collision_bounce,
                                         extra_margin_by_rb=rb_size_extra,
+                            margin_cap_by_pair=_pair_cap,
+                            collision_velocity_damp=collision_velocity_damp,
+                            push_report=(_push_report if physics_report else None),
+                            push_preserve_length=push_preserve_length,
+                            skip_embedded_parent=skip_embedded_parent,
                                         lateral_slack_scale=lateral_slack_scale,
                                         vertical_spread_scale=vertical_spread_scale,
                                         vertical_neighbors=vertical_neighbors)
@@ -1980,6 +2186,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                             hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                                             collision_bounce=collision_bounce,
                                             extra_margin_by_rb=rb_size_extra,
+                            margin_cap_by_pair=_pair_cap,
+                            collision_velocity_damp=collision_velocity_damp,
+                            push_report=(_push_report if physics_report else None),
+                            push_preserve_length=push_preserve_length,
+                            skip_embedded_parent=skip_embedded_parent,
                                             lateral_slack_scale=lateral_slack_scale,
                                             vertical_spread_scale=vertical_spread_scale,
                                             vertical_neighbors=vertical_neighbors,
@@ -2023,6 +2234,11 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                                                 hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                                                 collision_bounce=collision_bounce,
                                                 extra_margin_by_rb=rb_size_extra,
+                            margin_cap_by_pair=_pair_cap,
+                            collision_velocity_damp=collision_velocity_damp,
+                            push_report=(_push_report if physics_report else None),
+                            push_preserve_length=push_preserve_length,
+                            skip_embedded_parent=skip_embedded_parent,
                                                 lateral_slack_scale=lateral_slack_scale,
                                                 vertical_spread_scale=vertical_spread_scale,
                                                 vertical_neighbors=vertical_neighbors,
@@ -2043,6 +2259,69 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
                     loc[bone] = (0.0, 0.0, 0.0, 1.0)
         for bone, q in loc.items():
             keys.setdefault(bone, []).append((f, q))
+        # 20フレームごとに「各スカートパーティクルが今どのコライダーに一番近いか」を集計。
+        # 押し出しが効き続けているなら、その相手の表面距離がマージン相当で張り付く。
+        if _rep_rest and (f % 20 == 0):
+            for _k, _rbl in _rep_rings.items():
+                for _rb in _rbl:
+                    _pp = state_cloth.pos.get(_rb)
+                    if _pp is None:
+                        continue
+                    _best = None
+                    for _col in cols_f:
+                        _crbi = _col[-1]
+                        # 実際の衝突判定と同じ絞り込みを行う。これを省くと、
+                        # チェーンのアンカー剛体(構造上その内側にある)まで最寄り
+                        # として拾ってしまい、貫通率が常時100%に見える
+                        _pp_obj = _rep_part.get(_rb)
+                        _ex = exclude_rb.get(_rb) if exclude_rb else None
+                        if _ex is not None and _crbi in _ex:
+                            continue
+                        if allowed_collider_rbi is not None:
+                            if _crbi not in allowed_collider_rbi:
+                                continue
+                        elif _pp_obj is not None and not (
+                                (_col[-2] & (1 << _pp_obj.group))
+                                and (_pp_obj.collision_mask & (1 << _col[-3]))):
+                            continue
+                        if _col[0] == "sphere":
+                            _C, _rad = _col[1], _col[2]
+                        else:
+                            _C = _closest_on_segment(_pp, _col[1], _col[2])
+                            _rad = _col[3]
+                        _dd = _len(_sub(_pp, _C)) - _rad
+                        if _best is None or _dd < _best[0]:
+                            _best = (_dd, _crbi)
+                    if _best is not None:
+                        _e = _rep_near.setdefault((_k, _best[1]), [0, 0.0])
+                        _e[0] += 1
+                        _e[1] += _best[0]
+                        # メッシュ貫通の推定: クリアランス < ドレープ深さ なら、
+                        # ボーンは当たっていなくても布の谷はコライダーの内側にある
+                        _dv = _rep_drape.get(_rb)
+                        if _dv is not None:
+                            _pe = _rep_pen.setdefault(_k, [0, 0, 0.0, 0.0])
+                            _pe[0] += 1
+                            if _best[0] < _dv:
+                                _pe[1] += 1
+                                _depth = _dv - _best[0]
+                                _pe[2] += _depth
+                                if _depth > _pe[3]:
+                                    _pe[3] = _depth
+
+        if _rep_rest:
+            _bcf = body_axis_at(f)[0]
+            for _k, _rbl in _rep_rings.items():
+                _sum = 0.0
+                _n = 0
+                for _rb in _rbl:
+                    _pp = state_cloth.pos.get(_rb)
+                    if _pp is None:
+                        continue
+                    _sum += math.hypot(_pp[0] - _bcf[0], _pp[2] - _bcf[2]) - _rep_rest[_rb]
+                    _n += 1
+                if _n:
+                    _rep_series[_k].append(_sum / _n)
         # スカート(skirt_rbs)は位置も焼く: 回転のみだとボーン長が rest 固定で、
         # 衝突押し出し(3D)を表現できず貫入が残るため。世界行列を top-down に構築し、
         # 各スカートボーンの局所translationでパーティクル世界位置に正確に一致させる。
@@ -2078,6 +2357,61 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     if _substep_enabled:
         print("  [physics] adaptive substep total: fired on %d/%d frames"
               % (_substep_fire_total, num_frames))
+
+    # --- 計測結果: スカートのリングが静止時の半径からどれだけ開いたか ---
+    # 「接触した瞬間だけ開くのか」「開いたまま戻らないのか」を数字で見るため、
+    # 平均・最大に加えて、動画を10等分した区間ごとの平均も出す。
+    def _rep_near_rings():
+        return sorted({k[0] for k in _rep_near})
+
+    if _rep_series and any(_rep_series.values()):
+        print("  [physics] skirt ring expansion vs rest radius (glTF units, + = opened outward):")
+        for _k in sorted(_rep_series):
+            _v = _rep_series[_k]
+            if not _v:
+                continue
+            _sv = sorted(_v)
+            _p50 = _sv[len(_sv) // 2]
+            _p95 = _sv[min(len(_sv) - 1, int(len(_sv) * 0.95))]
+            _over = sum(1 for x in _v if x > 0.005) * 100.0 / len(_v)
+            print("    ring %d (%2d bones): median %+.4f  p95 %+.4f  max %+.4f  min %+.4f  "
+                  "frames over +0.005: %.0f%%"
+                  % (_k, len(_rep_rings[_k]), _p50, _p95, max(_v), min(_v), _over))
+        for _k in sorted(_rep_near_rings()):
+            _all = [(v[0], k[1], v[1] / max(v[0], 1)) for k, v in _rep_near.items() if k[0] == _k]
+            _tot = sum(x[0] for x in _all) or 1
+            _rows = sorted(_all, reverse=True)[:3]
+            if _rows:
+                print("    ring %d nearest collider (sampled): %s"
+                      % (_k, ", ".join("%s %d%% (mean surface dist %+.4f)"
+                                       % (rbs_names_all[c]["name"] if 0 <= c < len(rbs_names_all)
+                                          else c, round(100.0 * n / _tot), d)
+                                       for n, c, d in _rows)))
+        if _rep_pen:
+            print("    (estimated mesh penetration = clearance below the measured "
+                  "drape depth; the bone itself may still be clear)")
+            for _k in sorted(_rep_pen):
+                _n, _hit, _sum, _mx = _rep_pen[_k]
+                print("    ring %d mesh penetration: %.1f%% of samples, mean depth %.4f, "
+                      "max %.4f" % (_k, 100.0 * _hit / max(1, _n),
+                                    _sum / max(1, _hit), _mx))
+        for _k in sorted(_rep_rings):
+            _rbl = _rep_rings[_k]
+            _hit = [(_push_report.get(_rb) or [0, 0.0, 0.0]) for _rb in _rbl]
+            _fr = sum(h[0] for h in _hit)
+            if _fr:
+                print("    ring %d pushes: %.1f%% of frames per bone, mean push %.4f, max %.4f"
+                      % (_k, 100.0 * _fr / max(1, num_frames * len(_rbl)),
+                         sum(h[1] for h in _hit) / _fr, max(h[2] for h in _hit)))
+            else:
+                print("    ring %d pushes: none" % _k)
+        for _k in sorted(_rep_series):
+            _v = _rep_series[_k]
+            if len(_v) < 10:
+                continue
+            _seg = len(_v) // 10
+            _tl = [sum(_v[i * _seg:(i + 1) * _seg]) / _seg for i in range(10)]
+            print("    ring %d timeline: %s" % (_k, " ".join("%+.3f" % x for x in _tl)))
 
     out = {}
     for bone, ks in keys.items():
@@ -2405,6 +2739,9 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                         margin=0.0, exclude_rb=None, skip_angle_clamp_rbs=None,
                         allowed_collider_rbi=None, hem_weight=None, hem_extra_margin=0.0,
                         collision_bounce=0.0, extra_margin_by_rb=None,
+                        margin_cap_by_pair=None, collision_velocity_damp=1.0,
+                        push_report=None, push_preserve_length=True,
+                        skip_embedded_parent=True,
                         lateral_slack_scale=0.0, vertical_spread_scale=0.0,
                         vertical_neighbors=None, segment_aware_collision=False,
                         hem_extend=None):
@@ -2433,7 +2770,8 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
     # collision_bounce(弾み)とvertical_spread_scale(縦方向への押し出し分配)は
     # どちらも「そのフレーム中にresolve_collisionsが実際に押し出した変位の
     # 合計」を必要とするため、同じaccum機構を共用する。
-    _bounce_accum = {} if (collision_bounce or vertical_spread_scale) else None
+    _bounce_accum = ({} if (collision_bounce or vertical_spread_scale
+                            or collision_velocity_damp) else None)
     grav = _scale(_norm(gravity_dir), gravity_power * dt) if gravity_power else (0.0, 0.0, 0.0)
 
     # --- 1. 積分（慣性＋重力＋rest方向へのstiffness nudge） ---
@@ -2503,14 +2841,18 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                                             allowed_collider_rbi=allowed_collider_rbi,
                                             hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                                             accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb,
-                                            hem_extend=hem_extend)
+                                            margin_cap_by_pair=margin_cap_by_pair,
+                                            hem_extend=hem_extend,
+                                            push_preserve_length=push_preserve_length,
+                                            skip_embedded_parent=skip_embedded_parent)
             else:
                 resolve_collisions(state, colliders, body_axis=body_axis,
                                    radial_rbs=radial_rbs, margin=margin,
                                    exclude_rb=exclude_rb,
                                    allowed_collider_rbi=allowed_collider_rbi,
                                    hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
-                                   accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+                                   accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb,
+                                   margin_cap_by_pair=margin_cap_by_pair)
         # アンカーは常に固定位置へ（set_anchor で pos は既に固定済み）
 
     # 反復後にもう一度押し出し: 直前の length 拘束が侵入を復活させても、
@@ -2523,14 +2865,18 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
                                         allowed_collider_rbi=allowed_collider_rbi,
                                         hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
                                         accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb,
-                                        hem_extend=hem_extend)
+                                        margin_cap_by_pair=margin_cap_by_pair,
+                                        hem_extend=hem_extend,
+                                        push_preserve_length=push_preserve_length,
+                                        skip_embedded_parent=skip_embedded_parent)
         else:
             resolve_collisions(state, colliders, body_axis=body_axis,
                                radial_rbs=radial_rbs, margin=margin,
                                exclude_rb=exclude_rb,
                                allowed_collider_rbi=allowed_collider_rbi,
                                hem_weight=hem_weight, hem_extra_margin=hem_extra_margin,
-                               accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb)
+                               accum=_bounce_accum, extra_margin_by_rb=extra_margin_by_rb,
+                                   margin_cap_by_pair=margin_cap_by_pair)
 
         # vertical_spread_scale: コライダーに当たって押し出された1パーティクルの
         # 変位を、縦方向に隣接する1つ上・1つ下のパーティクル(1ホップのみ、
@@ -2596,12 +2942,32 @@ def simulate_step_cloth(state, gravity_dir, dt, drag_force, stiffness_force,
     # 弾みが見た目にほとんど効かなくなる。また念押し1回分の変位だけでは反復
     # 拘束がほぼ収束済みで小さすぎるため、6回の反復+念押し全ての合計を見て
     # 初めて弾みとして意味のある大きさになる。
+    # 計測: このフレームで実際に押し出しが起きたパーティクルと、その大きさ
+    if push_report is not None and _bounce_accum:
+        for rb, disp in _bounce_accum.items():
+            _e = push_report.setdefault(rb, [0, 0.0, 0.0])
+            _e[0] += 1
+            _dl = _len(disp)
+            _e[1] += _dl
+            if _dl > _e[2]:
+                _e[2] = _dl
+
     if _bounce_accum:
         for rb, disp in _bounce_accum.items():
             if part[rb].inv_mass <= 0:
                 continue
-            pos[rb] = _add(pos[rb], _scale(disp, collision_bounce))
-            prev[rb] = _sub(prev[rb], _scale(disp, collision_bounce))
+            if collision_bounce:
+                pos[rb] = _add(pos[rb], _scale(disp, collision_bounce))
+                prev[rb] = _sub(prev[rb], _scale(disp, collision_bounce))
+            # 押し出しは pos だけを動かすため、Verlet では「押された分だけ
+            # 外向きの速度を得た」ことになる(次フレームの慣性 pos-prev に乗る)。
+            # 毎フレーム接触していると、この速度が供給され続けて布が外向きへ
+            # 送られ、離れても戻らない(実測: IAのスカートは全フレームで
+            # 腰リング+0.025のまま平坦、コライダーを外すと中央-0.001)。
+            # prev を同じだけ動かして、押し出しが速度を生まないようにする。
+            # 1.0=速度を完全に打ち消す(既定)、0.0=従来どおり速度が乗る。
+            if collision_velocity_damp:
+                prev[rb] = _add(prev[rb], _scale(disp, collision_velocity_damp))
 
 
 
@@ -3153,7 +3519,7 @@ def _closest_segment_segment_t(p1, q1, p2, q2):
 def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                        radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None,
                        hem_weight=None, hem_extra_margin=0.0, accum=None,
-                       extra_margin_by_rb=None):
+                       extra_margin_by_rb=None, margin_cap_by_pair=None):
     """dynamic パーティクルを各コライダーの外へ押し出す（片方向）。
 
     body_axis: (center, up) 下半身(腰)の世界位置と縦軸。指定時、かつ対象が
@@ -3291,7 +3657,15 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
                     continue
             dvec = _sub(P, C)
             d = _len(dvec)
-            R = rad + _eff_margin
+            # 静止姿勢クランプ: このパーティクルとこのコライダーの組み合わせについて、
+            # 静止姿勢(フレーム0)での実クリアランスを超えるマージンは使わない。
+            # 超えると静止状態から押し出しが始まり、スカートが傘型に開く。
+            _m = _eff_margin
+            if margin_cap_by_pair is not None:
+                _cap = margin_cap_by_pair.get((rb, rbi))
+                if _cap is not None and _m > _cap:
+                    _m = _cap
+            R = rad + _m
             if d >= R:
                 continue
             # 放射外向きは「腰より下のコライダー(脚)」かつ「下半身系パーティクル」限定。
@@ -3332,7 +3706,9 @@ def resolve_collisions(state, colliders, body_axis=None, margin=0.0,
 def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin=0.0,
                                 radial_rbs=None, exclude_rb=None, allowed_collider_rbi=None,
                                 hem_weight=None, hem_extra_margin=0.0, accum=None,
-                                extra_margin_by_rb=None, hem_extend=None):
+                                extra_margin_by_rb=None, hem_extend=None,
+                                margin_cap_by_pair=None, push_preserve_length=True,
+                                skip_embedded_parent=True):
     """resolve_collisions と同じ押し出しロジックを使うが、パーティクル単体でなく
     「親→子の区間(セグメント)」をコライダーに対してテストする。
 
@@ -3458,9 +3834,32 @@ def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin
                 if allowed_collider_rbi is None:
                     if not ((cmask & (1 << c.group)) and (c.collision_mask & (1 << cgroup))):
                         continue
+                # 親端がコライダーの内側にある場合は、区間ではなく子端の点だけで
+                # 判定する。モデルによってはチェーンの根元剛体が別のコライダーの
+                # 内側に置かれている(IAはスカートの親剛体「下半身」が「下半身1」
+                # カプセルの内側 -0.052 にある)。この埋まりは作者が意図した構造で
+                # あって解決すべき侵入ではないが、区間判定はこれを深い衝突として
+                # 検出し、その一部を毎フレーム子へ転写してしまう(実測: 最上段リング
+                # だけが全フレーム押され平均0.0159動かされ、スカートが+0.025開いた
+                # まま戻らなくなっていた。押し出された点自体はコライダーから+0.05
+                # 離れており、子の位置では説明できなかった)。
+                if skip_embedded_parent:
+                    if kind == "capsule":
+                        _Cpa = _closest_on_segment(Pa, a_, b_)
+                    else:
+                        _Cpa = C
+                    if _len(_sub(Pa, _Cpa)) < rad:
+                        if kind == "capsule":
+                            C = _closest_on_segment(Pc, a_, b_)
+                        Q, t_self = Pc, 1.0
                 dvec = _sub(Q, C)
                 d = _len(dvec)
-                R = rad + _eff_margin_c
+                _m_c = _eff_margin_c
+                if margin_cap_by_pair is not None:
+                    _cap_c = margin_cap_by_pair.get((c.rb, rbi))
+                    if _cap_c is not None and _m_c > _cap_c:
+                        _m_c = _cap_c
+                R = rad + _m_c
                 if d >= R:
                     continue
                 use_radial = ((bc is not None) and (C[1] < bc[1])
@@ -3513,7 +3912,16 @@ def resolve_collisions_segments(state, chains, colliders, body_axis=None, margin
             rel = _sub(new_pos, ppos)
             rlen = _len(rel)
             if rlen > 1e-9:
-                new_pos = _add(ppos, _scale(rel, p_obj.rest_len / rlen))
+                # 半径は「押し出す直前の実際の距離」を保つ。rest_len へ伸ばして
+                # しまうと、縮んでいた区間が接触のたびに満長まで伸ばされ、
+                # わずかな接触が大きな外向き変位に化ける(実測: IAの腰リングは
+                # 全フレームで接触し、押し出し自体は小さいのに平均0.0159動かされ、
+                # 開きが+0.025で固定されていた)。長さの管理は後続の縦チェーン
+                # 拘束の仕事で、ここは親を中心にした回転(円運動)だけを担う。
+                _keep = _len(_sub(P0, ppos)) if push_preserve_length else p_obj.rest_len
+                if _keep < 1e-9:
+                    _keep = p_obj.rest_len
+                new_pos = _add(ppos, _scale(rel, _keep / rlen))
         pos[rb] = new_pos
         if accum is not None:
             actual_disp = _sub(new_pos, P0)

@@ -483,6 +483,12 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             midpoint_correction_samples=1,
             collision_bounce=0.0,
             rb_size_margin_scale=0.0,
+            drape_depth_scale=0.0,
+            drape_probe=True,
+            margin_rest_clamp=True,
+            collision_velocity_damp=1.0,
+            physics_report=False,
+            symmetrize_colliders=False,
             lateral_slack_scale=0.0,
             vertical_spread_scale=0.0,
             cloth_algorithm="points",
@@ -1011,6 +1017,15 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         _mmdx, physics.compute_bone_world_matrices(g.j))
                 if _phys.get("rigidBodies"):
                     _only = ["髪"] if bake_target == "hair" else None
+                    # ドレープの落ち込みをPMXメッシュから実測(有効時のみ)。
+                    _drape = {}
+                    # physics_report のときは、drape_depth_scale が0でも計測用に
+                    # ドレープ深さを求める(貫通量の推定に使うだけで挙動は変えない)
+                    if drape_depth_scale > 0.0 or physics_report:
+                        from .drape import measure_drape_depth
+                        _drape = measure_drape_depth(model)
+                        print("  [physics] drape depth measured on %d bone(s) "
+                              "from the PMX mesh" % len(_drape))
                     hair_keys, hair_tkeys, _n_excl = bake_hair_into_gltf(
                         g.j, baked, len(times), _phys, scale,
                         drag_force=hair_drag, stiffness_force=hair_stiffness,
@@ -1030,6 +1045,13 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                         midpoint_correction_samples=midpoint_correction_samples,
                         collision_bounce=collision_bounce,
                         rb_size_margin_scale=rb_size_margin_scale,
+                        drape_depth_by_bone=_drape,
+                        drape_depth_scale=drape_depth_scale,
+                        drape_probe=drape_probe,
+                        margin_rest_clamp=margin_rest_clamp,
+                        collision_velocity_damp=collision_velocity_damp,
+                        physics_report=physics_report,
+                        symmetrize_colliders=symmetrize_colliders,
                         lateral_slack_scale=lateral_slack_scale,
                         vertical_spread_scale=vertical_spread_scale,
                         cloth_algorithm=cloth_algorithm,
