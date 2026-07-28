@@ -75,9 +75,11 @@ def main(argv=None):
                     help="extra bounce when a hair/cloth particle is pushed "
                     "out of a collider (default 0.0 = no bounce, unchanged "
                     "behavior; higher = springier on contact)")
-    ap.add_argument("--collision-margin", type=float, default=0.01, metavar="F",
+    ap.add_argument("--collision-margin", type=float, default=0.0, metavar="F",
                     help="clearance kept between cloth and body colliders in "
-                    "glTF units (default 0.01). Increase if the skirt visually "
+                    "glTF units (default 0.0, since the skirt clearance now comes from "
+                    "--rb-size-margin-scale and --drape-depth-scale; hair and "
+                    "other chains only get this one). Increase if the skirt visually "
                     "touches/clips the legs; 0 = push to the collider surface "
                     "exactly")
     ap.add_argument("--force-no-collision", action="append", metavar="NAME",
@@ -193,13 +195,14 @@ def main(argv=None):
                     help="with --drape-depth-scale, treat the measured depth as "
                     "extra margin instead of moving the midpoint sample inward "
                     "(comparison / fallback; the inward sample is the default).")
-    ap.add_argument("--rb-size-margin-scale", type=float, default=0.0,
+    ap.add_argument("--rb-size-margin-scale", type=float, default=1.0,
                     metavar="F",
                     help="derive extra clearance from each skirt rigid "
                     "body's own PMX box size (the smallest of size_x/y/z, "
                     "taken as the panel's thickness), scaled by this factor "
                     "and added on top of --collision-margin/--hem-extra-margin "
-                    "(default 0.0 = off, unchanged behavior). Bone-position "
+                    "(default 1.0 = the thickness as modelled; 0 disables it). "
+                    "Bone-position "
                     "collision treats particles as zero-size points, while "
                     "the PMX skirt rigid bodies are actually thin boxes, so "
                     "real MMD viewers get a snug, non-bulging fit 'for free' "
@@ -210,7 +213,7 @@ def main(argv=None):
                     "are unaffected. Start around 1.0 and adjust to taste, "
                     "since whether PMX size values are half- or full-extent "
                     "can vary by tool/model")
-    ap.add_argument("--lateral-slack-scale", type=float, default=0.0,
+    ap.add_argument("--lateral-slack-scale", type=float, default=6.0,
                     metavar="F",
                     help="allow slack in the skirt's lateral ring distance "
                     "constraint (between adjacent panels at the same height), "
@@ -226,7 +229,7 @@ def main(argv=None):
                     "outside that range are pushed back to the nearest edge "
                     "(not all the way to rest_len). Start around 1.0 and "
                     "adjust to taste")
-    ap.add_argument("--vertical-spread-scale", type=float, default=0.0,
+    ap.add_argument("--vertical-spread-scale", type=float, default=0.5,
                     metavar="F",
                     help="distribute a collision-pushed particle's "
                     "displacement to its immediate vertical neighbors "
