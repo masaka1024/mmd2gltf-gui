@@ -122,8 +122,11 @@ STRINGS = {
         "adv_vertical_spread_label": "押し出しの縦方向への分配",
         "adv_vertical_spread_hint": "脚などに当たって1段だけ押し出された動きを、上下の隣の段にも\n"
                                      "分けて伝えます。0で無効(変化なし)。片足を上げるポーズなどで\n"
-                                     "スカートが輪切りのように段になる場合、まず1.0前後から試して\n"
-                                     "ください。",
+                                     "スカートが輪切りのように段になる場合に使います。\n"
+                                     "既定の0.5は、押された段の半分を隣へ伝える設定です。\n"
+                                     "1.0を超えると隣の段が接触した段より大きく動くため、接触が\n"
+                                     "上下へ増幅されながら伝わり、スカートが傘型に開く原因に\n"
+                                     "なります。使う場合も0.5〜1.0の範囲をおすすめします。",
         "adv_segment_aware_label": "衝突判定を「区間」単位で行う",
         "adv_segment_aware_hint": "従来は各段(パーティクル)を個別の点として衝突判定していました\n"
                                    "が、これを有効にすると親子の「区間」を線分として判定し、衝突\n"
@@ -145,6 +148,29 @@ STRINGS = {
                                     "剛体が実際に持っている厚みを利用するので、パラメータを\n"
                                     "手探りで太くするより自然な密着感が期待できます。まずは\n"
                                     "1.0前後から試し、見た目に合わせて上下してください。",
+        "adv_drape_depth_label": "ドレープ実測クリアランス",
+        "adv_drape_depth_hint": "スカートボーンは布の外寄りに置かれていることが多く、実際の\n"
+                                "メッシュはそこから内側へ落ち込んでいます。その落ち込み量を\n"
+                                "モデルのメッシュから実測し、クリアランスに使います。0で無効。\n"
+                                "1.0が実測どおりの値で、腰から裾へ自動的に変化します。上の\n"
+                                "「剛体サイズ由来」と同じ現象への対処なので、こちらを有効に\n"
+                                "すると上の設定は使われません(併用しても二重にはなりません)。\n"
+                                "「深い位置で当たり判定」は、中間パーティクルを実際の\n"
+                                "ドレープの深さまで内側へ寄せてから判定します。",
+        "adv_rest_clamp_label": "静止姿勢では押し出さない",
+        "adv_symmetrize_label": "左右のコライダーを対称化する",
+        "adv_symmetrize_hint": "「左○○」と「右○○」のコライダーについて、ボーンから見た\n"
+                               "位置・サイズ・回転を鏡像平均して左右対称にします。\n"
+                               "モデル制作はミラー作業が基本なので、左右の食い違いは\n"
+                               "作業上のブレであることが多く、そのままだと片側だけ\n"
+                               "スカートが膨らむ原因になります。書き出す元データは\n"
+                               "変更しません(物理ベイクの入力だけを直します)。",
+        "adv_physics_report_label": "スカートの物理レポートをログに出す",
+        "adv_physics_report_hint": "ベイク後に、スカートの各段が静止時よりどれだけ開いたか、\n"
+                                   "どのコライダーに一番近いか、押し出しが何%のフレームで\n"
+                                   "起きたかをログに出します。挙動がおかしいときの原因調べ用\n"
+                                   "です。集計のぶん少し遅くなります。",
+        "adv_drape_probe_label": "深い位置で当たり判定",
         "adv_hem_extend_label": "裾の当たり判定を下へ延長",
         "adv_hem_extend_hint": "縦ボーンの終端は剛体プレートの中央にあるため、本家では\n"
                                 "プレートの下半分も脚に当たります。そのはみ出し分だけ裾の\n"
@@ -284,8 +310,11 @@ STRINGS = {
         "adv_vertical_spread_label": "Vertical push spread",
         "adv_vertical_spread_hint": "Leaks a pushed-out ring's collision displacement to the "
                                     "rings just above and below it. 0 disables this (unchanged). "
-                                    "If a bent-leg pose makes the skirt look like a sliced tube, "
-                                    "start around 1.0.",
+                                    "Use it if a bent-leg pose makes the skirt look like a sliced "
+                                    "tube. Above 1.0 the neighbouring rings move further than the "
+                                    "ring that was actually hit, so each contact is amplified as "
+                                    "it spreads and the skirt flares like an umbrella. Values of "
+                                    "0.5-1.0 are recommended when you do use it.",
         "adv_segment_aware_label": "Resolve collisions per segment (not per particle)",
         "adv_segment_aware_hint": "Previously each ring (particle) was tested against colliders "
                                    "as an independent point. Enabling this tests the parent-child "
@@ -313,6 +342,30 @@ STRINGS = {
                                     "already has, it tends to look more natural than hand-"
                                     "tuning a flat margin. Start around 1.0 and adjust to "
                                     "taste.",
+        "adv_drape_depth_label": "Clearance from measured drape depth",
+        "adv_drape_depth_hint": "Skirt bones usually sit on the outer side of the cloth "
+                                "while the mesh itself sags further inward. This measures "
+                                "that sag from the model's mesh and uses it as clearance. "
+                                "0 disables it; 1.0 uses the measured value as is, varying "
+                                "automatically from waist to hem. It addresses the same "
+                                "issue as the setting above, so when this is on, the one "
+                                "above is not used (they are never stacked). "
+                                "\"Test collision at the deep point\" moves the midpoint "
+                                "samples inward to the measured drape depth before testing.",
+        "adv_rest_clamp_label": "Never push in the rest pose",
+        "adv_symmetrize_label": "Symmetrise left/right colliders",
+        "adv_symmetrize_hint": "Mirror-averages the position, size and rotation of each "
+                               "left/right collider pair relative to its bone. Modelling is "
+                               "normally done mirrored, so a left/right mismatch is usually "
+                               "a slip rather than intent, and it makes the skirt bulge on "
+                               "one side only. The exported source data is left untouched.",
+        "adv_physics_report_label": "Log a skirt physics report",
+        "adv_physics_report_hint": "After baking, logs how far each skirt ring opened "
+                                   "compared with its rest radius, which collider it was "
+                                   "closest to, and how often the collision push fired. "
+                                   "For tracking down odd cloth behaviour; it makes baking "
+                                   "slightly slower.",
+        "adv_drape_probe_label": "Test collision at the deep point",
         "adv_hem_extend_label": "Extend hem collision downward",
         "adv_hem_extend_hint": "The last bone sits at the center of the lowest rigid body "
                                 "plate, so in MMD the plate's bottom half also collides with "
@@ -656,11 +709,16 @@ class App(_BaseTk):
         self.stiffness_var = tk.StringVar(value="1.5")
         self.bounce_var = tk.StringVar(value="0.0")
         self.lateralslack_var = tk.StringVar(value="6.0")
-        self.verticalspread_var = tk.StringVar(value="1.5")
-        self.margin_var = tk.StringVar(value="0.01")
+        self.verticalspread_var = tk.StringVar(value="0.5")
+        self.margin_var = tk.StringVar(value="0.0")
         self.hemmargin_var = tk.StringVar(value="0.0")
         self.rbsizemargin_var = tk.StringVar(value="1.0")
         self.hemextend_var = tk.StringVar(value="0.0")
+        self.drapedepth_var = tk.StringVar(value="1.0")
+        self.drapeprobe_var = tk.BooleanVar(value=True)
+        self.restclamp_var = tk.BooleanVar(value=False)
+        self.physicsreport_var = tk.BooleanVar(value=False)
+        self.symcolliders_var = tk.BooleanVar(value=True)
         self.segmentaware_var = tk.BooleanVar(value=True)
         self.skirttwist_var = tk.BooleanVar(value=True)
         self.collmode_var = tk.StringVar(value="normal")
@@ -799,6 +857,22 @@ class App(_BaseTk):
         self.lbl_skirttwist_hint = ttk.Label(p, text="", foreground="#666666",
                                              wraplength=380, justify="left")
         self.lbl_skirttwist_hint.grid(row=17, column=1, sticky="w", **pad)
+
+        cb_report = ttk.Checkbutton(p, variable=self.physicsreport_var)
+        cb_report.grid(row=18, column=0, columnspan=2, sticky="w", **pad)
+        self._i18n_widgets.append((cb_report, "adv_physics_report_label"))
+        self.lbl_report_hint = ttk.Label(p, text="", foreground="#666666",
+                                         wraplength=380, justify="left")
+        self.lbl_report_hint.grid(row=19, column=1, sticky="w", **pad)
+
+        cb_sym = ttk.Checkbutton(p, variable=self.symcolliders_var)
+        cb_sym.grid(row=20, column=0, columnspan=2, sticky="w", **pad)
+        self._i18n_widgets.append((cb_sym, "adv_symmetrize_label"))
+        self.lbl_sym_hint = ttk.Label(p, text="", foreground="#666666",
+                                      wraplength=380, justify="left")
+        self.lbl_sym_hint.grid(row=21, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_sym_hint, "adv_symmetrize_hint"))
+        self._i18n_widgets.append((self.lbl_report_hint, "adv_physics_report_hint"))
         self._i18n_widgets.append((self.lbl_skirttwist_hint, "adv_skirt_twist_hint"))
 
         # ---- タブ3: 衝突・クリアランス ----
@@ -806,8 +880,12 @@ class App(_BaseTk):
         lbl_mg = ttk.Label(c, text="")
         lbl_mg.grid(row=0, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_mg, "adv_margin_label"))
-        ttk.Entry(c, textvariable=self.margin_var, width=8).grid(
-            row=0, column=1, sticky="w", **pad)
+        mg_frame = ttk.Frame(c)
+        mg_frame.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Entry(mg_frame, textvariable=self.margin_var, width=8).pack(side="left")
+        cb_rc = ttk.Checkbutton(mg_frame, variable=self.restclamp_var)
+        cb_rc.pack(side="left", padx=(10, 0))
+        self._i18n_widgets.append((cb_rc, "adv_rest_clamp_label"))
 
         lbl_hmg = ttk.Label(c, text="")
         lbl_hmg.grid(row=1, column=0, sticky="w", **pad)
@@ -829,21 +907,35 @@ class App(_BaseTk):
         self.lbl_rsm_hint.grid(row=4, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_rsm_hint, "adv_rb_size_margin_hint"))
 
+        lbl_dd = ttk.Label(c, text="")
+        lbl_dd.grid(row=5, column=0, sticky="w", **pad)
+        self._i18n_widgets.append((lbl_dd, "adv_drape_depth_label"))
+        dd_frame = ttk.Frame(c)
+        dd_frame.grid(row=5, column=1, sticky="w", **pad)
+        ttk.Entry(dd_frame, textvariable=self.drapedepth_var, width=8).pack(side="left")
+        cb_dp = ttk.Checkbutton(dd_frame, variable=self.drapeprobe_var)
+        cb_dp.pack(side="left", padx=(10, 0))
+        self._i18n_widgets.append((cb_dp, "adv_drape_probe_label"))
+        self.lbl_dd_hint = ttk.Label(c, text="", foreground="#666666",
+                                     wraplength=380, justify="left")
+        self.lbl_dd_hint.grid(row=6, column=1, sticky="w", **pad)
+        self._i18n_widgets.append((self.lbl_dd_hint, "adv_drape_depth_hint"))
+
         lbl_hex = ttk.Label(c, text="")
-        lbl_hex.grid(row=5, column=0, sticky="w", **pad)
+        lbl_hex.grid(row=7, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_hex, "adv_hem_extend_label"))
         ttk.Entry(c, textvariable=self.hemextend_var, width=8).grid(
-            row=5, column=1, sticky="w", **pad)
+            row=7, column=1, sticky="w", **pad)
         self.lbl_hex_hint = ttk.Label(c, text="", foreground="#666666",
                                       wraplength=380, justify="left")
-        self.lbl_hex_hint.grid(row=6, column=1, sticky="w", **pad)
+        self.lbl_hex_hint.grid(row=8, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_hex_hint, "adv_hem_extend_hint"))
 
         lbl_cm = ttk.Label(c, text="")
-        lbl_cm.grid(row=7, column=0, sticky="w", **pad)
+        lbl_cm.grid(row=9, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_cm, "adv_collision_mode_label"))
         cm_frame = ttk.Frame(c)
-        cm_frame.grid(row=7, column=1, sticky="w", **pad)
+        cm_frame.grid(row=9, column=1, sticky="w", **pad)
         rb_normal = ttk.Radiobutton(cm_frame, variable=self.collmode_var,
                                     value="normal")
         rb_normal.pack(anchor="w")
@@ -854,10 +946,10 @@ class App(_BaseTk):
         self._i18n_widgets.append((rb_allow, "adv_collision_mode_allow"))
 
         lbl_cn = ttk.Label(c, text="")
-        lbl_cn.grid(row=8, column=0, sticky="w", **pad)
+        lbl_cn.grid(row=10, column=0, sticky="w", **pad)
         self._i18n_widgets.append((lbl_cn, "adv_collision_names_label"))
         cn_frame = ttk.Frame(c)
-        cn_frame.grid(row=8, column=1, sticky="ew", **pad)
+        cn_frame.grid(row=10, column=1, sticky="ew", **pad)
         ttk.Entry(cn_frame, textvariable=self.collnames_var).pack(
             side="left", fill="x", expand=True)
         self.browse_rb_btn = ttk.Button(cn_frame, command=self._show_rigidbody_picker)
@@ -866,17 +958,17 @@ class App(_BaseTk):
 
         self.lbl_cn_hint = ttk.Label(c, text="", foreground="#666666",
                                      wraplength=380, justify="left")
-        self.lbl_cn_hint.grid(row=9, column=1, sticky="w", **pad)
+        self.lbl_cn_hint.grid(row=11, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_cn_hint, "adv_collision_names_hint"))
 
         vrm_frame = ttk.Frame(c)
-        vrm_frame.grid(row=10, column=1, sticky="w", **pad)
+        vrm_frame.grid(row=12, column=1, sticky="w", **pad)
         self.vrm_compat_btn = ttk.Button(vrm_frame, command=self._apply_vrm_compat_mode)
         self.vrm_compat_btn.pack(side="left")
         self._i18n_widgets.append((self.vrm_compat_btn, "adv_vrm_compat_btn"))
         self.lbl_vrm_hint = ttk.Label(c, text="", foreground="#666666",
                                       wraplength=380, justify="left")
-        self.lbl_vrm_hint.grid(row=11, column=1, sticky="w", **pad)
+        self.lbl_vrm_hint.grid(row=13, column=1, sticky="w", **pad)
         self._i18n_widgets.append((self.lbl_vrm_hint, "adv_vrm_compat_hint"))
 
         # ---- タブ4: サブステップ／中間パーティクル ----
@@ -1168,6 +1260,10 @@ class App(_BaseTk):
             hem_extend_scale = float(self.hemextend_var.get())
         except Exception:
             hem_extend_scale = 0.0
+        try:
+            drape_depth_scale = float(self.drapedepth_var.get())
+        except Exception:
+            drape_depth_scale = 0.0
         _coll_names = [s.strip() for s in self.collnames_var.get().split(",") if s.strip()] or None
         force_no_collision = _coll_names if self.collmode_var.get() == "normal" else None
         allowed_collider = _coll_names if self.collmode_var.get() == "allow" else None
@@ -1235,6 +1331,11 @@ class App(_BaseTk):
             midpoint_correction_collider_names=midpoint_names,
             midpoint_correction_samples=midpoint_samples,
             rb_size_margin_scale=rb_size_margin_scale,
+            drape_depth_scale=drape_depth_scale,
+            drape_probe=bool(self.drapeprobe_var.get()),
+            margin_rest_clamp=bool(self.restclamp_var.get()),
+            physics_report=bool(self.physicsreport_var.get()),
+            symmetrize_colliders=bool(self.symcolliders_var.get()),
             lateral_slack_scale=lateral_slack_scale,
             vertical_spread_scale=vertical_spread_scale,
             segment_aware_collision=self.segmentaware_var.get(),
