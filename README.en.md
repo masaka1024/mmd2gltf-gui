@@ -207,7 +207,7 @@ python -m mmd2gltf model.pmx --vmd motion.vmd --bake-physics --bake-target all -
 | `--hair-stiffness F` | 1.5 | Restoring force toward the rest shape. |
 | `--hair-gravity F` | 0.02 | Gravity strength. 0 keeps the rest shape. |
 | `--collision-bounce F` | 0.0 | Extra bounce when a hair/cloth particle is pushed out of a collider. 0 = unchanged behavior; higher = springier on contact. |
-| `--collision-margin F` | 0.01 | Clearance kept between cloth and body colliders, in glTF units. Increase if the skirt visually touches/clips the legs. |
+| `--collision-margin F` | 0.0 | Clearance kept between cloth and body colliders, in glTF units. The skirt now gets its clearance from the two measurement-based options below, so this defaults to 0. **Hair, neckties and other chains only get this one**, so raise it to around 0.003 if hair clips into the head. |
 | `--hem-extra-margin F` | 0.0 | Extra clearance applied **only toward the hem** of each skirt chain. It interpolates smoothly from the root (waist, 0) to the hem (1), so it suppresses hem clipping without changing the waist silhouette. |
 
 ### Skirt silhouette tuning
@@ -218,20 +218,64 @@ The point-based solver (default) treats the skirt as chains of point masses, whe
 | --- | --- | --- |
 | `--segment-aware-collision` | OFF | Resolves collider push-out against each parent-to-child **segment** (line) instead of a single particle. Tackles the "staircase" look (one ring popping out when a leg lifts) at its root cause (skirt only; hair is unaffected). |
 | `--skirt-bone-twist` | OFF | Keeps each skirt bone's real rotation (mesh twist) instead of always forcing it to identity. Fixes the "bulge at the midpoint of a segment, even though the bone positions are correct" artifact. The rotation used is already safety-clamped to a max of 60° change per frame (skirt only). |
-| `--vertical-spread-scale F` | 0.0 | Distributes part of a collision push-out to the neighboring rings above and below in the same chain, so the bend spreads smoothly along the leg's angle instead of kinking at one ring. Start around 1.0. |
-| `--rb-size-margin-scale F` | 0.0 | Derives extra clearance from each skirt rigid body's own PMX box size (smallest side = the panel's thickness). In MMD itself the rigid bodies' volume produces a natural, snug fit "for free", while bone-position collision treats particles as zero-size points; this reads the size back out of the model to approximate the same effect. Start around 1.0 (whether PMX size values are half- or full-extent varies by tool/model). |
-| `--lateral-slack-scale F` | 0.0 | Allows slack in the skirt's lateral ring constraint (between adjacent panels at the same height), derived from the real PMX joint's translation limits (linearLimitMin/Max). MMD itself lets the distance move freely inside that range and only stops at the edges, whereas this solver used to pull it back to exactly the rest length every step — which can look stiff and origami-like on flare skirts. Start around 1.0. |
+| `--vertical-spread-scale F` | 0.5 | Distributes part of a collision push-out to the neighboring rings above and below in the same chain, so the bend spreads smoothly along the leg's angle instead of kinking at one ring. **Above 1.0 the neighbouring rings move further than the ring that was hit, so each contact is amplified as it spreads and the skirt flares like an umbrella. Stay within 0.5-1.0.** |
+| `--rb-size-margin-scale F` | 1.0 | Derives extra clearance from each skirt rigid body's own PMX box size (smallest side = the panel's thickness). In MMD itself the rigid bodies' volume produces a natural, snug fit "for free", while bone-position collision treats particles as zero-size points; this reads the size back out of the model to approximate the same effect. In MMD the box collides on its **face**, so its centre always stops half a thickness away from the collider — which means 1.0 simply reuses the thickness the author modelled, and is a physically grounded default. |
+| `--lateral-slack-scale F` | 6.0 | Allows slack in the skirt's lateral ring constraint (between adjacent panels at the same height), derived from the real PMX joint's translation limits (linearLimitMin/Max). MMD itself lets the distance move freely inside that range and only stops at the edges, whereas this solver used to pull it back to exactly the rest length every step — which can look stiff and origami-like on flare skirts. Start around 1.0 (the verified models use 6.0). |
 
-**Example settings** — the combination actually used on the verified IA model. The best values depend on each model's skirt construction, so treat this as a starting point:
+**Recommended settings** — arrived at by measuring penetration and skirt opening on two models (IA and Ponpu-cho style Hatsune Miku). The numeric defaults already match this configuration, so on the CLI you only need to add the boolean options:
 
 ```bash
 python -m mmd2gltf model.pmx --vmd motion.vmd --bake-physics --bake-target all \
-  --segment-aware-collision --skirt-bone-twist \
-  --vertical-spread-scale 1.5 --rb-size-margin-scale 1.0 --lateral-slack-scale 6.0 \
+  --segment-aware-collision --skirt-bone-twist --symmetrize-colliders \
   -o out.glb
 ```
 
-The same settings are available in the GUI under "Advanced settings".
+**The GUI ships with these values already filled in.** The same settings are available under "Advanced settings".
+
+Measured mesh penetration with this configuration (share of sampled frames):
+
+| Model | Waist ring | Middle | Hem |
+| --- | --- | --- | --- |
+| IA | 0.2% | 0.0% | 12.9% |
+| Ponpu-cho style Miku | 4.1% | 0.6% | 8.2% (lowest ring 3.3%) |
+
+### Clearance measured from the mesh
+
+Skirt bones are usually placed on the outer side of the cloth (the ridge of a fold), while the mesh itself sags further inward. The bake pushes the bones (particles) outside the colliders, so **the cloth can look like it goes through the legs even when nothing is penetrating numerically**.
+
+`--drape-depth-scale` measures that sag directly from the PMX mesh and uses it as clearance.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--drape-depth-scale F` | 1.0 | Use the mesh-measured drape depth as clearance. 1.0 uses the measured value as is, 0 disables it. The value is per position, so it varies automatically from waist to hem. |
+| `--no-drape-probe` | — | Disable moving the midpoint-correction samples inward to the drape depth (for comparison). |
+
+The sag varies a lot between models, and within a single skirt. On the verified model (IA) it was 0.089 at the waist against 0.330 at the hem (PMX units) — a **3.7x gradient** that no single uniform clearance can match without being too much at the waist or too little at the hem.
+
+Rigid bodies whose drape depth could not be measured (too few vertices weighted to that bone, etc.) keep using the `--rb-size-margin-scale` value instead.
+
+### Correcting left/right asymmetry
+
+Modelling is normally done mirrored, yet collider positions and sizes often end up slightly different between left and right. On the verified model (IA), the thigh capsule sat 0.046 further out on one side and the lower leg 0.067, relative to their bones (the bones themselves were perfectly symmetric). That gap is about the same size as the clearance, so **the skirt gets pushed out on one side only and visibly bulges**.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--symmetrize-colliders` | OFF | Mirror-averages the position, size and rotation of each left/right collider pair relative to its bone. **The data written to `extras.mmd` is left untouched** — only the bake input is corrected. |
+
+### Physics report (for investigation)
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--physics-report` | OFF | After baking, logs for each skirt ring: how far it opened compared with its rest radius, which collider it was closest to, how often the collision push fired, and the estimated mesh penetration rate and depth. |
+
+Useful when tracking down odd cloth behaviour. The opening timeline in particular (the average over ten equal slices of the motion) tells you at a glance whether the skirt opens on contact and recovers, or opened once and never came back. It makes baking slightly slower.
+
+### Push-out behaviour
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--collision-velocity-damp F` | 1.0 | How much of the velocity created by a push-out is cancelled. In Verlet integration moving a position also changes the velocity, so 1.0 gives a fully inelastic response that fixes the position without touching the velocity. 0 restores the old behaviour. |
+| `--margin-rest-clamp` | OFF | Cap the clearance of each particle-collider pair at the distance actually available in the rest pose. Off by default because it trims the measurement-based clearance, but kept as an escape hatch for models where the cloth sits extremely tight to the body. |
 
 ### Anti-penetration options
 
@@ -273,7 +317,15 @@ The GUI makes this easier under "Advanced settings":
 - **Show rigid body names...** — parses the selected PMX and lists rigid bodies in two groups (static/colliders vs. dynamic/sway parts); double-click to add a name to the field.
 - **Use VRM-compatible mode** — a one-click preset that auto-detects leg-area colliders and switches to Restricted mode.
 
-The PMX non-collision groups (group/noCollisionMask) themselves are also read and honored during baking; the modes above are overrides for when those settings aren't enough.
+The PMX group settings (group/noCollisionMask) themselves are also read and honored during baking; the modes above are overrides for when those settings aren't enough.
+
+> **About that 16-bit field:** PMX calls it the "non-collision group flag", but **a set bit means the body DOES collide with that group** — it is Bullet's collision filter mask verbatim. The checkboxes in PMXEditor are shown inverted (checked = no collision), so reading the field by its name gives you exactly the wrong answer. three.js's mmd-parser calls it `groupTarget` and saba calls it `m_collisionGroup`; both avoid the word "non-collision". This tool now follows the same interpretation (the value written to `extras.mmd` is still the raw PMX one — see `mmd2gltf/physicsGltf_schema.md`).
+
+### Inspecting rigid bodies visually
+
+`tools/mmd_physics_inspector.html` is a standalone tool for looking inside a converted GLB in your browser — just drag and drop the file onto it, no installation required.
+
+It renders the rigid bodies, joints and collision groups stored in `extras.mmd` in 3D. Clicking a rigid body shows its shape, size, mode, bound bone, the groups it collides with, and how many other bodies it can collide with. When you are unsure how a model is put together, it answers "where is this collider" and "is it actually set to collide" in a couple of minutes.
 
 ## Option reference
 
@@ -307,13 +359,13 @@ See the sections under [Physics baking](#physics-baking) for symptom-based expla
 | `--hair-stiffness F` | Rest-shape restoring force (default 1.5) |
 | `--hair-gravity F` | Gravity strength (default 0.02; 0 keeps the rest shape) |
 | `--collision-bounce F` | Extra bounce when pushed out of a collider (default 0.0 = unchanged; higher = springier on contact) |
-| `--collision-margin F` | Clearance kept between cloth and body colliders, in glTF units (default 0.01). Increase if the skirt visually touches/clips the legs; 0 = push exactly to the collider surface |
+| `--collision-margin F` | Clearance kept between cloth and body colliders, in glTF units (default 0.0; the skirt gets its clearance from the two measurement-based options, and this is the only one that reaches hair and neckties). Increase if the skirt visually touches/clips the legs; 0 = push exactly to the collider surface |
 | `--hem-extra-margin F` | Extra clearance added on top of `--collision-margin`, interpolated smoothly from root (0) to hem (1) of each skirt chain, so the waist side is unaffected (default 0.0 = off) |
 | `--segment-aware-collision` | Resolve collision push-out per parent-to-child segment instead of per particle (skirt only). Root-cause fix for the "staircase" look (default OFF) |
 | `--skirt-bone-twist` | Keep each skirt bone's real rotation (mesh twist) instead of forcing identity (default OFF). Uses values already safety-clamped to 60°/frame |
-| `--vertical-spread-scale F` | Distribute push-out to neighboring rings above/below for smoother bends (default 0.0 = off; start around 1.0) |
-| `--rb-size-margin-scale F` | Extra clearance derived from each skirt rigid body's own box size (default 0.0 = off; start around 1.0) |
-| `--lateral-slack-scale F` | Allow slack in the lateral ring constraint, derived from the real PMX joint limits (default 0.0 = hard constraint; start around 1.0) |
+| `--vertical-spread-scale F` | Distribute push-out to neighboring rings above/below for smoother bends (default 0.5; above 1.0 the spread is amplified and the skirt flares) |
+| `--rb-size-margin-scale F` | Extra clearance derived from each skirt rigid body's own box size (default 1.0 = the thickness as modelled; 0 = off) |
+| `--lateral-slack-scale F` | Allow slack in the lateral ring constraint, derived from the real PMX joint limits (default 6.0; 0 = hard constraint) |
 | `--adaptive-substep-threshold F` | Auto-subdivide only fast-motion frames to prevent tunneling (default = disabled; typical 0.5–0.75) |
 | `--adaptive-substep-max-n N` | Cap on substeps per frame (default 4) |
 | `--adaptive-substep-collider NAME` | Restrict which colliders trigger substepping (repeatable; default = all) |
@@ -324,6 +376,12 @@ See the sections under [Physics baking](#physics-baking) for symptom-based expla
 | `--midpoint-correction-samples N` | Sample points per segment (default 1 = midpoint only; higher checks N interior points, distributing the push proportionally) |
 | `--force-no-collision NAME` | Force the named rigid body to be fully non-colliding, overriding its PMX group/noCollisionMask (denylist escape hatch; repeatable). Use when a specific collider pins/stretches cloth in extreme poses despite the PMX data looking correct |
 | `--allowed-collider NAME` | Switch collision to allowlist mode: only the named rigid bodies are treated as colliders at all (repeatable; ignores PMX group/noCollisionMask entirely once any is given). Mirrors VRM SpringBone / VRChat PhysBones-style per-chain collider scoping |
+| `--drape-depth-scale F` | Use the mesh-measured drape depth as the skirt's clearance (default 1.0 = as measured, 0 = off). The value is per position, so it varies from waist to hem automatically |
+| `--no-drape-probe` | Disable moving the midpoint-correction samples inward to the drape depth (for comparison) |
+| `--symmetrize-colliders` | Mirror-average left/right collider pairs so only the bake input is symmetric (default OFF). The data in `extras.mmd` is unchanged |
+| `--collision-velocity-damp F` | How much of the velocity created by a push-out is cancelled (default 1.0 = fully inelastic, 0 = old behaviour) |
+| `--margin-rest-clamp` | Cap clearance at the distance available in the rest pose (default OFF) |
+| `--physics-report` | After baking, log per-ring skirt opening, nearest collider, push frequency and estimated penetration (default OFF) |
 | `--cloth-algorithm MODE` | Skirt solver: `points` (default, main line) / `rigid_chain` (experimental) / `rigid_body` (experimental). See `--help` for the experimental algorithms' `--rigid-chain-*` / `--rigid-body-*` parameters |
 
 ## Viewer compatibility notes
@@ -380,6 +438,9 @@ mmd2gltf/
   gltf.py       GLB builder (sparse accessor support)
   convert.py    Conversion core
   cli.py        CLI
+  drape.py      Measures the drape depth of the cloth from the PMX mesh
+tools/
+  mmd_physics_inspector.html  Visual check for rigid bodies, joints and collision groups
 ```
 
 ## License
