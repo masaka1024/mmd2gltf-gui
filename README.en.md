@@ -292,6 +292,25 @@ With fast motion, two kinds of see-through can occur: (1) a frame's movement is 
 | `--midpoint-correction-collider NAME` | all colliders | Restricts which colliders are considered (repeatable). Typically pass the same names as `--adaptive-substep-collider`. |
 | `--midpoint-correction-samples N` | 1 | Number of sample points checked along each segment. 1 = the midpoint only; higher values check N interior points (e.g. 2 checks the 1/3 and 2/3 points) and distribute the push to the two bones proportionally. The push direction is always horizontal (perpendicular to gravity). |
 
+### Why penetration cannot be reduced to zero
+
+The bake writes its result as **bone keyframes**, and the mesh follows through skinning. What this bake can control is where the bones are, not where each individual vertex ends up.
+
+Skirt bones sit on the outer side of the cloth (the ridge of a fold), while the mesh itself sags inward from there. Keeping the bones outside the colliders still leaves that sagging cloth free to cross the legs. `--drape-depth-scale` measures the sag from the mesh and feeds it back as clearance, but the amount of sag also changes with the pose, so the gap can be narrowed and not closed.
+
+MMD itself (Bullet physics) lets the cloth pass through in the same places. As long as the skirt is approximated by plate-shaped rigid bodies, neither side guarantees per-vertex separation.
+
+For reference, here are measured figures with the recommended settings (share of sampled frames where the fold of the cloth ended up inside a collider, and how deep, in glTF units):
+
+| Model | Waist ring | Middle | Hem | Mean depth at the hem |
+| --- | --- | --- | --- | --- |
+| IA | 0.1% | 0.0% | 11.3% | 0.0045 |
+| Ponpu-cho style Miku | 4.1% | 0.6% | 8.2% | 0.0022 |
+
+The upper rings can be cleared almost entirely; what remains is the hem. A depth of 0.0045 works out to roughly 4 mm on a 1.6-unit-tall figure.
+
+**If you need true non-penetration**, use the rigid body and joint data preserved in `extras.mmd` and build a vertex-level cloth simulation on the receiving side — Unity's Cloth, Unreal Engine's Chaos Cloth, and so on. The bake layer is an approximation for environments that have no physics engine at all.
+
 ### Experimental: cloth algorithm switch
 
 `--cloth-algorithm` switches the skirt solver:
