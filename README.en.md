@@ -111,6 +111,12 @@ In other words, a .glb produced by this tool is not only viewable as-is — it c
 
 If you'd rather not install Python, use the prebuilt EXE.
 
+> **About the published EXE**
+> The EXE currently on the Releases page predates the recent round of physics
+> baking work (skirt silhouette, anti-penetration, clearance measured from the
+> model). **Use the Python version if you want the current behaviour.** A
+> rebuilt EXE will follow.
+
 1. Download the latest zip from the [Releases](https://github.com/masaka1024/mmd2gltf-gui/releases) page.
 2. Extract it and double-click `mmd2gltf_gui.exe` (self-contained) to launch the GUI.
 3. From there it's the same as the GUI described in [Usage](#usage). Pillow, tkinterdnd2, and numpy are bundled, so no extra installs are needed (drag & drop works in the EXE too).
