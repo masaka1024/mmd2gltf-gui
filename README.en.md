@@ -241,7 +241,7 @@ Measured mesh penetration with this configuration (share of sampled frames):
 
 ### Clearance measured from the mesh
 
-Skirt bones are usually placed on the outer side of the cloth (the ridge of a fold), while the mesh itself sags further inward. The bake pushes the bones (particles) outside the colliders, so **the cloth can look like it goes through the legs even when nothing is penetrating numerically**.
+A skirt is represented by a handful of plate-shaped rigid bodies. The bones sit at a position that stands for each plate, and the mesh at the valley of a fold lies further inside than that. The bake pushes the bones (particles) outside the colliders, so **the cloth can look like it goes through the legs even when nothing is penetrating numerically**. With only a few plates standing in for fabric, that difference is unavoidable.
 
 `--drape-depth-scale` measures that sag directly from the PMX mesh and uses it as clearance.
 
@@ -250,17 +250,19 @@ Skirt bones are usually placed on the outer side of the cloth (the ridge of a fo
 | `--drape-depth-scale F` | 1.0 | Use the mesh-measured drape depth as clearance. 1.0 uses the measured value as is, 0 disables it. The value is per position, so it varies automatically from waist to hem. |
 | `--no-drape-probe` | — | Disable moving the midpoint-correction samples inward to the drape depth (for comparison). |
 
-The sag varies a lot between models, and within a single skirt. On the verified model (IA) it was 0.089 at the waist against 0.330 at the hem (PMX units) — a **3.7x gradient** that no single uniform clearance can match without being too much at the waist or too little at the hem.
+How large that difference is varies a lot between models, and within a single skirt. On one of the verified models it was 0.089 at the waist against 0.330 at the hem (PMX units) — a **3.7x gradient** that no single uniform clearance can match without being too much at the waist or too little at the hem. A measured value carries the gradient with it.
 
 Rigid bodies whose drape depth could not be measured (too few vertices weighted to that bone, etc.) keep using the `--rb-size-margin-scale` value instead.
 
 ### Correcting left/right asymmetry
 
-Modelling is normally done mirrored, yet collider positions and sizes often end up slightly different between left and right. On the verified model (IA), the thigh capsule sat 0.046 further out on one side and the lower leg 0.067, relative to their bones (the bones themselves were perfectly symmetric). That gap is about the same size as the clearance, so **the skirt gets pushed out on one side only and visibly bulges**.
+Collider positions and sizes sometimes carry a small left/right difference. In MMD itself (Bullet physics) the rigid bodies collide as volumes, so a difference of that size never surfaces. This bake, on the other hand, treats bones as points and adds clearance around them to keep the shape. **Once the difference is comparable to that clearance, the skirt can look pushed out on one side only** — it surfaces because of the approximation, not because of the model.
+
+On one of the verified models the gap was 0.046 at the thigh and 0.067 at the lower leg, relative to their bones (the bones themselves were perfectly symmetric).
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--symmetrize-colliders` | OFF | Mirror-averages the position, size and rotation of each left/right collider pair relative to its bone. **The data written to `extras.mmd` is left untouched** — only the bake input is corrected. |
+| `--symmetrize-colliders` | OFF | Mirror-averages the position, size and rotation of each left/right collider pair relative to its bone, correcting **only the bake input**. **The data written to `extras.mmd` is left untouched.** Some models shape the two sides differently on purpose, so this is off by default. |
 
 ### Physics report (for investigation)
 
@@ -296,9 +298,9 @@ With fast motion, two kinds of see-through can occur: (1) a frame's movement is 
 
 The bake writes its result as **bone keyframes**, and the mesh follows through skinning. What this bake can control is where the bones are, not where each individual vertex ends up.
 
-Skirt bones sit on the outer side of the cloth (the ridge of a fold), while the mesh itself sags inward from there. Keeping the bones outside the colliders still leaves that sagging cloth free to cross the legs. `--drape-depth-scale` measures the sag from the mesh and feeds it back as clearance, but the amount of sag also changes with the pose, so the gap can be narrowed and not closed.
+A skirt is represented by a handful of plate-shaped rigid bodies. The bones stand for those plates, and the mesh at the valley of a fold lies further inside. Keeping the bones outside the colliders still leaves that inner cloth free to cross the legs. `--drape-depth-scale` measures the difference from the mesh and feeds it back as clearance, but the difference also changes with the pose, so it can be narrowed and not closed.
 
-MMD itself (Bullet physics) lets the cloth pass through in the same places. As long as the skirt is approximated by plate-shaped rigid bodies, neither side guarantees per-vertex separation.
+MMD itself (Bullet physics) represents the skirt with plate-shaped rigid bodies in the same way, and neither side takes per-vertex separation as a premise. How a skirt reads on screen is shaped by how its rigid bodies and joints are tuned.
 
 For reference, here are measured figures with the recommended settings (share of sampled frames where the fold of the cloth ended up inside a collider, and how deep, in glTF units):
 
