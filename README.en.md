@@ -71,12 +71,18 @@ Conversion and display have been verified with the following models (obtain the 
 
 The primary purpose of mmd2gltf is to **carry MMD data out to other formats and environments as accurately as possible**. glTF (.glb) is used as the "container" for that journey.
 
+Think of the converted glTF as a **showcase holding an MMD asset**: through the glass — that is, in any glTF viewer — you can watch the model and its motion as-is, while the original data (`extras.mmd`) sits inside, untouched, as raw values.
+
 To achieve this, every converted file has a **two-layer structure**:
 
 1. **Preservation layer (`extras.mmd`)** — Everything glTF cannot express — rigid bodies, joints, IK settings, append/grant parents, toon / sphere-map / edge material settings, and more — is **fully preserved as raw PMX values**. A receiving application (a game engine or another tool) can reconstruct the original MMD model's structure from this layer with high fidelity.
 2. **Baked layer (standard glTF animation)** — Motion and secondary physics (hair, skirts) are baked into standard keyframes so the model "just looks right" in ordinary glTF viewers that have no physics engine. This layer is an approximate fallback by design.
 
 Physics baking never discards the preservation layer, so you can have both: viewers play the baked motion as-is, while engines rebuild real physics from the raw data.
+
+There is no reverse converter (glTF → PMX) yet. But everything needed to restore the model is kept in `extras.mmd` as raw values. **If you ever want to touch the original again — try building that restoration tool.** The Unity importer is a working example of such a reconstruction, and the data layout is documented in `mmd2gltf/physicsGltf_schema.md`.
+
+> **About usage terms:** The model's and motion's usage terms still apply after conversion. Because `extras.mmd` contains the original data in full, **distributing a converted file is equivalent to distributing the original data**. A model that prohibits redistribution cannot be distributed after conversion either.
 
 ### Proof of concept: the Unity importer
 
@@ -110,12 +116,6 @@ In other words, a .glb produced by this tool is not only viewable as-is — it c
 ## Windows EXE (no Python needed)
 
 If you'd rather not install Python, use the prebuilt EXE.
-
-> **About the published EXE**
-> The EXE currently on the Releases page predates the recent round of physics
-> baking work (skirt silhouette, anti-penetration, clearance measured from the
-> model). **Use the Python version if you want the current behaviour.** A
-> rebuilt EXE will follow.
 
 1. Download the latest zip from the [Releases](https://github.com/masaka1024/mmd2gltf-gui/releases) page.
 2. Extract it and double-click `mmd2gltf_gui.exe` (self-contained) to launch the GUI.
@@ -228,22 +228,18 @@ The point-based solver (default) treats the skirt as chains of point masses, whe
 | `--rb-size-margin-scale F` | 1.0 | Derives extra clearance from each skirt rigid body's own PMX box size (smallest side = the panel's thickness). In MMD itself the rigid bodies' volume produces a natural, snug fit "for free", while bone-position collision treats particles as zero-size points; this reads the size back out of the model to approximate the same effect. In MMD the box collides on its **face**, so its centre always stops half a thickness away from the collider — which means 1.0 simply reuses the thickness the author modelled, and is a physically grounded default. |
 | `--lateral-slack-scale F` | 6.0 | Allows slack in the skirt's lateral ring constraint (between adjacent panels at the same height), derived from the real PMX joint's translation limits (linearLimitMin/Max). MMD itself lets the distance move freely inside that range and only stops at the edges, whereas this solver used to pull it back to exactly the rest length every step — which can look stiff and origami-like on flare skirts. Start around 1.0 (the verified models use 6.0). |
 
-**Recommended settings** — arrived at by measuring penetration and skirt opening on two models (IA and Ponpu-cho style Hatsune Miku). The numeric defaults already match this configuration, so on the CLI you only need to add the boolean options:
+**Recommended settings** — arrived at by measuring penetration and skirt opening on two models (IA and Ponpu-cho style Hatsune Miku).
 
 ```bash
 python -m mmd2gltf model.pmx --vmd motion.vmd --bake-physics --bake-target all \
   --segment-aware-collision --skirt-bone-twist --symmetrize-colliders \
+  --hem-extend-scale 1.0 --adaptive-substep-threshold 0.5 \
   -o out.glb
 ```
 
-**The GUI ships with these values already filled in.** The same settings are available under "Advanced settings".
+**The GUI launches with most of these values already filled in.** Only two need enabling under "Advanced settings": hem extension (1.0) and adaptive substep (threshold 0.5).
 
-Measured mesh penetration with this configuration (share of sampled frames):
-
-| Model | Waist ring | Middle | Hem |
-| --- | --- | --- | --- |
-| IA | 0.2% | 0.0% | 12.9% |
-| Ponpu-cho style Miku | 4.1% | 0.6% | 8.2% (lowest ring 3.3%) |
+Measured figures for this configuration are listed under [Why penetration cannot be reduced to zero](#why-penetration-cannot-be-reduced-to-zero).
 
 ### Clearance measured from the mesh
 
@@ -291,6 +287,7 @@ With fast motion, two kinds of see-through can occur: (1) a frame's movement is 
 
 | Option | Default | Effect |
 | --- | --- | --- |
+| `--hem-extend-scale F` | 0.0 | Virtually extends each skirt chain's last (hem) segment by F × half the hem rigid body's height for collision testing. The hem bone sits at the center of a plate-shaped rigid body, so the actual cloth reaches further down than the bone; this compensates for penetration in that unreached part (1.0 = the rigid body's real size). |
 | `--adaptive-substep-threshold F` | disabled | Targets (1). Automatically subdivides only those frames where the anchor+collider relative movement exceeds F × the nearest collider's radius. Typical values: 0.5–0.75. Leaving it unset keeps the behavior fully unchanged. |
 | `--adaptive-substep-max-n N` | 4 | Cap on how many substeps a single frame can be split into. |
 | `--adaptive-substep-collider NAME` | all colliders | Restricts which colliders trigger substepping (repeatable). Passing only leg/knee colliders makes fast arm motion not trigger it. |
@@ -313,7 +310,7 @@ For reference, here are measured figures with the recommended settings (share of
 | Model | Waist ring | Middle | Hem | Mean depth at the hem |
 | --- | --- | --- | --- | --- |
 | IA | 0.1% | 0.0% | 11.3% | 0.0045 |
-| Ponpu-cho style Miku | 4.1% | 0.6% | 8.2% | 0.0022 |
+| Ponpu-cho style Miku | 3.8% | 0.6% | 3.3% (lowest ring 0.6%) | 0.0018 |
 
 The upper rings can be cleared almost entirely; what remains is the hem. A depth of 0.0045 works out to roughly 4 mm on a 1.6-unit-tall figure.
 
@@ -393,6 +390,7 @@ See the sections under [Physics baking](#physics-baking) for symptom-based expla
 | `--vertical-spread-scale F` | Distribute push-out to neighboring rings above/below for smoother bends (default 0.5; above 1.0 the spread is amplified and the skirt flares) |
 | `--rb-size-margin-scale F` | Extra clearance derived from each skirt rigid body's own box size (default 1.0 = the thickness as modelled; 0 = off) |
 | `--lateral-slack-scale F` | Allow slack in the lateral ring constraint, derived from the real PMX joint limits (default 6.0; 0 = hard constraint) |
+| `--hem-extend-scale F` | Virtually extend the last (hem) segment by F × half the hem rigid body's height for collision (default 0.0 = off; 1.0 = the body's real size). Compensates for cloth reaching below the hem bone |
 | `--adaptive-substep-threshold F` | Auto-subdivide only fast-motion frames to prevent tunneling (default = disabled; typical 0.5–0.75) |
 | `--adaptive-substep-max-n N` | Cap on substeps per frame (default 4) |
 | `--adaptive-substep-collider NAME` | Restrict which colliders trigger substepping (repeatable; default = all) |
