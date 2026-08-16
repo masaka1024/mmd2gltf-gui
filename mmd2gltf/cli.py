@@ -6,7 +6,27 @@ import sys
 from .convert import convert
 
 
+def _make_output_tolerant():
+    """表示できない文字があってもログ出力で落ちないようにする。
+
+    日本語Windowsの既定コンソールは cp932 で、em dash (U+2014) のような文字を
+    encode できない。ログを1行 print しただけで UnicodeEncodeError が飛び、
+    cli.main() の except がそれを掴んで変換全体が中断していた
+    (--bake-physics は BAKE_HAIR_VERSION に em dash を含むため必ず落ちた)。
+    ログの見た目は変換結果と無関係なので、出せない文字は置換して先へ進める。
+
+    GUI は stdout を StringIO へ差し替えるため reconfigure を持たない。
+    その場合は何もしない (StringIO はどんな文字でも受け取れる)。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv=None):
+    _make_output_tolerant()
     ap = argparse.ArgumentParser(
         prog="mmd2gltf",
         description="Convert MMD PMX models (and optional VMD motions) "
