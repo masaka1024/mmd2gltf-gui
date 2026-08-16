@@ -965,6 +965,12 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
             "comment": model["comment"], "commentEn": model["comment_en"],
             "morphs": morph_extras,
             "displayFrames": model["display_frames"],
+            # ボーンの基本情報(PMX生値)。受け手が「移動可(0x0004)か」等を
+            # 剛体の有無から推測せず仕様どおり判定できるようにする。
+            # 並びはglTFのnodes[0..len(bones)-1]と同順(=PMXボーン順)。
+            "bones": [{"name": b["name"], "nameEn": b["name_en"],
+                       "flags": b["flags"], "parent": b["parent"]}
+                      for b in model["bones"]],
             "rigidBodies": model["rigid_bodies"],
             "joints": model["joints"],
         }}
@@ -994,12 +1000,18 @@ def convert(pmx_path, out_path, vmd_path=None, unlit=False, solve_ik=True,
                 log("  VMD contains %d IK on/off key frame(s)%s"
                     % (len(vmd["ik_frames"]),
                        "" if use_vmd_ik_frames else " (ignored)"))
-            times, baked, unmatched = bake(
+            times, baked, unmatched, ignored_t = bake(
                 model, vmd, solve_ik=solve_ik, step=step, progress=prog,
                 disable_ik=disable_ik, use_vmd_ik_frames=use_vmd_ik_frames)
             if unmatched:
                 log("  %d VMD bone tracks had no matching PMX bone"
                     % len(unmatched))
+            if ignored_t:
+                log("  %d VMD track(s) carried translation on non-movable "
+                    "bones -- ignored (MMD semantics): %s"
+                    % (len(ignored_t),
+                       ", ".join(ignored_t[:8])
+                       + (" ..." if len(ignored_t) > 8 else "")))
             t_acc = g.add_accessor(times, G.FLOAT, "SCALAR", minmax=True)
 
             # --- 剛体物理ベイク（PBD/クロス）: 剛体の回転を物理シミュで生成 ---

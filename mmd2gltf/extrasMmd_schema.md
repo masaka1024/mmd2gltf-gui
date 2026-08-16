@@ -72,6 +72,7 @@ nodes[i]    .extras.mmd   … ボーンの MMD 固有パラメータ（IK・付�
   "commentEn": "...",
   "morphs": [ ... ],            // モーフ原本（下記）
   "displayFrames": [ ... ],     // 表示枠（PMX raw）
+  "bones": [ ... ],             // ボーン基本情報（PMX raw・下記）
   "rigidBodies": [ ... ],       // 剛体原本（PMX raw・未変換）
   "joints": [ ... ],            // ジョイント原本（PMX raw・未変換）
   "physicsGltf": { ... }        // 変換済み物理ビュー → physicsGltf_schema.md
@@ -100,6 +101,25 @@ glTF 空間へは 位置 (x, y, -z)、クォータニオン (-x, -y, z, w) で�
 頂点モーフ・UV モーフは glTF の morph target として本体に変換済みです。
 グループ・ボーン・材質モーフは glTF に対応概念がないため、
 raw オフセットを `offsets` に保持します（インポーター側で解釈してください）。
+
+### bones（ボーン基本情報）
+
+```jsonc
+"bones": [
+  { "name": "しっぽ１３", "nameEn": "tail13", "flags": 8193, "parent": 165 }
+]
+```
+
+- 並びは glTF の `nodes[0 .. len(bones)-1]` と同順（= PMX ボーン順）で、
+  配列の添字がそのままボーン番号（= glTF ノード番号）です。
+- `flags` は PMX の生値です。受け手はここから「移動可 (0x0004) か」等を
+  剛体の有無から推測せずに判定できます。
+  例: **translation チャンネルが正当なのは、移動可ボーンと、
+  物理ベイクが位置を焼くボーン（mode 1/2 剛体付き）だけ**です。
+- 同じ `flags` は各ボーンノードの `nodes[i].extras.mmd.flags` にも
+  入っています（→ 3章）。ノードを走査せずに一覧で欲しい受け手向けに、
+  ここに同じ原本値を一覧としても持ちます（どちらも PMX raw で同値）。
+- IK 定義などフラグ依存の詳細は `nodes[i].extras.mmd` 側にあります。
 
 ---
 

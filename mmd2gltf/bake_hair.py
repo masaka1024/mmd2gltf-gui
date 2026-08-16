@@ -15,7 +15,7 @@ from .physics import (q_mul, q_rotate_vec, q_conj, q_normalize,
 # ベイク実行のたびに [physics] ログの先頭に出力する。内容を変更した際は必ず
 # ここも更新し、環境側のファイルが古い/キャッシュされている疑いを
 # ログだけで切り分けられるようにする。
-BAKE_HAIR_VERSION = "2026-07-28n (drape_depth_scale now falls back to the rigid body thickness for bodies whose drape depth could not be measured, instead of dropping their clearance to zero) | previously 2026-07-28m (symmetrize_colliders option: mirror-average left/right collider pairs for baking, since modelling is normally done mirrored and small left/right slips show up as a one-sided skirt bulge; also fixes the report, which ignored exclude_rb and the group mask and therefore counted the chain anchor as a collider) | previously 2026-07-28l (physics_report also estimates mesh-level penetration: clearance measured against the mesh-derived drape depth, so the number reflects what is visible rather than whether the bone itself is clear) | previously 2026-07-28k (the per-ring diagnostics are now opt-in via physics_report) | previously 2026-07-28j (skip_embedded_parent: when a segment starts inside a collider by design — IA seats the skirt chain's parent body 0.052 inside the 下半身1 capsule — the segment test read that as a deep collision and transferred part of it to the first skirt ring every single frame; such a segment is now tested at its child end only) | previously 2026-07-28i (push_preserve_length: after a segment-aware collision push, the particle was re-projected onto the rest_len sphere around its parent, so any contact also stretched a compressed segment to full length — a tiny push became a large outward move. It now keeps the pre-push distance and only rotates about the parent, as the circular-motion design intended) | previously 2026-07-28h (diagnostic: count how often the collision push actually fires per skirt ring and how large it is) | previously 2026-07-28g (diagnostic: sample which collider each skirt ring is closest to during the motion, and at what surface distance, to name what the cloth is actually resting on) | previously 2026-07-28f (collision_velocity_damp: collision push-out moved pos only, so in Verlet every push injected outward velocity; with contact on most frames the skirt was fed outward and never came back — measured as a flat +0.025 waist-ring expansion that vanished with colliders off. prev now moves with the push so the response is fully inelastic) | previously 2026-07-28e (diagnostic: also report which skirt particles are already touching a collider in the rest pose, and the tightest particle-collider pairs, since a permanent contact shows up as a constant ring expansion) | previously 2026-07-28d (diagnostic: report per-ring skirt expansion vs the rest radius each frame, with a 10-slice timeline, to tell contact-driven opening apart from opening that never recovers) | previously 2026-07-28c (margin_rest_clamp: cap the total clearance of each particle-collider pair at the distance actually available in the rest pose, so no margin pushes the cloth outward while the model stands still; needed because the collision-mask fix widened the skirt's collider set to the hip capsules) | previously 2026-07-28b (collision mask semantics fixed: the PMX 16bit field stores which groups a body DOES collide with, Bullet-style; the old code treated a set bit as no-collision and skipped with or, which inverted every group decision) | previously 2026-07-28a (drape_depth_scale: use mesh-measured drape depth per bone as the skirt extra clearance, replacing the rb_size_margin_scale approximation; measured on IA: waist 0.089 / mid 0.118 / hem 0.330 in PMX units, i.e. a 3.7x root-to-hem gradient that a single uniform clearance cannot match) | previously 2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
+BAKE_HAIR_VERSION = "2026-08-16a (chain parenting now prefers bone-hierarchy-consistent joints: Dijkstra priority is (inconsistent-edge count, 3D distance), so a suspension joint that ties a chain tip back to the waist — e.g. しっぽ吊/腰ベルト６ on Tda Miku Append kai — can no longer steal the tip as a direct child of the anchor and reverse the chain end; such joints now become lateral distance constraints, which is their physical role. Fixes tail/belt tips exported with translations in the wrong parent frame, seen in UE5 as chains stretching to the floor) | previously 2026-07-28n (drape_depth_scale now falls back to the rigid body thickness for bodies whose drape depth could not be measured, instead of dropping their clearance to zero) | previously 2026-07-28m (symmetrize_colliders option: mirror-average left/right collider pairs for baking, since modelling is normally done mirrored and small left/right slips show up as a one-sided skirt bulge; also fixes the report, which ignored exclude_rb and the group mask and therefore counted the chain anchor as a collider) | previously 2026-07-28l (physics_report also estimates mesh-level penetration: clearance measured against the mesh-derived drape depth, so the number reflects what is visible rather than whether the bone itself is clear) | previously 2026-07-28k (the per-ring diagnostics are now opt-in via physics_report) | previously 2026-07-28j (skip_embedded_parent: when a segment starts inside a collider by design — IA seats the skirt chain's parent body 0.052 inside the 下半身1 capsule — the segment test read that as a deep collision and transferred part of it to the first skirt ring every single frame; such a segment is now tested at its child end only) | previously 2026-07-28i (push_preserve_length: after a segment-aware collision push, the particle was re-projected onto the rest_len sphere around its parent, so any contact also stretched a compressed segment to full length — a tiny push became a large outward move. It now keeps the pre-push distance and only rotates about the parent, as the circular-motion design intended) | previously 2026-07-28h (diagnostic: count how often the collision push actually fires per skirt ring and how large it is) | previously 2026-07-28g (diagnostic: sample which collider each skirt ring is closest to during the motion, and at what surface distance, to name what the cloth is actually resting on) | previously 2026-07-28f (collision_velocity_damp: collision push-out moved pos only, so in Verlet every push injected outward velocity; with contact on most frames the skirt was fed outward and never came back — measured as a flat +0.025 waist-ring expansion that vanished with colliders off. prev now moves with the push so the response is fully inelastic) | previously 2026-07-28e (diagnostic: also report which skirt particles are already touching a collider in the rest pose, and the tightest particle-collider pairs, since a permanent contact shows up as a constant ring expansion) | previously 2026-07-28d (diagnostic: report per-ring skirt expansion vs the rest radius each frame, with a 10-slice timeline, to tell contact-driven opening apart from opening that never recovers) | previously 2026-07-28c (margin_rest_clamp: cap the total clearance of each particle-collider pair at the distance actually available in the rest pose, so no margin pushes the cloth outward while the model stands still; needed because the collision-mask fix widened the skirt's collider set to the hip capsules) | previously 2026-07-28b (collision mask semantics fixed: the PMX 16bit field stores which groups a body DOES collide with, Bullet-style; the old code treated a set bit as no-collision and skipped with or, which inverted every group decision) | previously 2026-07-28a (drape_depth_scale: use mesh-measured drape depth per bone as the skirt extra clearance, replacing the rb_size_margin_scale approximation; measured on IA: waist 0.089 / mid 0.118 / hem 0.330 in PMX units, i.e. a 3.7x root-to-hem gradient that a single uniform clearance cannot match) | previously 2026-07-27a (hem_extend_scale: virtually extend tail segments by the tail rigid body's half height for collision, based on inspector finding that tail bones sit at plate centers; substep composition fixed: drag_sub=1-(1-drag)**(1/N) — old drag**(1/N) assumed drag was the retention factor and over-damped activated frames to near-zero momentum — and stiffness now scaled by 1/N like gravity)"
 
 def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
 def _len(a): return math.sqrt(a[0]*a[0]+a[1]*a[1]+a[2]*a[2])
@@ -899,8 +899,12 @@ def bake_hair_into_gltf(gltf_json, baked, num_frames, physics_gltf, scale,
     nodes = gltf_json["nodes"]
     print("  [physics] bake_hair.py version: %s" % BAKE_HAIR_VERSION)
     bwm = compute_bone_world_matrices(gltf_json)
+    _bone_parents = [-1] * len(nodes)
+    for _i, _nd in enumerate(nodes):
+        for _c in _nd.get("children", []):
+            _bone_parents[_c] = _i
     chains, parts, excluded, lateral = extract_chains_bfs(
-        physics_gltf, bwm, only_names=only_names)
+        physics_gltf, bwm, only_names=only_names, bone_parents=_bone_parents)
     rbs_names_all = physics_gltf["rigidBodies"]
     _push_report = {}   # 計測用(ウォームアップ中の分は本計測前にリセットする)
     if force_no_collision_names:
@@ -2459,9 +2463,18 @@ def _joint_lateral_angle_info(j):
     return tuple(amin), tuple(amax), (tuple(jrot) if jrot else (0.0, 0.0, 0.0, 1.0))
 
 
-def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
+def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None,
+                       bone_parents=None):
     """アンカー(mode0剛体)からのBFSで親を決め、縦チェーン＋横距離拘束に分解。
     髪(単純チェーン)もスカート(リング)も統一的に扱える。
+
+    bone_parents: 省略可。node index -> 親node index(無ければ-1)のリスト。
+        渡すと、ツリー辺の選択が辞書式Dijkstra(第1キー=ボーン階層と不整合な
+        辺の本数、第2キー=3D距離)になる。「整合」とは、親剛体のボーンが
+        子剛体ボーンの直接の親(または同一ボーン)であること。これにより、
+        しっぽ先端を腰に繋ぎ直す「吊り」ジョイント等の近道エッジが、正規の
+        鎖(全て整合辺=不整合0本)より優先されることがなくなる。吊り辺自体は
+        非ツリー辺(横距離拘束)として残る。Noneなら従来通り3D距離のみ。
 
     戻り値: (chains, parts, excluded, lateral)
       lateral = [(rb_i, rb_j, rest_len, joint_slack, ang_min, ang_max, joint_rot), ...]
@@ -2529,31 +2542,57 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
     # (例: 上段の輪を1周してから下段に接続)になりやすい。これは実際の物理挙動として
     # 不安定（アンカーの動きが輪全体に梃子のように伝わり、回転出力が特異点近くで
     # 跳ねる)なので、ホップ数ではなく実際の3D距離を最短路の重みにする。
+    #
+    # bone_parents が渡された場合はさらに、優先度を(不整合辺数, 3D距離)の
+    # 辞書式にする。不整合辺 = 「親剛体のボーンが子剛体ボーンの直接の親
+    # (または同一ボーン)」でない辺。しっぽ末端を腰に繋ぐ「吊り」ジョイントの
+    # ような近道は3D距離では鎖経由より短くなり得るが(実例: Tda式ミク・アペンド
+    # 改のしっぽ吊・腰ベルト６)、不整合辺を1本含むため、全て整合な正規の鎖に
+    # 必ず負ける。
+    def edge_clean(pa_rb, ch_rb):
+        if bone_parents is None:
+            return True
+        ba = rbs[pa_rb]["bone"]
+        bb = rbs[ch_rb]["bone"]
+        if ba == bb:
+            return True          # 同一ボーンを共有する剛体
+        if 0 <= bb < len(bone_parents):
+            return bone_parents[bb] == ba
+        return False
+
     import heapq
-    depth = {i: 0.0 for i in anchors}
+    ZERO = (0, 0.0)
+    depth = {i: ZERO for i in anchors}
+
+    def better(nd, cur_d):
+        # 辞書式比較。距離側は従来の 1e-9 イプシロン付き。
+        if nd[0] != cur_d[0]:
+            return nd[0] < cur_d[0]
+        return nd[1] < cur_d[1] - 1e-9
+
     tree_joint = {}     # child_rb -> joint（親との辺）
     visited = set(anchors)
     lateral = []
     seen_pairs = set()
-    heap = [(0.0, i) for i in anchors]
+    heap = [(ZERO, i) for i in anchors]
     heapq.heapify(heap)
     while heap:
         dcur, cur = heapq.heappop(heap)
-        if dcur > depth.get(cur, dcur):
-            continue   # 古いエントリ（既により短い経路で確定済み）
+        if better(depth.get(cur, dcur), dcur):
+            continue   # 古いエントリ（既により良い経路で確定済み）
         for nb, j in adj.get(cur, []):
             if nb not in parts:      # 対象外(別カテゴリのdyn等)は無視
                 continue
             rp_c, rp_n = parts[cur].rest_pos, parts[nb].rest_pos
             w = _len(_sub(rp_c, rp_n)) if (rp_c and rp_n) else 1.0
-            nd = dcur + w
+            nd = (dcur[0] + (0 if edge_clean(cur, nb) else 1), dcur[1] + w)
             if nb not in visited:
                 visited.add(nb)
                 depth[nb] = nd
                 parts[nb].parent = cur
                 tree_joint[nb] = j
                 heapq.heappush(heap, (nd, nb))
-            elif nd < depth.get(nb, float("inf")) - 1e-9:
+            elif better(nd, depth.get(nb, (1 << 30, float("inf")))):
                 # より短い経路が後から見つかった（優先度キューの構造上あり得る）。
                 # 親を更新し、旧親子辺は横拘束として残す。
                 old_parent = parts[nb].parent
@@ -2620,7 +2659,7 @@ def extract_chains_bfs(physics_gltf, bone_world_matrices, only_names=None):
 
     chains = []
     for r, members in groups.items():
-        members.sort(key=lambda i: depth.get(i, 0))
+        members.sort(key=lambda i: depth.get(i, (0, 0.0)))
         ch = Chain()
         anchor_i = parts[members[0]].parent
         if anchor_i in parts and parts[anchor_i].kinematic:
@@ -3972,13 +4011,12 @@ def measure_tunneling(gltf_json, baked, num_frames, physics_gltf, scale,
     print("  [measure] adaptive-substep measurement version: %s"
           % ADAPTIVE_SUBSTEP_MEASURE_VERSION)
     bwm = compute_bone_world_matrices(gltf_json)
-    chains, parts, excluded, lateral = extract_chains_bfs(
-        physics_gltf, bwm, only_names=only_names)
-
     parent = [-1] * len(nodes)
     for i, nd in enumerate(nodes):
         for c in nd.get("children", []):
             parent[c] = i
+    chains, parts, excluded, lateral = extract_chains_bfs(
+        physics_gltf, bwm, only_names=only_names, bone_parents=parent)
 
     def local_mat_at(bi, f):
         d = baked.get(bi)

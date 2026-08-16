@@ -84,6 +84,11 @@ class Skeleton:
             range(n),
             key=lambda i: (1 if self.bones[i]["flags"] & 0x1000 else 0,
                            self.bones[i]["layer"], i))
+        # 移動可フラグ(0x0004)。MMDは移動可でないボーンのVMD移動値を適用しない
+        # ため、ベイクでも同じ扱いにする(適用すると、物理焼き込み系ツールが
+        # 書き出したフルキーVMDに残る移動値が回転専用ボーンへ乗り、glTF側で
+        # translationチャンネルとして出力され、受け手の物理・姿勢参照を壊す)。
+        self.movable = [bool(b["flags"] & 0x0004) for b in self.bones]
         self.local_q = [QID] * n
         self.local_t = [(0.0, 0.0, 0.0)] * n   # animation offset (adds to rest)
         self._world = {}
@@ -124,7 +129,8 @@ class Skeleton:
         """
         self.reset()
         for i, (pos, rot) in sampled.items():
-            self.local_t[i] = pos
+            if self.movable[i]:
+                self.local_t[i] = pos
             self.local_q[i] = qnorm(rot)
 
         for i in self.order:
@@ -194,7 +200,9 @@ def bake(model, vmd, solve_ik=True, step=1, progress=None,
         are never solved (e.g. ["足"] disables leg/toe IK).
     use_vmd_ik_frames: honour IK on/off key frames stored in the VMD.
 
-    Returns (times, bone_data) where bone_data maps bone index to
+    Returns (times, bone_data, unmatched, ignored_translation) where
+    ignored_translation lists names of non-movable bones whose VMD
+    translation values were ignored (MMD semantics). bone_data maps bone index to
     {"t": [vec3 local translation incl. rest] or None, "r": [quat] or None}
     (channels that never deviate from rest are dropped).
     """
@@ -218,6 +226,15 @@ def bake(model, vmd, solve_ik=True, step=1, progress=None,
             unmatched.append(name)
             continue
         tracks[i] = Track(keys)
+
+    # 移動可(0x0004)でないボーンのトラックに移動値が入っている場合、その移動値は
+    # MMD同様に適用しない(Skeleton.movable参照)。ここでは報告用に本数だけ数える。
+    ignored_translation = []
+    for i, tr in tracks.items():
+        if not (bones[i]["flags"] & 0x0004):
+            if any(abs(k["pos"][0]) + abs(k["pos"][1]) + abs(k["pos"][2]) > 1e-9
+                   for k in tr.keys):
+                ignored_translation.append(bones[i]["name"])
 
     sk = Skeleton(model)
 
@@ -290,4 +307,4 @@ def bake(model, vmd, solve_ik=True, step=1, progress=None,
         if anim_r or anim_t:
             out[i] = {"r": rots[i] if anim_r else None,
                       "t": trans[i] if anim_t else None}
-    return times, out, unmatched
+    return times, out, unmatched, ignored_translation
