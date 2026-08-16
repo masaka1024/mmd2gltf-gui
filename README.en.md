@@ -466,6 +466,8 @@ mmd2gltf/
   drape.py      Measures the drape depth of the cloth from the PMX mesh
 tools/
   mmd_physics_inspector.html  Visual check for rigid bodies, joints and collision groups
+  build_release.ps1           Builds the Windows EXE and packs the release zip
+  release_pack.py             Verifies the payload and builds the zip (called by the above)
 ```
 
 ## License

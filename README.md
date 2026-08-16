@@ -466,6 +466,8 @@ mmd2gltf/
   drape.py      PMXメッシュからドレープ(布の落ち込み)深さを実測
 tools/
   mmd_physics_inspector.html  剛体・ジョイント・衝突グループの目視確認ツール
+  build_release.ps1           Windows EXE版のビルドから配布zipまで
+  release_pack.py             配布物の検査とzipの組み立て(上記から呼ばれる)
 ```
 
 ## ライセンス
