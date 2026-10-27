@@ -81,6 +81,7 @@ Conversion and display have been verified with the following models (obtain the 
 - [Usage](#usage)
 - [IK handling](#ik-handling)
 - [Physics baking (experimental)](#physics-baking-experimental)
+- [Viewing the converted .glb with the MMD look (FacetGL)](#viewing-the-converted-glb-with-the-mmd-look-facetgl)
 - [Inspecting rigid bodies visually](#inspecting-rigid-bodies-visually)
 - [Option reference](#option-reference)
 - [Viewer compatibility notes](#viewer-compatibility-notes)
@@ -203,6 +204,15 @@ python -m mmd2gltf model.pmx --vmd motion.vmd --bake-physics --bake-target all -
 ```
 
 Physics baking does not modify the rigid-body and joint data in `extras.mmd`. There are many tuning parameters, but for the reason above this README does not document them individually; see `python -m mmd2gltf --help` if you need them. The GUI exposes the same settings under "Advanced settings".
+
+## Viewing the converted .glb with the MMD look (FacetGL)
+
+You can check the result in [FacetGL](https://github.com/masaka1024/facetgl), a sister-project 3D model viewer. FacetGL reads the toon, sphere and edge information stored in `extras.mmd` and renders the model close to how it looks in MMD.
+
+- **Web version: <https://masaka1024.github.io/facetgl/>** — nothing to install. Just drop the `.glb` onto the page (the file is read only inside your browser and is never uploaded)
+- **Desktop version (Windows / macOS)**: [Releases](https://github.com/masaka1024/facetgl/releases)
+
+`.glb` files with motion play as-is, and the "MMD view" button switches to the standard glTF rendering for comparison. Hair and skirts can also be simulated with physics using the rigid bodies and joints in `extras.mmd` (experimental).
 
 ## Inspecting rigid bodies visually
 
