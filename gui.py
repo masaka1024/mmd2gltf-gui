@@ -95,7 +95,8 @@ STRINGS = {
         "adv_ignore_vmd_ik": "VMD内のIK ON/OFFキーを無視(--ignore-vmd-ik)",
         "adv_no_extras": "extras.mmd を出力しない(--no-extras)",
         "adv_no_custom_attrs": "MMD固有の頂点属性を省略(--no-custom-attrs)\n"
-                                "  ※Blenderで「メッシュを読み込めない」エラーが出る場合はこれをON",
+                                "  ※Blenderで「メッシュを読み込めない」エラーが出る場合はこれをON\n"
+                                "  ※ONにするとSDEF・追加UV・エッジ倍率は出力されません",
         "adv_disable_ik_label": "無効化するIK名(カンマ区切り)",
         "adv_step_label": "サンプリング間隔(--step)",
         "adv_anim_name_label": "アニメーション名",
@@ -280,7 +281,8 @@ STRINGS = {
         "adv_ignore_vmd_ik": "Ignore IK on/off keys in VMD (--ignore-vmd-ik)",
         "adv_no_extras": "Don't output extras.mmd (--no-extras)",
         "adv_no_custom_attrs": "Omit MMD-specific vertex attributes (--no-custom-attrs)\n"
-                                "  \u2731 Turn this ON if Blender fails to load the mesh",
+                                "  \u2731 Turn this ON if Blender fails to load the mesh\n"
+                                "  \u2731 When ON, SDEF / additional UVs / edge scale are not written",
         "adv_disable_ik_label": "IK names to disable (comma-separated)",
         "adv_step_label": "Sampling step (--step)",
         "adv_anim_name_label": "Animation clip name",

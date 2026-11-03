@@ -238,7 +238,7 @@ It shows rigid bodies, joints and collision groups in 3D. Clicking a rigid body 
 | `--alpha-mode MODE` | `auto` (default) analyses each texture's alpha distribution and picks OPAQUE/MASK/BLEND. `opaque`/`mask`/`blend` force one mode for all materials |
 | `--force-double-sided` | Render all materials double-sided (when the back of hair or skirts disappears) |
 | `--scale F` | Uniform scale from MMD units to glTF units/metres (default 0.08). MMD models are conventionally built at about 1 unit ≈ 8 cm, so `1.0` (no scaling) shows roughly 12.5× too large in glTF viewers. Applied to vertices, bone positions, SDEF parameters, morphs and baked translations; raw data in `extras.mmd` is untouched (the factor is recorded in `extras.mmd.unitScale`) |
-| `--no-custom-attrs` | Omit MMD-specific vertex attributes (`_SDEF_C`/`_SDEF_R0`/`_SDEF_R1`/`_ADDUV1..4`/`_EDGESCALE`/`_WEIGHTTYPE`). Use this if Blender's standard glTF importer fails on them (the data remains under `extras.mmd`) |
+| `--no-custom-attrs` | Omit MMD-specific vertex attributes (`_SDEF_C`/`_SDEF_R0`/`_SDEF_R1`/`_ADDUV1..4`/`_EDGESCALE`/`_WEIGHTTYPE`). Use this if Blender's standard glTF importer fails on them. **With this option the SDEF parameters, additional UVs, edge scale and weight types are not written to the output file** (they are per-vertex data and are not stored under `extras.mmd`). By default (without this option) all of them are kept |
 | `--bake-physics` and related | Physics baking ([experimental](#physics-baking-experimental)); see `--help` for the full list |
 
 ## Viewer compatibility notes
