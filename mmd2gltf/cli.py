@@ -58,7 +58,9 @@ def main(argv=None):
     ap.add_argument("--no-custom-attrs", action="store_true",
                     help="omit MMD-specific vertex attributes (_SDEF_*, "
                     "_ADDUV*, _EDGESCALE, _WEIGHTTYPE); try this if an "
-                    "importer (e.g. Blender) fails on custom attributes")
+                    "importer (e.g. Blender) fails on custom attributes. "
+                    "Note: this per-vertex data is not kept in extras.mmd, "
+                    "so it is dropped from the output")
     ap.add_argument("--force-double-sided", action="store_true",
                     help="render all materials double-sided "
                     "(like three.js MMDLoader)")

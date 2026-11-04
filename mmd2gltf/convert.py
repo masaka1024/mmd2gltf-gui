@@ -6,8 +6,13 @@ Coordinate conversion (MMD left-handed, Y-up  ->  glTF right-handed, Y-up):
     quaternion        : (x, y, z, w) -> (-x, -y, z, w)
     triangle winding  : (a, b, c) -> (a, c, b)
 Everything glTF cannot express natively (IK, physics, sphere/toon shading,
-material & bone morphs, SDEF, display frames, ...) is preserved verbatim
+material & bone morphs, display frames, ...) is preserved verbatim
 (MMD coordinate space) under `extras.mmd` in the glTF JSON.
+Per-vertex MMD data (SDEF C/R0/R1, additional UVs, edge scale, weight type)
+is NOT in `extras.mmd`; it is written as custom vertex attributes
+(_SDEF_C/_SDEF_R0/_SDEF_R1 in glTF space with `scale` applied, _ADDUV1..4,
+_EDGESCALE, _WEIGHTTYPE), and is omitted entirely when custom_attrs=False
+(--no-custom-attrs).
 """
 import io
 import os

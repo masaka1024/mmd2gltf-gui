@@ -239,7 +239,7 @@ python -m mmd2gltf モデル.pmx --vmd モーション.vmd --bake-physics --bake
 | `--alpha-mode MODE` | `auto`(既定)はテクスチャのα分布を解析し OPAQUE/MASK/BLEND を自動判別。`opaque`/`mask`/`blend`で全材質強制も可 |
 | `--force-double-sided` | 全材質を両面描画に(髪やスカートの裏面が消える場合に) |
 | `--scale F` | MMD単位→glTF単位(メートル)への一律スケール(既定0.08)。MMDモデルは慣習的に1ユニット≈8cmで作られているため、`1.0`(無変換)にするとglTFビューアでは約12.5倍の大きさで表示されます。頂点・ボーン位置・SDEFパラメータ・モーフ・ベイク済みアニメーションの平行移動に適用され、`extras.mmd`内の生データには影響しません(`extras.mmd.unitScale`に係数を記録) |
-| `--no-custom-attrs` | MMD固有の頂点属性(`_SDEF_C`/`_SDEF_R0`/`_SDEF_R1`/`_ADDUV1..4`/`_EDGESCALE`/`_WEIGHTTYPE`)を出力しない。Blenderの標準glTFインポータがこれらの属性でエラーになる場合に指定(データは`extras.mmd`側に残ります) |
+| `--no-custom-attrs` | MMD固有の頂点属性(`_SDEF_C`/`_SDEF_R0`/`_SDEF_R1`/`_ADDUV1..4`/`_EDGESCALE`/`_WEIGHTTYPE`)を出力しない。Blenderの標準glTFインポータがこれらの属性でエラーになる場合に指定。**指定するとSDEFパラメータ・追加UV・エッジ倍率・ウェイト種別は出力ファイルに含まれません**(これらは頂点単位のデータで`extras.mmd`には入らないため)。既定(指定なし)ではすべて保持されます |
 | `--bake-physics` ほか | 物理ベイク関連([実験的機能](#物理ベイク実験的機能))。一覧は `--help` を参照 |
 
 ## ビュアー互換性の注意
