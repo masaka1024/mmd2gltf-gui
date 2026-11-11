@@ -1,12 +1,14 @@
 # `extras.mmd.physicsGltf` スキーマ
 
+日本語 | [English](physicsGltf_schema.en.md)
+
 mmd2gltf は、MMD（PMX）の剛体・ジョイント情報を glTF 出力の `extras.mmd` に残します。
 そのうち **`physicsGltf`** は、後工程（Unity / Unreal Engine など）で物理を組む人が
 **そのまま使える形に変換済み**のビューです。座標系・単位・向きを自前で変換する必要はありません。
 
 > glTF には実行時物理がありません。mmd2gltf は髪やスカートの「揺れ」を焼き込まず、
 > 物理定義をこの `physicsGltf` として残します。エンジン側で揺れものを構築してください。
-> （キーフレームに焼き込みたい場合は `--bake-hair` オプションを使用します。）
+> （キーフレームに焼き込みたい場合は `--bake-physics` オプションを使用します。）
 
 ---
 

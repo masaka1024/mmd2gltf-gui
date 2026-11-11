@@ -100,7 +100,7 @@ The output has a two-layer structure:
 1. **Preservation layer (`extras.mmd`)** — rigid bodies, joints, IK settings, append parents, toon/sphere/edge material settings, and other information glTF cannot express, stored as the original PMX values. A receiving side can rebuild the model structure from this layer. For rigid bodies and joints, a converted view in glTF space and scale (`physicsGltf`) is written alongside.
 2. **Display layer (standard glTF mesh, skin and animation)** — what ordinary glTF viewers show as-is. VMD motion is baked into keyframes with IK solved.
 
-There is no reverse converter (glTF → PMX). The data layout is documented in `mmd2gltf/extrasMmd_schema.md` and `mmd2gltf/physicsGltf_schema.md`.
+There is no reverse converter (glTF → PMX). The data layout is documented in [`mmd2gltf/extrasMmd_schema.en.md`](mmd2gltf/extrasMmd_schema.en.md) and [`mmd2gltf/physicsGltf_schema.en.md`](mmd2gltf/physicsGltf_schema.en.md) (English translations of the Japanese originals `extrasMmd_schema.md` / `physicsGltf_schema.md`).
 
 > **About usage terms:** The model's and motion's usage terms still apply after conversion. Because `extras.mmd` contains the original data, **distributing a converted file is equivalent to distributing the original data**. A model that prohibits redistribution cannot be distributed after conversion either.
 
@@ -220,7 +220,7 @@ You can check the result in [FacetGL](https://github.com/masaka1024/facetgl), a 
 
 It shows rigid bodies, joints and collision groups in 3D. Clicking a rigid body shows its shape, size, mode, bound bone and the groups it collides with. When building physics on the engine side, this lets you check where each rigid body is and whether it is really set to collide.
 
-> **About the 16-bit field:** PMX rigid bodies have a 16-bit field called the "non-collision group flag", but **a set bit means the body DOES collide with that group** — it is Bullet's collision filter mask verbatim. PMXEditor displays it inverted (checked = no collision), so reading the field by its name gives the opposite result. This tool and the inspector follow the mask interpretation (the value written to `extras.mmd` is still the raw PMX one — see `mmd2gltf/physicsGltf_schema.md`).
+> **About the 16-bit field:** PMX rigid bodies have a 16-bit field called the "non-collision group flag", but **a set bit means the body DOES collide with that group** — it is Bullet's collision filter mask verbatim. PMXEditor displays it inverted (checked = no collision), so reading the field by its name gives the opposite result. This tool and the inspector follow the mask interpretation (the value written to `extras.mmd` is still the raw PMX one — see `mmd2gltf/physicsGltf_schema.en.md`).
 
 ## Option reference
 
@@ -300,8 +300,10 @@ mmd2gltf/
   gltf.py                 GLB builder (sparse accessor support)
   convert.py              Conversion core
   cli.py                  CLI
-  extrasMmd_schema.md     extras.mmd specification
-  physicsGltf_schema.md   extras.mmd.physicsGltf specification
+  extrasMmd_schema.md     extras.mmd specification (Japanese original)
+  extrasMmd_schema.en.md  extras.mmd specification (English)
+  physicsGltf_schema.md   extras.mmd.physicsGltf specification (Japanese original)
+  physicsGltf_schema.en.md  extras.mmd.physicsGltf specification (English)
 gui.py                    GUI
 tools/
   mmd_physics_inspector.html  Visual inspector for rigid bodies, joints and collision groups
