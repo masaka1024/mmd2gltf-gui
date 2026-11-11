@@ -302,7 +302,9 @@ mmd2gltf/
   convert.py              変換本体
   cli.py                  CLI
   extrasMmd_schema.md     extras.mmd の仕様
+  extrasMmd_schema.en.md  extras.mmd の仕様(英語版)
   physicsGltf_schema.md   extras.mmd.physicsGltf の仕様
+  physicsGltf_schema.en.md  extras.mmd.physicsGltf の仕様(英語版)
 gui.py                    GUI
 tools/
   mmd_physics_inspector.html  剛体・ジョイント・衝突グループの目視確認ツール

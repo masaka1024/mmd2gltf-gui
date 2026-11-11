@@ -1,5 +1,7 @@
 # `extras.mmd` スキーマ
 
+日本語 | [English](extrasMmd_schema.en.md)
+
 mmd2gltf は、glTF 標準では表現できない MMD（PMX）固有の情報と、
 変換パイプラインが不可逆に加工した部分の復元用データを、
 glTF JSON の `extras.mmd` に残します。
@@ -160,6 +162,10 @@ raw オフセットを `offsets` に保持します（インポーター側で�
 ```
 
 ### alphaClass / origTexture の詳細
+
+> **重要：** glTF に入っているベースカラーテクスチャは、加工済みのことがあります。
+> MMD 本来の見た目を再現するときは、glTF の `alphaMode` ではなく `alphaClass` で
+> 描き方を決め、`origTexture` があればそちらを使ってください。
 
 パイプラインは、透過ソートに弱いビューアでも破綻しないよう、
 半透明テクスチャを **prebake**（背景色と合成して不透明化）し
